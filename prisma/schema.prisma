@@ -1,0 +1,335 @@
+// ===============================
+// PRISMA SETUP
+// ===============================
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===============================
+// ENUM
+// ===============================
+enum UserRole {
+  client
+  staff
+  venue
+  admin
+}
+
+enum EventStatus {
+  DRAFT
+  LIVE
+  CLOSED
+}
+
+enum ReservationStatus {
+  pending
+  confirmed
+  cancelled
+  completed
+}
+
+enum ReservationType {
+  table
+  entry
+}
+
+enum PromoStatus {
+  active
+  inactive
+  expired
+}
+
+enum DiscountType {
+  percentage
+  fixed
+  free
+}
+
+enum EntryMethod {
+  QR
+  RAPIDO
+}
+
+enum Gender {
+  M
+  F
+  ALTRO
+}
+
+// ===============================
+// USERS
+// ===============================
+model users {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email         String   @unique
+  password_hash String
+  role          UserRole
+
+  name          String?
+  phone         String?
+  avatar        String?
+
+  sesso         Gender?
+  birth_date    DateTime?
+
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  venue_id      String?  @db.Uuid
+  venue         venues?  @relation(fields: [venue_id], references: [id])
+
+  // 🔥 QUESTI DUE DEVONO ESISTERE ENTRAMBI
+  entries        entries[] @relation("UserEntries")
+  staff_entries  entries[] @relation("StaffEntries")
+
+  reservations  reservations[]
+  user_promos   user_promos[]
+
+  @@index([venue_id])
+}
+
+
+
+// ===============================
+// VENUES (LOCALI)
+// ===============================
+model venues {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String
+  city        String?
+  address     String?
+  description String?
+  image       String?
+  latitude    Decimal? @db.Decimal(9,6)
+  longitude   Decimal? @db.Decimal(9,6)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  events      events[]
+  tables      venue_tables[]
+  promos      promos[]
+  users       users[]
+}
+
+// ===============================
+// EVENTS
+// ===============================
+model events {
+  id          String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id    String      @db.Uuid
+  name        String
+  description String?
+  image       String?
+  date        DateTime    @db.Date
+  start_time  DateTime?   @db.Time(6)
+  end_time    DateTime?   @db.Time(6)
+  status      EventStatus @default(DRAFT)
+  created_at  DateTime    @default(now())
+  updated_at  DateTime    @updatedAt
+
+  venue       venues      @relation(fields: [venue_id], references: [id])
+
+  entries     entries[]
+  entry_prices event_entry_prices[]
+  event_tables event_tables[]
+  reservations reservations[]
+  promos      promos[]
+  bar_sales   bar_sales[]
+  cloakroom_sales cloakroom_sales[]
+}
+
+// ===============================
+// EVENT ENTRY PRICES (LISTINO INGRESSI)
+// - Optional gender (null = all)
+// - Optional time window (nulls = always)
+// ===============================
+model event_entry_prices {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_id   String   @db.Uuid
+
+  label      String?
+  gender     Gender?
+  start_time DateTime? @db.Time(6)
+  end_time   DateTime? @db.Time(6)
+  price      Decimal
+
+  created_at DateTime @default(now())
+
+  event events @relation(fields: [event_id], references: [id])
+
+  @@index([event_id])
+}
+
+// ===============================
+// VENUE TABLES (STRUTTURALI)
+// ===============================
+model venue_tables {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id     String   @db.Uuid
+  nome         String
+  zona         String?
+  numero       Int?
+  per_testa    Decimal?
+  costo_minimo Decimal?
+  persone_max  Int?
+
+  venue        venues    @relation(fields: [venue_id], references: [id])
+  event_tables event_tables[]
+  reservations reservations[]
+
+  @@unique([venue_id, numero])
+}
+
+// ===============================
+// EVENT TABLES (STATO TAVOLO PER EVENTO)
+// ===============================
+model event_tables {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_id       String   @db.Uuid
+  venue_table_id String   @db.Uuid
+
+  prenotati     Int      @default(0)
+  entrati       Int      @default(0)
+  pagato_totale Decimal  @default(0)
+  stato         String   @default("libero")
+
+  event         events       @relation(fields: [event_id], references: [id])
+  venue_table   venue_tables @relation(fields: [venue_table_id], references: [id])
+  table_sales   table_sales[]
+
+  @@unique([event_id, venue_table_id])
+  @@index([event_id])
+}
+
+// ===============================
+// ENTRIES (INGRESSI)
+// ===============================
+model entries {
+  id         String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  event_id   String      @db.Uuid
+  user_id    String?     @db.Uuid
+  staff_id   String?     @db.Uuid
+
+  sesso      Gender
+  price      Decimal     @default(0)
+  method     EntryMethod
+
+  created_at DateTime    @default(now())
+
+  event      events      @relation(fields: [event_id], references: [id])
+
+  user       users?      @relation("UserEntries", fields: [user_id], references: [id])
+  staff      users?      @relation("StaffEntries", fields: [staff_id], references: [id])
+
+  @@index([event_id, created_at])
+  @@index([user_id])
+  @@index([staff_id])
+}
+
+
+
+
+// ===============================
+// BAR SALES
+// ===============================
+model bar_sales {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_id   String   @db.Uuid
+  amount     Decimal
+  created_at DateTime @default(now())
+
+  event events @relation(fields: [event_id], references: [id])
+
+  @@index([event_id, created_at])
+}
+
+// ===============================
+// CLOAKROOM SALES
+// ===============================
+model cloakroom_sales {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_id   String   @db.Uuid
+  amount     Decimal
+  created_at DateTime @default(now())
+
+  event events @relation(fields: [event_id], references: [id])
+
+  @@index([event_id, created_at])
+}
+
+// ===============================
+// TABLE SALES
+// ===============================
+model table_sales {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_table_id String   @db.Uuid
+  amount         Decimal
+  created_at     DateTime @default(now())
+
+  event_table event_tables @relation(fields: [event_table_id], references: [id])
+
+  @@index([event_table_id, created_at])
+}
+
+// ===============================
+// PROMOS
+// ===============================
+model promos {
+  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id       String        @db.Uuid
+  event_id       String?       @db.Uuid
+  title          String
+  description    String?
+  discount_type  DiscountType
+  discount_value Decimal?
+  status         PromoStatus   @default(active)
+  created_at     DateTime      @default(now())
+
+  venue          venues        @relation(fields: [venue_id], references: [id])
+  event          events?       @relation(fields: [event_id], references: [id])
+  user_promos    user_promos[]
+}
+
+// ===============================
+// USER PROMOS
+// ===============================
+model user_promos {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id   String   @db.Uuid
+  promo_id  String   @db.Uuid
+  used_at   DateTime?
+
+  user  users  @relation(fields: [user_id], references: [id])
+  promo promos @relation(fields: [promo_id], references: [id])
+
+  @@unique([user_id, promo_id])
+}
+
+// ===============================
+// RESERVATIONS
+// ===============================
+model reservations {
+  id           String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id      String            @db.Uuid
+  event_id     String            @db.Uuid
+  venue_table_id String?         @db.Uuid
+  type         ReservationType
+  status       ReservationStatus @default(pending)
+  guests       Int
+  total_amount Decimal?
+  created_at   DateTime          @default(now())
+
+  user  users  @relation(fields: [user_id], references: [id])
+  event events @relation(fields: [event_id], references: [id])
+  venue_table venue_tables? @relation(fields: [venue_table_id], references: [id])
+
+  @@index([event_id])
+  @@index([user_id])
+  @@index([venue_table_id])
+}
