@@ -1,20 +1,25 @@
-import { createApp } from '../src/main';
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from '../src/app.module';
 import { ExpressAdapter } from '@nestjs/platform-express';
 import express from 'express';
-import type { VercelRequest, VercelResponse } from '@vercel/node';
 
-let cachedApp: express.Express | null = null;
+const server = express();
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (!cachedApp) {
-    const server = express();
-    const adapter = new ExpressAdapter(server);
+let app;
 
-    const app = await createApp(adapter);
-    await app.init();
-
-    cachedApp = server;
+async function bootstrap() {
+  if (!app) {
+    const nestApp = await NestFactory.create(
+      AppModule,
+      new ExpressAdapter(server),
+    );
+    await nestApp.init();
+    app = nestApp;
   }
+  return server;
+}
 
-  cachedApp(req, res);
+export default async function handler(req, res) {
+  const server = await bootstrap();
+  server(req, res);
 }
