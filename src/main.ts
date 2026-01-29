@@ -36,7 +36,7 @@ export async function createApp(adapter?: AbstractHttpAdapter) {
   app.use(json({ limit: '15mb' }));
   app.use(urlencoded({ extended: true, limit: '15mb' }));
 
-  app.setGlobalPrefix('api');
+  // app.setGlobalPrefix('api');
   app.enableCors();
 
   return app;
