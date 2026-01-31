@@ -33,7 +33,12 @@ export class SupabaseStorageService {
   async createSignedUploadForEventPoster(params?: {
     ext?: string;
     contentType?: string;
-  }): Promise<{ bucket: string; path: string; token: string; signedUrl: string }> {
+  }): Promise<{
+    bucket: string;
+    path: string;
+    token: string;
+    signedUrl: string;
+  }> {
     const client = this.ensureClient();
 
     const extRaw = (params?.ext || 'jpg').replace(/^\./, '').toLowerCase();

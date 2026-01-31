@@ -4,7 +4,11 @@ import { createClient } from '@supabase/supabase-js';
 import { PrismaClient } from '@prisma/client';
 import { randomUUID } from 'crypto';
 
-function parseDataUrl(input: string): { mime: string; buffer: Buffer; ext: string } {
+function parseDataUrl(input: string): {
+  mime: string;
+  buffer: Buffer;
+  ext: string;
+} {
   const match = /^data:([^;]+);base64,(.+)$/i.exec(input.trim());
   if (!match) throw new Error('Not a data URL');
   const mime = match[1].toLowerCase();
@@ -29,7 +33,11 @@ async function main() {
   }
 
   const supabase = createClient(supabaseUrl, serviceRoleKey, {
-    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
   });
 
   const prisma = new PrismaClient({ log: ['error'] });
@@ -57,7 +65,10 @@ async function main() {
     });
 
     if (error) {
-      console.error(`[migrate] upload failed for event ${e.id}:`, error.message);
+      console.error(
+        `[migrate] upload failed for event ${e.id}:`,
+        error.message,
+      );
       continue;
     }
 
