@@ -10,6 +10,50 @@ import { Prisma } from '@prisma/client';
 export class ReservationsService {
   constructor(private readonly prisma: PrismaService) {}
 
+  private reservationSelect() {
+    return {
+      id: true,
+      user_id: true,
+      event_id: true,
+      venue_table_id: true,
+      type: true,
+      status: true,
+      guests: true,
+      total_amount: true,
+      created_at: true,
+      user: {
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          phone: true,
+        },
+      },
+      event: {
+        select: {
+          id: true,
+          venue_id: true,
+          name: true,
+          date: true,
+          start_time: true,
+          end_time: true,
+        },
+      },
+      venue_table: {
+        select: {
+          id: true,
+          venue_id: true,
+          nome: true,
+          zona: true,
+          numero: true,
+          persone_max: true,
+          per_testa: true,
+          costo_minimo: true,
+        },
+      },
+    } satisfies Prisma.reservationsSelect;
+  }
+
   private normalizeCreateReservationDto(dto: any): {
     user_id?: string;
     event_id?: string;
@@ -63,34 +107,14 @@ export class ReservationsService {
     userId?: string;
     date?: string;
   }) {
-    const where: any = {};
+    const where: Prisma.reservationsWhereInput = {};
     if (params?.eventId) where.event_id = params.eventId;
     if (params?.userId) where.user_id = params.userId;
     // date filtering not supported by current schema (no date column)
     return this.prisma.reservations.findMany({
       where,
       orderBy: { created_at: 'desc' },
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            phone: true,
-          },
-        },
-        event: {
-          select: {
-            id: true,
-            venue_id: true,
-            name: true,
-            date: true,
-            start_time: true,
-            end_time: true,
-          },
-        },
-        venue_table: true,
-      },
+      select: this.reservationSelect(),
     });
   }
 
@@ -113,27 +137,7 @@ export class ReservationsService {
         orderBy: { created_at: 'desc' },
         skip,
         take,
-        include: {
-          user: {
-            select: {
-              id: true,
-              name: true,
-              email: true,
-              phone: true,
-            },
-          },
-          event: {
-            select: {
-              id: true,
-              venue_id: true,
-              name: true,
-              date: true,
-              start_time: true,
-              end_time: true,
-            },
-          },
-          venue_table: true,
-        },
+        select: this.reservationSelect(),
       }),
     ]);
 
@@ -149,27 +153,7 @@ export class ReservationsService {
   async getReservation(id: string) {
     const r = await this.prisma.reservations.findUnique({
       where: { id },
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            phone: true,
-          },
-        },
-        event: {
-          select: {
-            id: true,
-            venue_id: true,
-            name: true,
-            date: true,
-            start_time: true,
-            end_time: true,
-          },
-        },
-        venue_table: true,
-      },
+      select: this.reservationSelect(),
     });
     if (!r) throw new NotFoundException('Reservation not found');
     return r;

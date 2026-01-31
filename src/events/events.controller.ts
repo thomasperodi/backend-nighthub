@@ -2,21 +2,48 @@ import {
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
+  Headers,
   Param,
   Patch,
   Post,
   Query,
   Res,
+  UnauthorizedException,
+  UploadedFile,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
+import { JwtService } from '@nestjs/jwt';
 import { EventsService } from './events.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { UpdateEventDto } from './dto/update-event.dto';
 
 @Controller()
 export class EventsController {
-  constructor(private readonly eventsService: EventsService) {}
+  constructor(
+    private readonly eventsService: EventsService,
+    private readonly jwtService: JwtService,
+  ) {}
+
+  private assertStaffAuth(authorization?: string) {
+    const token = authorization?.replace(/^Bearer\s+/i, '') || undefined;
+    if (!token) throw new UnauthorizedException('Missing Authorization token');
+
+    let payload: any;
+    try {
+      payload = this.jwtService.verify(token);
+    } catch {
+      throw new UnauthorizedException('Invalid token');
+    }
+
+    const role = String(payload?.role || '').toLowerCase();
+    if (!role || role === 'client') {
+      throw new ForbiddenException('Insufficient permissions');
+    }
+  }
 
   @Get('events')
   async list(
@@ -64,6 +91,25 @@ export class EventsController {
   @Post('events')
   create(@Body() dto: CreateEventDto) {
     return this.eventsService.createEvent(dto);
+  }
+
+  // Upload poster separately to keep event create/update fast.
+  // Client sends multipart/form-data with field name `file`.
+  @Post('events/poster')
+  @UseInterceptors(FileInterceptor('file'))
+  uploadPoster(@UploadedFile() file?: Express.Multer.File) {
+    return this.eventsService.uploadEventPoster(file);
+  }
+
+  // Preferred: client-direct upload (no bytes through Vercel).
+  // Returns { bucket, path, token, signedUrl } for Supabase Storage.
+  @Post('events/poster/signed')
+  createPosterSignedUpload(
+    @Headers('authorization') authorization?: string,
+    @Body() body?: { ext?: string; contentType?: string },
+  ) {
+    this.assertStaffAuth(authorization);
+    return this.eventsService.createEventPosterSignedUpload(body);
   }
 
   @Patch('events/:id')

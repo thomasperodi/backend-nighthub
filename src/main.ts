@@ -29,14 +29,25 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { json, urlencoded } from 'express';
 import type { AbstractHttpAdapter } from '@nestjs/core';
+import { responseTimingMiddleware } from './common/http/response-timing.middleware';
 
 export async function createApp(adapter?: AbstractHttpAdapter) {
   const app = adapter
-    ? await NestFactory.create(AppModule, adapter)
-    : await NestFactory.create(AppModule);
+    ? await NestFactory.create(AppModule, adapter, { bodyParser: false })
+    : await NestFactory.create(AppModule, { bodyParser: false });
 
-  app.use(json({ limit: '15mb' }));
-  app.use(urlencoded({ extended: true, limit: '15mb' }));
+  app.use(responseTimingMiddleware());
+
+  app.use((req, res, next) => {
+    // Quick check to ensure the deployed instance is running the expected body limit.
+    // If you still see 413 with limit=102400 in logs, Vercel is serving an older build.
+    res.setHeader('X-Json-Limit', '5mb');
+    next();
+  });
+
+  // Increase JSON body limit (Nest default is 100kb). Posters should go via /events/poster.
+  app.use(json({ limit: '5mb' }));
+  app.use(urlencoded({ extended: true, limit: '5mb' }));
 
   app.setGlobalPrefix('api');
   app.enableCors();

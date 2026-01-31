@@ -12,6 +12,7 @@ import {
   events,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { SupabaseStorageService } from '../common/storage/supabase-storage.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { UpdateEventDto } from './dto/update-event.dto';
 
@@ -26,7 +27,52 @@ export type EventStats = {
 
 @Injectable()
 export class EventsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly storage: SupabaseStorageService,
+  ) {}
+
+  private isDataUrlImage(value?: string | null): boolean {
+    return Boolean(
+      value && /^data:image\/(png|jpe?g|webp);base64,/i.test(value),
+    );
+  }
+
+  async uploadEventPoster(file?: Express.Multer.File) {
+    if (!file) {
+      throw new BadRequestException('file is required');
+    }
+    if (!file.mimetype?.startsWith('image/')) {
+      throw new BadRequestException('file must be an image');
+    }
+
+    const ext = (() => {
+      const m = /\.(png|jpe?g|webp)$/i.exec(file.originalname || '');
+      if (m) return m[1].toLowerCase();
+      if (file.mimetype === 'image/png') return 'png';
+      if (file.mimetype === 'image/webp') return 'webp';
+      return 'jpg';
+    })();
+
+    const { pathPromise } = this.storage.uploadEventPosterFromBuffer({
+      buffer: file.buffer,
+      contentType: file.mimetype,
+      ext,
+    });
+
+    const path = await pathPromise;
+    return { path };
+  }
+
+  async createEventPosterSignedUpload(params?: {
+    ext?: string;
+    contentType?: string;
+  }) {
+    return this.storage.createSignedUploadForEventPoster({
+      ext: params?.ext,
+      contentType: params?.contentType,
+    });
+  }
 
   private isDebugEventsEnabled(): boolean {
     return process.env.DEBUG_EVENTS === '1';
@@ -615,12 +661,20 @@ export class EventsService {
       };
     });
 
+    if (this.isDataUrlImage(dto.image)) {
+      throw new BadRequestException(
+        'image must be a storage path (upload poster via POST /events/poster/signed or POST /events/poster)',
+      );
+    }
+
+    const imagePath: string | undefined = dto.image;
+
     const event = await this.prisma.events.create({
       data: {
         venue_id: dto.venue_id,
         name: dto.name,
         description: dto.description,
-        image: dto.image,
+        image: imagePath,
         date,
         start_time,
         end_time,
@@ -655,6 +709,14 @@ export class EventsService {
 
     const venueId = dto.venue_id ?? existing.venue_id;
 
+    if (this.isDataUrlImage(dto.image)) {
+      throw new BadRequestException(
+        'image must be a storage path (upload poster via POST /events/poster/signed or POST /events/poster)',
+      );
+    }
+
+    const imagePath: string | undefined = dto.image;
+
     await this.prisma.$transaction(async (tx) => {
       await tx.events.update({
         where: { id },
@@ -662,7 +724,7 @@ export class EventsService {
           venue_id: dto.venue_id,
           name: dto.name,
           description: dto.description,
-          image: dto.image,
+          image: imagePath,
           date,
           start_time,
           end_time,

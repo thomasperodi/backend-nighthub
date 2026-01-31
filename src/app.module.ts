@@ -7,9 +7,10 @@ import { EventsModule } from './events/events.module';
 import { StaffModule } from './staff/staff.module';
 import { VenuesModule } from './venues/venues.module';
 import { ReservationsModule } from './reservations/reservations.module';
+import { StorageModule } from './common/storage/storage.module';
 
 @Module({
-  imports: [PrismaModule, AuthModule, EventsModule, StaffModule, VenuesModule, ReservationsModule],
+  imports: [PrismaModule, StorageModule, AuthModule, EventsModule, StaffModule, VenuesModule, ReservationsModule],
   controllers: [AppController],
   providers: [AppService],
 })
