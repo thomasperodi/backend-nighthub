@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "regions": ["fra1"],
   "builds": [
     {
       "src": "api/index.ts",
@@ -8,7 +9,6 @@
   ],
   "functions": {
     "api/index.ts": {
-      "regions": ["fra1"],
       "memory": 1024,
       "maxDuration": 10
     }
