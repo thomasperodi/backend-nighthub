@@ -1,10 +1,46 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { Prisma } from '@prisma/client';
+import { Prisma, PromoStatus } from '@prisma/client';
 
 @Injectable()
 export class PromosService {
   constructor(private readonly prisma: PrismaService) {}
+
+  async listActiveByEvent(eventId: string) {
+    return this.prisma.promos.findMany({
+      where: { event_id: eventId, status: PromoStatus.active },
+      orderBy: { created_at: 'desc' },
+      select: {
+        id: true,
+        venue_id: true,
+        event_id: true,
+        title: true,
+        description: true,
+        discount_type: true,
+        discount_value: true,
+        status: true,
+        created_at: true,
+      },
+    });
+  }
+
+  async listActiveByVenue(venueId: string) {
+    return this.prisma.promos.findMany({
+      where: { venue_id: venueId, status: PromoStatus.active },
+      orderBy: { created_at: 'desc' },
+      select: {
+        id: true,
+        venue_id: true,
+        event_id: true,
+        title: true,
+        description: true,
+        discount_type: true,
+        discount_value: true,
+        status: true,
+        created_at: true,
+      },
+    });
+  }
 
   async listPromos() {
     return this.prisma.promos.findMany({ orderBy: { created_at: 'desc' } });

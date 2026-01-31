@@ -7,7 +7,9 @@ import {
   Param,
   Body,
   Query,
+  Res,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { VenuesService } from './venues.service';
 import { EventsService } from '../events/events.service';
 import { CreateVenueDto } from './dto/create-venue.dto';
@@ -23,12 +25,20 @@ export class VenuesController {
   ) {}
 
   @Get()
-  list() {
+  list(@Res({ passthrough: true }) res?: Response) {
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=300, stale-while-revalidate=3600',
+    );
     return this.venuesService.listVenues();
   }
 
   @Get(':id')
-  get(@Param('id') id: string) {
+  get(@Param('id') id: string, @Res({ passthrough: true }) res?: Response) {
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=300, stale-while-revalidate=3600',
+    );
     return this.venuesService.getVenue(id);
   }
 
@@ -52,23 +62,40 @@ export class VenuesController {
     @Param('id') id: string,
     @Query('status') status?: string,
     @Query('date') date?: string,
+    @Res({ passthrough: true }) res?: Response,
   ) {
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=30, stale-while-revalidate=300',
+    );
     return this.eventsService.listEvents({ venue_id: id, status, date });
   }
 
   @Get(':id/stats')
-  stats(@Param('id') id: string) {
+  stats(@Param('id') id: string, @Res({ passthrough: true }) res?: Response) {
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=10, stale-while-revalidate=60',
+    );
     return this.venuesService.getStats(id);
   }
 
   @Get(':id/promos')
-  promos(@Param('id') id: string) {
+  promos(@Param('id') id: string, @Res({ passthrough: true }) res?: Response) {
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=30, stale-while-revalidate=300',
+    );
     return this.venuesService.listPromos(id);
   }
 
   // Venue structural tables (persisted in DB)
   @Get(':id/tables')
-  tables(@Param('id') id: string) {
+  tables(@Param('id') id: string, @Res({ passthrough: true }) res?: Response) {
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=300, stale-while-revalidate=3600',
+    );
     return this.venuesService.listVenueTables(id);
   }
 

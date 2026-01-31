@@ -7,7 +7,9 @@ import {
   Patch,
   Query,
   BadRequestException,
+  Res,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { StaffService } from './staff.service';
 import { RecordEntryDto } from './dto/record-entry.dto';
 import { RecordSaleDto } from './dto/record-sale.dto';
@@ -111,7 +113,14 @@ export class StaffController {
   }
 
   @Get('events/:eventId/stats')
-  eventStats(@Param('eventId') eventId: string) {
+  eventStats(
+    @Param('eventId') eventId: string,
+    @Res({ passthrough: true }) res?: Response,
+  ) {
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=5, stale-while-revalidate=30',
+    );
     return this.eventsService.getEventStats(eventId);
   }
 

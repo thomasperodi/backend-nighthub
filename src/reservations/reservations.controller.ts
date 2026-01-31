@@ -19,11 +19,22 @@ export class ReservationsController {
     @Query('eventId') eventIdCamel?: string,
     @Query('user_id') userIdSnake?: string,
     @Query('userId') userIdCamel?: string,
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
   ) {
-    return this.reservationsService.listReservations({
-      eventId: eventIdSnake ?? eventIdCamel,
-      userId: userIdSnake ?? userIdCamel,
-    });
+    const eventId = eventIdSnake ?? eventIdCamel;
+    const userId = userIdSnake ?? userIdCamel;
+
+    if (page || pageSize) {
+      const pageNum = page ? parseInt(page, 10) || 1 : 1;
+      const pageSizeNum = pageSize ? parseInt(pageSize, 10) || 20 : 20;
+      return this.reservationsService.listReservationsPaginated(pageNum, pageSizeNum, {
+        eventId,
+        userId,
+      });
+    }
+
+    return this.reservationsService.listReservations({ eventId, userId });
   }
 
   @Get(':id')

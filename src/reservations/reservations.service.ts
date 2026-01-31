@@ -94,6 +94,58 @@ export class ReservationsService {
     });
   }
 
+  async listReservationsPaginated(
+    page: number,
+    pageSize: number,
+    params?: { eventId?: string; userId?: string },
+  ) {
+    const take = Math.max(pageSize, 1);
+    const skip = (Math.max(page, 1) - 1) * take;
+
+    const where: Prisma.reservationsWhereInput = {};
+    if (params?.eventId) where.event_id = params.eventId;
+    if (params?.userId) where.user_id = params.userId;
+
+    const [total, data] = await this.prisma.$transaction([
+      this.prisma.reservations.count({ where }),
+      this.prisma.reservations.findMany({
+        where,
+        orderBy: { created_at: 'desc' },
+        skip,
+        take,
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              phone: true,
+            },
+          },
+          event: {
+            select: {
+              id: true,
+              venue_id: true,
+              name: true,
+              date: true,
+              start_time: true,
+              end_time: true,
+            },
+          },
+          venue_table: true,
+        },
+      }),
+    ]);
+
+    return {
+      data,
+      total,
+      page: Math.max(page, 1),
+      pageSize: take,
+      hasMore: skip + data.length < total,
+    };
+  }
+
   async getReservation(id: string) {
     const r = await this.prisma.reservations.findUnique({
       where: { id },

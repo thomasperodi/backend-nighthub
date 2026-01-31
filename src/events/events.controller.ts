@@ -7,7 +7,9 @@ import {
   Patch,
   Post,
   Query,
+  Res,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { EventsService } from './events.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { UpdateEventDto } from './dto/update-event.dto';
@@ -23,17 +25,14 @@ export class EventsController {
     @Query('date') date?: string,
     @Query('page') page?: string,
     @Query('pageSize') pageSize?: string,
+    @Res({ passthrough: true }) res?: Response,
   ) {
-    // Debug: understand why LIVE events might not be returned
-    // (safe log: no PII, only filters + server time)
-    console.log('[events.controller] GET /events', {
-      venue_id,
-      status,
-      date,
-      page,
-      pageSize,
-      serverNow: new Date().toISOString(),
-    });
+    // Enable Vercel edge caching (keyed by full URL incl. querystring).
+    // Keep TTL short to avoid stale event lists while still removing repeated load.
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=30, stale-while-revalidate=300',
+    );
 
     if (page || pageSize) {
       const pageNum = page ? parseInt(page, 10) || 1 : 1;
@@ -49,7 +48,11 @@ export class EventsController {
   }
 
   @Get('events/:id')
-  getOne(@Param('id') id: string) {
+  getOne(@Param('id') id: string, @Res({ passthrough: true }) res?: Response) {
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=60, stale-while-revalidate=600',
+    );
     return this.eventsService.getEvent(id);
   }
 

@@ -24,6 +24,10 @@ export class StaffService {
     private readonly eventsService: EventsService,
   ) {}
 
+  private isDebugStaffEnabled(): boolean {
+    return process.env.DEBUG_STAFF === '1';
+  }
+
   private async resolveVenueIdFromStaffId(staffId: string): Promise<string> {
     const u = await this.prisma.users.findUnique({
       where: { id: staffId },
@@ -83,14 +87,16 @@ export class StaffService {
     const resolvedEventId =
       await this.resolveActiveLiveEventIdForVenue(resolvedVenueId);
 
-    console.log('[staff.service] resolveEventId', {
-      eventId: eventId ?? null,
-      venueId: resolvedVenueId,
-      staffId: staffId ?? null,
-      eventTableId: eventTableId ?? null,
-      resolvedEventId,
-      now: new Date().toISOString(),
-    });
+    if (this.isDebugStaffEnabled()) {
+      console.log('[staff.service] resolveEventId', {
+        eventId: eventId ?? null,
+        venueId: resolvedVenueId,
+        staffId: staffId ?? null,
+        eventTableId: eventTableId ?? null,
+        resolvedEventId,
+        now: new Date().toISOString(),
+      });
+    }
 
     return resolvedEventId;
   }
@@ -126,7 +132,16 @@ export class StaffService {
       select: { id: true },
     });
 
-    if (!venueTables.length) return;
+    const venueTableCount = venueTables.length;
+    if (!venueTableCount) return;
+
+    // Fast path: if already fully seeded, avoid groupBy + sync work on every request.
+    const existingCount = await this.prisma.event_tables.count({
+      where: { event_id: eventId },
+    });
+    if (existingCount >= venueTableCount && existingCount > 0) {
+      return;
+    }
 
     // Aggregate prenotati from reservations
     const grouped = await this.prisma.reservations.groupBy({
@@ -144,10 +159,7 @@ export class StaffService {
     for (const g of grouped) {
       const venueTableId = g.venue_table_id;
       if (!venueTableId) continue;
-      prenotatiByVenueTableId.set(
-        venueTableId,
-        Number(g._sum.guests ?? 0),
-      );
+      prenotatiByVenueTableId.set(venueTableId, Number(g._sum.guests ?? 0));
     }
 
     // Ensure event_tables rows exist for every venue table
@@ -169,7 +181,7 @@ export class StaffService {
       select: { id: true, venue_table_id: true, prenotati: true },
     });
 
-    const updates: Array<Promise<unknown>> = [];
+    const updates: Array<Prisma.PrismaPromise<unknown>> = [];
     for (const row of current) {
       const desired = prenotatiByVenueTableId.get(row.venue_table_id) ?? 0;
       if ((row.prenotati ?? 0) !== desired) {
@@ -182,7 +194,7 @@ export class StaffService {
       }
     }
     if (updates.length) {
-      await this.prisma.$transaction(updates as any);
+      await this.prisma.$transaction(updates);
     }
   }
 
@@ -405,10 +417,23 @@ export class StaffService {
         ...(venueId ? { venue_table: { venue_id: venueId } } : {}),
         ...(onlyBooked ? { prenotati: { gt: 0 } } : {}),
       },
-      include: {
-        venue_table: true,
-        event: true,
-        table_sales: { orderBy: { created_at: 'desc' } },
+      select: {
+        id: true,
+        event_id: true,
+        venue_table: {
+          select: {
+            venue_id: true,
+            nome: true,
+            zona: true,
+            per_testa: true,
+            numero: true,
+          },
+        },
+        prenotati: true,
+        entrati: true,
+        pagato_totale: true,
+        stato: true,
+        table_sales: { orderBy: { created_at: 'desc' }, take: 50 },
       },
       orderBy: [{ venue_table: { numero: 'asc' } }],
     });
@@ -435,12 +460,11 @@ export class StaffService {
             ? 'parziale'
             : 'in_attesa',
         is_saldato,
-        created_at: (t as any).created_at ?? undefined,
         table_waiters: [],
         table_sales: (t.table_sales ?? []).map((s) => ({
           id: s.id,
-          amount: Number((s as any).amount ?? 0),
-          created_at: (s as any).created_at,
+          amount: Number(s.amount ?? 0),
+          created_at: s.created_at,
         })),
       };
     });

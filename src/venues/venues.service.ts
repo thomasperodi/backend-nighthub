@@ -301,20 +301,18 @@ export class VenuesService {
     reservationsCount: number;
     totalReservationAmount: number;
   }> {
-    const eventsCount: number = await this.prisma.events.count({
-      where: { venue_id: venueId },
-    });
-    const promosCount: number = await this.prisma.promos.count({
-      where: { venue_id: venueId },
-    });
-    const reservationsCount: number = await this.prisma.reservations.count({
-      where: { event: { venue_id: venueId } },
-    });
-
-    const reservationsSum = await this.prisma.reservations.aggregate({
-      where: { event: { venue_id: venueId }, total_amount: { not: null } },
-      _sum: { total_amount: true },
-    });
+    const [eventsCount, promosCount, reservationsCount, reservationsSum] =
+      await this.prisma.$transaction([
+        this.prisma.events.count({ where: { venue_id: venueId } }),
+        this.prisma.promos.count({ where: { venue_id: venueId } }),
+        this.prisma.reservations.count({
+          where: { event: { venue_id: venueId } },
+        }),
+        this.prisma.reservations.aggregate({
+          where: { event: { venue_id: venueId }, total_amount: { not: null } },
+          _sum: { total_amount: true },
+        }),
+      ]);
 
     let totalReservationAmount = 0;
     const rawTotal = reservationsSum._sum?.total_amount;

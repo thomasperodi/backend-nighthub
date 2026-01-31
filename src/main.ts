@@ -22,7 +22,9 @@
 // // Use void to explicitly ignore the returned promise for linting
 // void bootstrap();
 
-// For deploy on vercel
+// For deploy on vercel (and local dev)
+import 'dotenv/config';
+
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { json, urlencoded } from 'express';
@@ -36,8 +38,18 @@ export async function createApp(adapter?: AbstractHttpAdapter) {
   app.use(json({ limit: '15mb' }));
   app.use(urlencoded({ extended: true, limit: '15mb' }));
 
-  // app.setGlobalPrefix('api');
+  app.setGlobalPrefix('api');
   app.enableCors();
 
   return app;
 }
+
+async function bootstrap() {
+  const app = await createApp();
+  const port = Number(process.env.PORT ?? 3000);
+  await app.listen(port, '0.0.0.0');
+  console.log(`Backend listening on http://0.0.0.0:${port}`);
+}
+
+// Nest CLI entrypoint for local dev
+void bootstrap();

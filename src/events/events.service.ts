@@ -28,6 +28,82 @@ export type EventStats = {
 export class EventsService {
   constructor(private readonly prisma: PrismaService) {}
 
+  private isDebugEventsEnabled(): boolean {
+    return process.env.DEBUG_EVENTS === '1';
+  }
+
+  private nowUtcTimestampExpr() {
+    // timestamp without time zone in UTC (matches our @db.Time UTC-component convention)
+    return Prisma.sql`(now() AT TIME ZONE 'UTC')`;
+  }
+
+  private computedStatusExpr() {
+    // Computes DRAFT/LIVE/CLOSED from date + time window.
+    // NOTE: returns text to compare against EventStatus enum values.
+    const nowUtc = this.nowUtcTimestampExpr();
+    return Prisma.sql`
+      CASE
+        WHEN e."date" IS NULL OR e."start_time" IS NULL OR e."end_time" IS NULL THEN e."status"::text
+        ELSE
+          CASE
+            WHEN ${nowUtc} < (e."date" + e."start_time") THEN 'DRAFT'
+            WHEN ${nowUtc} < (
+              e."date" + e."end_time" +
+              CASE WHEN e."end_time" <= e."start_time" THEN interval '1 day' ELSE interval '0 day' END
+            ) THEN 'LIVE'
+            ELSE 'CLOSED'
+          END
+      END
+    `;
+  }
+
+  private async listEventIdsByComputedStatus(params: {
+    venueId?: string;
+    date?: string; // YYYY-MM-DD
+    status: EventStatus;
+    skip?: number;
+    take?: number;
+    withTotal?: boolean;
+  }): Promise<{ ids: string[]; total?: number }> {
+    const venueId = params.venueId ?? null;
+    const date = params.date ?? null;
+    const skip = params.skip ?? 0;
+    const take = params.take;
+    const status = params.status;
+    const computed = this.computedStatusExpr();
+
+    const whereBase = Prisma.sql`
+      FROM "events" e
+      WHERE (${venueId}::uuid IS NULL OR e."venue_id" = ${venueId}::uuid)
+        AND (${date}::date IS NULL OR e."date" = ${date}::date)
+        AND (${computed}) = ${status}
+    `;
+
+    let total: number | undefined;
+    if (params.withTotal) {
+      const rows = await this.prisma.$queryRaw<Array<{ total: number }>>(
+        Prisma.sql`SELECT COUNT(*)::int AS total ${whereBase}`,
+      );
+      total = rows?.[0]?.total ?? 0;
+    }
+
+    const limitOffset =
+      typeof take === 'number'
+        ? Prisma.sql` LIMIT ${take} OFFSET ${skip}`
+        : Prisma.empty;
+
+    const idRows = await this.prisma.$queryRaw<Array<{ id: string }>>(
+      Prisma.sql`
+        SELECT e."id"
+        ${whereBase}
+        ORDER BY e."date" ASC, e."start_time" ASC NULLS LAST
+        ${limitOffset}
+      `,
+    );
+
+    return { ids: idRows.map((r) => r.id), total };
+  }
+
   private computeEffectiveStatus(e: {
     date?: Date | null;
     start_time?: Date | null;
@@ -218,59 +294,123 @@ export class EventsService {
     if (requestedStatus === EventStatus.DRAFT) where.status = requestedStatus;
     if (filters?.date) where.date = this.parseDate(filters.date);
 
+    // If the client asks for computed status (LIVE/CLOSED), filter in DB to avoid fetching all rows.
+    if (requestedStatus && requestedStatus !== EventStatus.DRAFT) {
+      const dateOnly = filters?.date ? filters.date : undefined;
+      const { ids } = await this.listEventIdsByComputedStatus({
+        venueId: filters?.venue_id,
+        date: dateOnly,
+        status: requestedStatus,
+      });
+
+      if (!ids.length) return [] as events[];
+
+      const rows = await this.prisma.events.findMany({
+        where: { id: { in: ids } },
+        orderBy: [{ date: 'asc' }, { start_time: 'asc' }],
+        select: {
+          id: true,
+          venue_id: true,
+          name: true,
+          description: true,
+          image: true,
+          date: true,
+          start_time: true,
+          end_time: true,
+          status: true,
+          created_at: true,
+          updated_at: true,
+          promos: {
+            where: { status: PromoStatus.active },
+            orderBy: { created_at: 'desc' },
+            take: 3,
+            select: {
+              id: true,
+              venue_id: true,
+              event_id: true,
+              title: true,
+              description: true,
+              discount_type: true,
+              discount_value: true,
+              status: true,
+              created_at: true,
+            },
+          },
+        },
+      });
+
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-return
+      return ordered.map((e) => this.serializeEvent(e)) as any;
+    }
+
     const list = await this.prisma.events.findMany({
       where,
       orderBy: [{ date: 'asc' }, { start_time: 'asc' }],
-      include: {
+      select: {
+        id: true,
+        venue_id: true,
+        name: true,
+        description: true,
+        image: true,
+        date: true,
+        start_time: true,
+        end_time: true,
+        status: true,
+        created_at: true,
+        updated_at: true,
         promos: {
           where: { status: PromoStatus.active },
           orderBy: { created_at: 'desc' },
           take: 3,
+          select: {
+            id: true,
+            venue_id: true,
+            event_id: true,
+            title: true,
+            description: true,
+            discount_type: true,
+            discount_value: true,
+            status: true,
+            created_at: true,
+          },
         },
       },
     });
 
-    console.log('[events.service] listEvents db results', {
-      where,
-      requestedStatus,
-      dbCount: list.length,
-      serverNow: new Date().toISOString(),
-      tzOffsetMinutes: new Date().getTimezoneOffset(),
-    });
+    if (this.isDebugEventsEnabled()) {
+      console.log('[events.service] listEvents db results', {
+        where,
+        requestedStatus,
+        dbCount: list.length,
+        serverNow: new Date().toISOString(),
+        tzOffsetMinutes: new Date().getTimezoneOffset(),
+      });
+    }
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     const serialized = list.map((e) => this.serializeEvent(e));
 
-    // Debug sample of computed statuses
-    try {
-      /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access */
-      const sample = serialized.slice(0, 5).map((e: any) => ({
-        id: e?.id,
-        name: e?.name,
-        date: e?.date,
-        start_time: e?.start_time,
-        end_time: e?.end_time,
-        status: e?.status,
-      }));
-      /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access */
-      console.log('[events.service] listEvents computed sample', sample);
-    } catch {
-      // ignore
+    if (this.isDebugEventsEnabled()) {
+      // Debug sample of computed statuses
+      try {
+        /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access */
+        const sample = serialized.slice(0, 5).map((e: any) => ({
+          id: e?.id,
+          name: e?.name,
+          date: e?.date,
+          start_time: e?.start_time,
+          end_time: e?.end_time,
+          status: e?.status,
+        }));
+        /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access */
+        console.log('[events.service] listEvents computed sample', sample);
+      } catch {
+        // ignore
+      }
     }
 
-    if (requestedStatus && requestedStatus !== EventStatus.DRAFT) {
-      /* eslint-disable @typescript-eslint/no-unsafe-member-access */
-      const filtered = serialized.filter(
-        (e: any) => e.status === requestedStatus,
-      );
-      /* eslint-enable @typescript-eslint/no-unsafe-member-access */
-      console.log('[events.service] listEvents filtered computed', {
-        requestedStatus,
-        resultCount: filtered.length,
-      });
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-      return filtered as any;
-    }
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     return serialized as any;
   }
@@ -289,39 +429,70 @@ export class EventsService {
 
     // For computed statuses (LIVE/CLOSED) we must filter after serialization.
     if (requestedStatus && requestedStatus !== EventStatus.DRAFT) {
-      const whereAll: Prisma.eventsWhereInput = {};
-      if (filters?.venue_id) whereAll.venue_id = filters.venue_id;
-      if (filters?.date) whereAll.date = this.parseDate(filters.date);
+      const dateOnly = filters?.date ? filters.date : undefined;
+      const { ids, total } = await this.listEventIdsByComputedStatus({
+        venueId: filters?.venue_id,
+        date: dateOnly,
+        status: requestedStatus,
+        skip,
+        take,
+        withTotal: true,
+      });
 
-      const all = await this.prisma.events.findMany({
-        where: whereAll,
-        orderBy: [{ date: 'asc' }, { start_time: 'asc' }],
-        include: {
+      if (!ids.length) {
+        return {
+          data: [],
+          total: total ?? 0,
+          page,
+          pageSize: take,
+          hasMore: false,
+        };
+      }
+
+      const rows = await this.prisma.events.findMany({
+        where: { id: { in: ids } },
+        select: {
+          id: true,
+          venue_id: true,
+          name: true,
+          description: true,
+          image: true,
+          date: true,
+          start_time: true,
+          end_time: true,
+          status: true,
+          created_at: true,
+          updated_at: true,
           promos: {
             where: { status: PromoStatus.active },
             orderBy: { created_at: 'desc' },
             take: 3,
+            select: {
+              id: true,
+              venue_id: true,
+              event_id: true,
+              title: true,
+              description: true,
+              discount_type: true,
+              discount_value: true,
+              status: true,
+              created_at: true,
+            },
           },
         },
       });
 
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
       // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-      const serializedAll = all.map((e) => this.serializeEvent(e));
-      /* eslint-disable @typescript-eslint/no-unsafe-member-access */
-      const filtered = serializedAll.filter(
-        (e: any) => e.status === requestedStatus,
-      );
-      /* eslint-enable @typescript-eslint/no-unsafe-member-access */
-
-      const total = filtered.length;
-      const pageData = filtered.slice(skip, skip + take);
+      const pageData = ordered.map((e) => this.serializeEvent(e));
 
       return {
         data: pageData,
-        total,
+        total: total ?? pageData.length,
         page,
         pageSize: take,
-        hasMore: skip + pageData.length < total,
+        hasMore: total ? skip + pageData.length < total : false,
       };
     }
 
@@ -337,11 +508,33 @@ export class EventsService {
         orderBy: [{ date: 'asc' }, { start_time: 'asc' }],
         skip,
         take,
-        include: {
+        select: {
+          id: true,
+          venue_id: true,
+          name: true,
+          description: true,
+          image: true,
+          date: true,
+          start_time: true,
+          end_time: true,
+          status: true,
+          created_at: true,
+          updated_at: true,
           promos: {
             where: { status: PromoStatus.active },
             orderBy: { created_at: 'desc' },
             take: 3,
+            select: {
+              id: true,
+              venue_id: true,
+              event_id: true,
+              title: true,
+              description: true,
+              discount_type: true,
+              discount_value: true,
+              status: true,
+              created_at: true,
+            },
           },
         },
       }),

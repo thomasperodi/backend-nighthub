@@ -141,6 +141,10 @@ model events {
   promos      promos[]
   bar_sales   bar_sales[]
   cloakroom_sales cloakroom_sales[]
+
+  @@index([venue_id, date])
+  @@index([date, start_time])
+  @@index([status])
 }
 
 // ===============================
@@ -294,6 +298,9 @@ model promos {
   venue          venues        @relation(fields: [venue_id], references: [id])
   event          events?       @relation(fields: [event_id], references: [id])
   user_promos    user_promos[]
+
+  @@index([event_id, status, created_at])
+  @@index([venue_id, created_at])
 }
 
 // ===============================
@@ -332,4 +339,6 @@ model reservations {
   @@index([event_id])
   @@index([user_id])
   @@index([venue_table_id])
+  @@index([event_id, created_at])
+  @@index([user_id, created_at])
 }
