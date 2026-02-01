@@ -8,12 +8,6 @@
       "maxDuration": 10
     }
   },
-  "crons": [
-    {
-      "path": "/events/sync-status",
-      "schedule": "*/1 * * * *"
-    }
-  ],
   "rewrites": [
     {
       "source": "/(.*)",

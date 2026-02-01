@@ -49,13 +49,7 @@ export class EventsController {
     token?: string;
     headerSecret?: string;
     authorization?: string;
-    userAgent?: string;
   }) {
-    // Allow Vercel Cron (GET requests) without needing to embed secrets in the URL.
-    // Note: user-agent can be spoofed; if you want stronger auth, keep CRON_SECRET and
-    // call the endpoint with token/header from a trusted scheduler.
-    if (params.userAgent?.includes('vercel-cron/1.0')) return;
-
     // Prefer staff auth if provided
     if (params.authorization) {
       this.assertStaffAuth(params.authorization);
@@ -156,9 +150,8 @@ export class EventsController {
     @Query('token') token?: string,
     @Headers('x-cron-secret') headerSecret?: string,
     @Headers('authorization') authorization?: string,
-    @Headers('user-agent') userAgent?: string,
   ) {
-    this.assertCronAuth({ token, headerSecret, authorization, userAgent });
+    this.assertCronAuth({ token, headerSecret, authorization });
     return this.eventsService.syncEventStatusesNow({
       daysBack: 2,
       daysForward: 2,
