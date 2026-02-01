@@ -20,6 +20,10 @@ import { JwtService } from '@nestjs/jwt';
 import { EventsService } from './events.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { UpdateEventDto } from './dto/update-event.dto';
+import { Public } from '../auth/public.decorator';
+import { Roles } from '../auth/roles.decorator';
+import { CurrentUser } from '../auth/current-user.decorator';
+import type { RequestUser } from '../auth/types';
 
 @Controller()
 export class EventsController {
@@ -68,6 +72,7 @@ export class EventsController {
   }
 
   @Get('events')
+  @Public()
   async list(
     @Query('venue_id') venue_id?: string,
     @Query('status') status?: string,
@@ -97,6 +102,7 @@ export class EventsController {
   }
 
   @Get('events/:id')
+  @Public()
   getOne(@Param('id') id: string, @Res({ passthrough: true }) res?: Response) {
     res?.setHeader(
       'Cache-Control',
@@ -106,18 +112,29 @@ export class EventsController {
   }
 
   @Get('events/:id/stats')
-  getStats(@Param('id') id: string) {
+  @Roles('venue', 'admin')
+  async getStats(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    if (user.role !== 'admin') {
+      if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
+      await this.eventsService.assertEventBelongsToVenue(id, user.venue_id);
+    }
     return this.eventsService.getEventStats(id);
   }
 
   @Post('events')
-  create(@Body() dto: CreateEventDto) {
+  @Roles('venue', 'admin')
+  create(@Body() dto: CreateEventDto, @CurrentUser() user: RequestUser) {
+    if (user.role !== 'admin') {
+      if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
+      dto.venue_id = user.venue_id;
+    }
     return this.eventsService.createEvent(dto);
   }
 
   // Upload poster separately to keep event create/update fast.
   // Client sends multipart/form-data with field name `file`.
   @Post('events/poster')
+  @Roles('venue', 'admin')
   @UseInterceptors(FileInterceptor('file'))
   uploadPoster(@UploadedFile() file?: Express.Multer.File) {
     return this.eventsService.uploadEventPoster(file);
@@ -126,26 +143,44 @@ export class EventsController {
   // Preferred: client-direct upload (no bytes through Vercel).
   // Returns { bucket, path, token, signedUrl } for Supabase Storage.
   @Post('events/poster/signed')
+  @Roles('venue', 'admin')
   createPosterSignedUpload(
     @Headers('authorization') authorization?: string,
     @Body() body?: { ext?: string; contentType?: string },
   ) {
-    this.assertStaffAuth(authorization);
+    // Guarded by roles; keep header param only for backward compatibility.
+    void authorization;
     return this.eventsService.createEventPosterSignedUpload(body);
   }
 
   @Patch('events/:id')
-  update(@Param('id') id: string, @Body() dto: UpdateEventDto) {
+  @Roles('venue', 'admin')
+  async update(
+    @Param('id') id: string,
+    @Body() dto: UpdateEventDto,
+    @CurrentUser() user: RequestUser,
+  ) {
+    if (user.role !== 'admin') {
+      if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
+      await this.eventsService.assertEventBelongsToVenue(id, user.venue_id);
+      dto.venue_id = user.venue_id;
+    }
     return this.eventsService.updateEvent(id, dto);
   }
 
   @Delete('events/:id')
-  remove(@Param('id') id: string) {
+  @Roles('venue', 'admin')
+  async remove(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    if (user.role !== 'admin') {
+      if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
+      await this.eventsService.assertEventBelongsToVenue(id, user.venue_id);
+    }
     return this.eventsService.deleteEvent(id);
   }
 
   // Used by Vercel Cron (or other scheduler) to keep DB status up-to-date even with no client traffic.
   @Get('events/sync-status')
+  @Public()
   syncStatus(
     @Query('token') token?: string,
     @Headers('x-cron-secret') headerSecret?: string,

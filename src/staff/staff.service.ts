@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -23,6 +24,26 @@ export class StaffService {
     private readonly prisma: PrismaService,
     private readonly eventsService: EventsService,
   ) {}
+
+  async assertEventBelongsToVenue(eventId: string, venueId: string) {
+    const e = await this.prisma.events.findUnique({
+      where: { id: eventId },
+      select: { id: true, venue_id: true },
+    });
+    if (!e) throw new NotFoundException('Event not found');
+    if (e.venue_id !== venueId) throw new ForbiddenException('Forbidden');
+  }
+
+  async assertEventTableBelongsToVenue(eventTableId: string, venueId: string) {
+    const t = await this.prisma.event_tables.findUnique({
+      where: { id: eventTableId },
+      select: { id: true, event: { select: { venue_id: true } } },
+    });
+    if (!t) throw new NotFoundException('Table not found');
+    if (t.event.venue_id !== venueId) {
+      throw new ForbiddenException('Forbidden');
+    }
+  }
 
   private isDebugStaffEnabled(): boolean {
     return process.env.DEBUG_STAFF === '1';

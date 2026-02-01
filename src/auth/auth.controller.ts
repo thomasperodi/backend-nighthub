@@ -4,26 +4,25 @@ import {
   Body,
   Headers,
   Delete,
-  HttpException,
-  HttpStatus,
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { RegisterDto, LoginDto } from './dto';
-import { JwtService } from '@nestjs/jwt';
+import { Public } from './public.decorator';
+import { CurrentUser } from './current-user.decorator';
+import type { RequestUser } from './types';
 
 @Controller('auth')
 export class AuthController {
-  constructor(
-    private authService: AuthService,
-    private jwtService: JwtService,
-  ) {}
+  constructor(private authService: AuthService) {}
 
   @Post('register')
+  @Public()
   register(@Body() dto: RegisterDto) {
     return this.authService.register(dto);
   }
 
   @Post('login')
+  @Public()
   login(@Body() dto: LoginDto) {
     return this.authService.login(dto);
   }
@@ -36,30 +35,14 @@ export class AuthController {
   }
 
   @Delete('me')
-  async deleteMe(@Headers('authorization') authorization?: string) {
+  async deleteMe(
+    @CurrentUser() user: RequestUser,
+    @Headers('authorization') authorization?: string,
+  ) {
+    await this.authService.deleteUser(user.id);
+
+    // revoke current token too (best-effort)
     const token = authorization?.replace(/^Bearer\s+/i, '') || undefined;
-    if (!token) {
-      throw new HttpException('Unauthorized', HttpStatus.UNAUTHORIZED);
-    }
-
-    let payload: unknown;
-    try {
-      payload = this.jwtService.verify(token);
-    } catch {
-      throw new HttpException('Unauthorized', HttpStatus.UNAUTHORIZED);
-    }
-
-    if (!payload || typeof payload !== 'object' || !('sub' in payload)) {
-      throw new HttpException('Unauthorized', HttpStatus.UNAUTHORIZED);
-    }
-
-    const { sub } = payload as { sub?: string };
-    if (!sub) {
-      throw new HttpException('Unauthorized', HttpStatus.UNAUTHORIZED);
-    }
-
-    await this.authService.deleteUser(sub);
-    // revoke token
     this.authService.logout(token);
 
     return { success: true };

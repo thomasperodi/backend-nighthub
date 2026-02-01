@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -717,6 +718,15 @@ export class EventsService {
     await this.syncEventStatusIfNeeded(event as EventStatusSyncCandidate);
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     return this.serializeEvent(event);
+  }
+
+  async assertEventBelongsToVenue(eventId: string, venueId: string) {
+    const e = await this.prisma.events.findUnique({
+      where: { id: eventId },
+      select: { id: true, venue_id: true },
+    });
+    if (!e) throw new NotFoundException('Event not found');
+    if (e.venue_id !== venueId) throw new ForbiddenException('Forbidden');
   }
 
   async getEventStats(eventId: string): Promise<EventStats> {

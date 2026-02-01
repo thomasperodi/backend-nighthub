@@ -1,10 +1,37 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma, PromoStatus } from '@prisma/client';
 
 @Injectable()
 export class PromosService {
   constructor(private readonly prisma: PrismaService) {}
+
+  async listActivePromos() {
+    return this.prisma.promos.findMany({
+      where: { status: PromoStatus.active },
+      orderBy: { created_at: 'desc' },
+      select: {
+        id: true,
+        venue_id: true,
+        event_id: true,
+        title: true,
+        description: true,
+        discount_type: true,
+        discount_value: true,
+        status: true,
+        created_at: true,
+      },
+    });
+  }
+
+  async assertEventBelongsToVenue(eventId: string, venueId: string) {
+    const e = await this.prisma.events.findUnique({
+      where: { id: eventId },
+      select: { id: true, venue_id: true },
+    });
+    if (!e) throw new NotFoundException('Event not found');
+    if (e.venue_id !== venueId) throw new ForbiddenException('Forbidden');
+  }
 
   async listActiveByEvent(eventId: string) {
     return this.prisma.promos.findMany({
@@ -55,6 +82,13 @@ export class PromosService {
   async listByEvent(eventId: string) {
     return this.prisma.promos.findMany({
       where: { event_id: eventId },
+      orderBy: { created_at: 'desc' },
+    });
+  }
+
+  async listByEventForVenue(eventId: string, venueId: string) {
+    return this.prisma.promos.findMany({
+      where: { event_id: eventId, venue_id: venueId },
       orderBy: { created_at: 'desc' },
     });
   }

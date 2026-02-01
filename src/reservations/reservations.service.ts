@@ -28,6 +28,25 @@ export class ReservationsService {
     }
   }
 
+  async listBookedTableIdsForEvent(eventId: string): Promise<string[]> {
+    const rows = await this.prisma.reservations.findMany({
+      where: {
+        event_id: eventId,
+        type: 'table',
+        // Cancelled reservations should not block the table.
+        status: { not: 'cancelled' },
+        venue_table_id: { not: null },
+      },
+      select: { venue_table_id: true },
+    });
+
+    const out = new Set<string>();
+    for (const r of rows) {
+      if (r.venue_table_id) out.add(r.venue_table_id);
+    }
+    return Array.from(out);
+  }
+
   private reservationSelect() {
     return {
       id: true,
