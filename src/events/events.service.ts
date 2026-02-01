@@ -40,6 +40,66 @@ export class EventsService {
     private readonly storage: SupabaseStorageService,
   ) {}
 
+  private getEventsTimeZone(): string {
+    // Events times (date + @db.Time) are intended as local venue time.
+    // Defaulting to Europe/Rome keeps behavior aligned with production expectations.
+    return process.env.EVENTS_TIMEZONE || 'Europe/Rome';
+  }
+
+  private getTimeZoneOffsetMs(timeZone: string, instant: Date): number {
+    // Returns offset where: localTime = utcTime + offset
+    // Uses Intl to derive the local wall-clock components for the given instant.
+    const dtf = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hour12: false,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+
+    const parts = dtf.formatToParts(instant);
+    const map = new Map(parts.map((p) => [p.type, p.value]));
+    const year = Number(map.get('year'));
+    const month = Number(map.get('month'));
+    const day = Number(map.get('day'));
+    const hour = Number(map.get('hour'));
+    const minute = Number(map.get('minute'));
+    const second = Number(map.get('second'));
+
+    const localAsUtcMs = Date.UTC(year, month - 1, day, hour, minute, second);
+    return localAsUtcMs - instant.getTime();
+  }
+
+  private zonedDateTimeToUtcMs(params: {
+    timeZone: string;
+    year: number;
+    month: number; // 1-12
+    day: number; // 1-31
+    hour: number;
+    minute: number;
+    second?: number;
+  }): number {
+    const baseUtc = Date.UTC(
+      params.year,
+      params.month - 1,
+      params.day,
+      params.hour,
+      params.minute,
+      params.second ?? 0,
+      0,
+    );
+
+    // Two-pass conversion to handle DST boundaries correctly.
+    const guess = new Date(baseUtc);
+    const offset1 = this.getTimeZoneOffsetMs(params.timeZone, guess);
+    const utc1 = baseUtc - offset1;
+    const offset2 = this.getTimeZoneOffsetMs(params.timeZone, new Date(utc1));
+    return baseUtc - offset2;
+  }
+
   private isDataUrlImage(value?: string | null): boolean {
     return Boolean(
       value && /^data:image\/(png|jpe?g|webp);base64,/i.test(value),
@@ -148,28 +208,43 @@ export class EventsService {
     const fallback = e.status ?? EventStatus.DRAFT;
     if (!e?.date || !e?.start_time || !e?.end_time) return fallback;
 
-    // Date is @db.Date: use UTC date parts to avoid timezone drift.
-    // start/end are @db.Time: use UTC time parts to avoid timezone drift.
-    const y = e.date.getUTCFullYear();
-    const m = e.date.getUTCMonth();
-    const d = e.date.getUTCDate();
+    const timeZone = this.getEventsTimeZone();
+
+    // Date is @db.Date: use UTC date parts to avoid timezone drift for the calendar day.
+    // start/end are @db.Time: use UTC time parts to extract the raw time value.
+    const year = e.date.getUTCFullYear();
+    const month = e.date.getUTCMonth() + 1;
+    const day = e.date.getUTCDate();
 
     const sh = e.start_time.getUTCHours();
     const sm = e.start_time.getUTCMinutes();
-
     const eh = e.end_time.getUTCHours();
     const em = e.end_time.getUTCMinutes();
 
-    // Interpret date + HH:MM as UTC to match compute_event_status() DB logic.
-    const start = new Date(Date.UTC(y, m, d, sh, sm, 0, 0));
-    const end = new Date(Date.UTC(y, m, d, eh, em, 0, 0));
+    const startMs = this.zonedDateTimeToUtcMs({
+      timeZone,
+      year,
+      month,
+      day,
+      hour: sh,
+      minute: sm,
+    });
+
+    let endMs = this.zonedDateTimeToUtcMs({
+      timeZone,
+      year,
+      month,
+      day,
+      hour: eh,
+      minute: em,
+    });
 
     // Events can end after midnight (e.g. Saturday 23:00 -> Sunday 05:00)
-    if (end.getTime() <= start.getTime()) end.setUTCDate(end.getUTCDate() + 1);
+    if (endMs <= startMs) endMs += 24 * 60 * 60 * 1000;
 
-    const now = new Date();
-    if (now.getTime() < start.getTime()) return EventStatus.DRAFT;
-    if (now.getTime() >= start.getTime() && now.getTime() < end.getTime()) {
+    const nowMs = Date.now();
+    if (nowMs < startMs) return EventStatus.DRAFT;
+    if (nowMs >= startMs && nowMs < endMs) {
       return EventStatus.LIVE;
     }
     return EventStatus.CLOSED;
