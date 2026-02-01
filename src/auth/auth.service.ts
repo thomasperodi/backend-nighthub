@@ -64,7 +64,9 @@ export class AuthService {
     const valid = await bcryptCompare(dto.password, user.password_hash);
     if (!valid) return null;
 
-    const payload = { sub: user.id, role: user.role };
+    // Include venue_id in the token payload to enable efficient venue-scoped authorization.
+    // Fallback DB lookup is still possible for older tokens.
+    const payload = { sub: user.id, role: user.role, venue_id: user.venue_id };
     const access_token = this.jwtService.sign(payload, { expiresIn: '7d' });
 
     const publicUser: PublicUser = {

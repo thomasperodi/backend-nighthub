@@ -10,6 +10,24 @@ import { Prisma } from '@prisma/client';
 export class ReservationsService {
   constructor(private readonly prisma: PrismaService) {}
 
+  async resolveVenueIdForUser(userId: string): Promise<string | null> {
+    const u = await this.prisma.users.findUnique({
+      where: { id: userId },
+      select: { venue_id: true },
+    });
+    return u?.venue_id ?? null;
+  }
+
+  async assertEventBelongsToVenue(eventId: string, venueId: string) {
+    const event = await this.prisma.events.findFirst({
+      where: { id: eventId, venue_id: venueId },
+      select: { id: true },
+    });
+    if (!event) {
+      throw new NotFoundException('Event not found for this venue');
+    }
+  }
+
   private reservationSelect() {
     return {
       id: true,
@@ -105,11 +123,13 @@ export class ReservationsService {
   async listReservations(params?: {
     eventId?: string;
     userId?: string;
+    venueId?: string;
     date?: string;
   }) {
     const where: Prisma.reservationsWhereInput = {};
     if (params?.eventId) where.event_id = params.eventId;
     if (params?.userId) where.user_id = params.userId;
+    if (params?.venueId) where.event = { venue_id: params.venueId };
     // date filtering not supported by current schema (no date column)
     return this.prisma.reservations.findMany({
       where,
@@ -121,7 +141,7 @@ export class ReservationsService {
   async listReservationsPaginated(
     page: number,
     pageSize: number,
-    params?: { eventId?: string; userId?: string },
+    params?: { eventId?: string; userId?: string; venueId?: string },
   ) {
     const take = Math.max(pageSize, 1);
     const skip = (Math.max(page, 1) - 1) * take;
@@ -129,6 +149,7 @@ export class ReservationsService {
     const where: Prisma.reservationsWhereInput = {};
     if (params?.eventId) where.event_id = params.eventId;
     if (params?.userId) where.user_id = params.userId;
+    if (params?.venueId) where.event = { venue_id: params.venueId };
 
     const [total, data] = await this.prisma.$transaction([
       this.prisma.reservations.count({ where }),
