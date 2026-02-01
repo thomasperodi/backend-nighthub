@@ -32,9 +32,9 @@ export class EventsController {
     const token = authorization?.replace(/^Bearer\s+/i, '') || undefined;
     if (!token) throw new UnauthorizedException('Missing Authorization token');
 
-    let payload: any;
+    let payload: { role?: string };
     try {
-      payload = this.jwtService.verify(token);
+      payload = this.jwtService.verify<{ role?: string }>(token);
     } catch {
       throw new UnauthorizedException('Invalid token');
     }
@@ -42,6 +42,28 @@ export class EventsController {
     const role = String(payload?.role || '').toLowerCase();
     if (!role || role === 'client') {
       throw new ForbiddenException('Insufficient permissions');
+    }
+  }
+
+  private assertCronAuth(params: {
+    token?: string;
+    headerSecret?: string;
+    authorization?: string;
+  }) {
+    // Prefer staff auth if provided
+    if (params.authorization) {
+      this.assertStaffAuth(params.authorization);
+      return;
+    }
+
+    const expected = process.env.CRON_SECRET || '';
+    if (!expected) {
+      throw new ForbiddenException('CRON_SECRET is not configured');
+    }
+
+    const provided = params.headerSecret || params.token || '';
+    if (!provided || provided !== expected) {
+      throw new ForbiddenException('Invalid cron secret');
     }
   }
 
@@ -120,5 +142,19 @@ export class EventsController {
   @Delete('events/:id')
   remove(@Param('id') id: string) {
     return this.eventsService.deleteEvent(id);
+  }
+
+  // Used by Vercel Cron (or other scheduler) to keep DB status up-to-date even with no client traffic.
+  @Post('events/sync-status')
+  syncStatus(
+    @Query('token') token?: string,
+    @Headers('x-cron-secret') headerSecret?: string,
+    @Headers('authorization') authorization?: string,
+  ) {
+    this.assertCronAuth({ token, headerSecret, authorization });
+    return this.eventsService.syncEventStatusesNow({
+      daysBack: 2,
+      daysForward: 2,
+    });
   }
 }

@@ -25,6 +25,14 @@ export type EventStats = {
   last_updated: Date;
 };
 
+type EventStatusSyncCandidate = {
+  id: string;
+  date: Date | null;
+  start_time: Date | null;
+  end_time: Date | null;
+  status: EventStatus | null;
+};
+
 @Injectable()
 export class EventsService {
   constructor(
@@ -78,29 +86,10 @@ export class EventsService {
     return process.env.DEBUG_EVENTS === '1';
   }
 
-  private nowUtcTimestampExpr() {
-    // timestamp without time zone in UTC (matches our @db.Time UTC-component convention)
-    return Prisma.sql`(now() AT TIME ZONE 'UTC')`;
-  }
-
   private computedStatusExpr() {
-    // Computes DRAFT/LIVE/CLOSED from date + time window.
-    // NOTE: returns text to compare against EventStatus enum values.
-    const nowUtc = this.nowUtcTimestampExpr();
-    return Prisma.sql`
-      CASE
-        WHEN e."date" IS NULL OR e."start_time" IS NULL OR e."end_time" IS NULL THEN e."status"::text
-        ELSE
-          CASE
-            WHEN ${nowUtc} < (e."date" + e."start_time") THEN 'DRAFT'
-            WHEN ${nowUtc} < (
-              e."date" + e."end_time" +
-              CASE WHEN e."end_time" <= e."start_time" THEN interval '1 day' ELSE interval '0 day' END
-            ) THEN 'LIVE'
-            ELSE 'CLOSED'
-          END
-      END
-    `;
+    // Delegates computed status (including cross-midnight windows) to the DB.
+    // Returns a Postgres "EventStatus" enum.
+    return Prisma.sql`public.compute_event_status(e."date", e."start_time", e."end_time", e."status")`;
   }
 
   private async listEventIdsByComputedStatus(params: {
@@ -159,14 +148,11 @@ export class EventsService {
     const fallback = e.status ?? EventStatus.DRAFT;
     if (!e?.date || !e?.start_time || !e?.end_time) return fallback;
 
-    // Interpret date + HH:MM as local time (venue-friendly).
-    // Extract HH:MM from @db.Time using UTC components to avoid timezone drift.
-    const [yy, mm, dd] = this.formatDateOnly(e.date)
-      .split('-')
-      .map((x) => parseInt(x, 10));
-    const y = Number.isFinite(yy) ? yy : e.date.getFullYear();
-    const m = Number.isFinite(mm) ? mm - 1 : e.date.getMonth();
-    const d = Number.isFinite(dd) ? dd : e.date.getDate();
+    // Date is @db.Date: use UTC date parts to avoid timezone drift.
+    // start/end are @db.Time: use UTC time parts to avoid timezone drift.
+    const y = e.date.getUTCFullYear();
+    const m = e.date.getUTCMonth();
+    const d = e.date.getUTCDate();
 
     const sh = e.start_time.getUTCHours();
     const sm = e.start_time.getUTCMinutes();
@@ -174,13 +160,12 @@ export class EventsService {
     const eh = e.end_time.getUTCHours();
     const em = e.end_time.getUTCMinutes();
 
-    const start = new Date(y, m, d, sh, sm, 0, 0);
-    const end = new Date(y, m, d, eh, em, 0, 0);
+    // Interpret date + HH:MM as UTC to match compute_event_status() DB logic.
+    const start = new Date(Date.UTC(y, m, d, sh, sm, 0, 0));
+    const end = new Date(Date.UTC(y, m, d, eh, em, 0, 0));
 
-    // Events can end after midnight (e.g. 21:00 -> 03:00)
-    if (end.getTime() <= start.getTime()) {
-      end.setDate(end.getDate() + 1);
-    }
+    // Events can end after midnight (e.g. Saturday 23:00 -> Sunday 05:00)
+    if (end.getTime() <= start.getTime()) end.setUTCDate(end.getUTCDate() + 1);
 
     const now = new Date();
     if (now.getTime() < start.getTime()) return EventStatus.DRAFT;
@@ -188,6 +173,31 @@ export class EventsService {
       return EventStatus.LIVE;
     }
     return EventStatus.CLOSED;
+  }
+
+  private async syncEventStatusIfNeeded(e: {
+    id?: string;
+    date?: Date | null;
+    start_time?: Date | null;
+    end_time?: Date | null;
+    status?: EventStatus | null;
+  }): Promise<void> {
+    if (!e?.id) return;
+    if (!e?.date || !e?.start_time || !e?.end_time) return;
+
+    const effective = this.computeEffectiveStatus(e);
+    const current = e.status ?? EventStatus.DRAFT;
+    if (effective === current) return;
+
+    // Best-effort: keep DB status aligned for all consumers.
+    try {
+      await this.prisma.events.update({
+        where: { id: e.id },
+        data: { status: effective },
+      });
+    } catch {
+      // ignore
+    }
   }
 
   private normalizeStatus(status?: string): EventStatus | undefined {
@@ -236,8 +246,8 @@ export class EventsService {
   }
 
   private formatDateOnly(date: Date): string {
-    // YYYY-MM-DD
-    return date.toISOString().slice(0, 10);
+    // YYYY-MM-DD from UTC components to avoid timezone drift
+    return `${date.getUTCFullYear()}-${this.pad2(date.getUTCMonth() + 1)}-${this.pad2(date.getUTCDate())}`;
   }
 
   private formatTimeOnly(time?: Date | null): string | undefined {
@@ -387,6 +397,11 @@ export class EventsService {
 
       const byId = new Map(rows.map((r) => [r.id, r]));
       const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
+      await Promise.all(
+        ordered.map((e) =>
+          this.syncEventStatusIfNeeded(e as EventStatusSyncCandidate),
+        ),
+      );
       // eslint-disable-next-line @typescript-eslint/no-unsafe-return
       return ordered.map((e) => this.serializeEvent(e)) as any;
     }
@@ -434,6 +449,12 @@ export class EventsService {
         tzOffsetMinutes: new Date().getTimezoneOffset(),
       });
     }
+
+    await Promise.all(
+      list.map((e) =>
+        this.syncEventStatusIfNeeded(e as EventStatusSyncCandidate),
+      ),
+    );
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     const serialized = list.map((e) => this.serializeEvent(e));
@@ -530,6 +551,11 @@ export class EventsService {
 
       const byId = new Map(rows.map((r) => [r.id, r]));
       const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
+      await Promise.all(
+        ordered.map((e) =>
+          this.syncEventStatusIfNeeded(e as EventStatusSyncCandidate),
+        ),
+      );
       // eslint-disable-next-line @typescript-eslint/no-unsafe-return
       const pageData = ordered.map((e) => this.serializeEvent(e));
 
@@ -586,6 +612,12 @@ export class EventsService {
       }),
     ]);
 
+    await Promise.all(
+      data.map((e) =>
+        this.syncEventStatusIfNeeded(e as EventStatusSyncCandidate),
+      ),
+    );
+
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     const serializedData = data.map((e) => this.serializeEvent(e));
 
@@ -607,6 +639,7 @@ export class EventsService {
       },
     });
     if (!event) throw new NotFoundException('Event not found');
+    await this.syncEventStatusIfNeeded(event as EventStatusSyncCandidate);
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     return this.serializeEvent(event);
   }
@@ -837,6 +870,28 @@ export class EventsService {
       total_tables: this.decimalToNumber(tableAgg._sum.amount),
       last_updated: new Date(),
     };
+  }
+
+  async syncEventStatusesNow(params?: {
+    daysBack?: number;
+    daysForward?: number;
+  }) {
+    const daysBack = Math.max(0, Math.min(params?.daysBack ?? 2, 7));
+    const daysForward = Math.max(0, Math.min(params?.daysForward ?? 2, 7));
+
+    // Only a small moving window can change status over time.
+    // Cross-midnight events still belong to their start "date", so yesterday/today/tomorrow is enough.
+    const updated = await this.prisma.$executeRaw`
+      UPDATE "events" e
+      SET "status" = public.compute_event_status(e."date", e."start_time", e."end_time", e."status")
+      WHERE e."start_time" IS NOT NULL
+        AND e."end_time" IS NOT NULL
+        AND e."date" >= (CURRENT_DATE - (${daysBack}::int * interval '1 day'))::date
+        AND e."date" <= (CURRENT_DATE + (${daysForward}::int * interval '1 day'))::date
+        AND e."status" <> public.compute_event_status(e."date", e."start_time", e."end_time", e."status");
+    `;
+
+    return { success: true, updated: Number(updated) };
   }
 
   async venueStats(venueId: string) {
