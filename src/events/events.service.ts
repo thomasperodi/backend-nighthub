@@ -787,6 +787,16 @@ export class EventsService {
   async deleteEvent(id: string) {
     await this.getEvent(id);
     await this.prisma.$transaction([
+      // Delete dependents first to satisfy FK constraints
+      this.prisma.reservations.deleteMany({ where: { event_id: id } }),
+      this.prisma.event_entry_prices.deleteMany({ where: { event_id: id } }),
+
+      // Promos linked to this event may have user_promos rows
+      this.prisma.user_promos.deleteMany({
+        where: { promo: { event_id: id } },
+      }),
+      this.prisma.promos.deleteMany({ where: { event_id: id } }),
+
       this.prisma.bar_sales.deleteMany({ where: { event_id: id } }),
       this.prisma.cloakroom_sales.deleteMany({ where: { event_id: id } }),
       this.prisma.table_sales.deleteMany({
