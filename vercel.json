@@ -10,7 +10,7 @@
   },
   "crons": [
     {
-      "path": "/events/sync-status?token=${CRON_SECRET}",
+      "path": "/events/sync-status",
       "schedule": "*/1 * * * *"
     }
   ],
