@@ -172,7 +172,7 @@ export class EventsService {
       FROM "events" e
       WHERE (${venueId}::uuid IS NULL OR e."venue_id" = ${venueId}::uuid)
         AND (${date}::date IS NULL OR e."date" = ${date}::date)
-        AND (${computed}) = ${status}
+        AND (${computed}) = (${status}::"EventStatus")
     `;
 
     let total: number | undefined;

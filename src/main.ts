@@ -30,8 +30,11 @@ import { AppModule } from './app.module';
 import { json, urlencoded } from 'express';
 import type { AbstractHttpAdapter } from '@nestjs/core';
 import { responseTimingMiddleware } from './common/http/response-timing.middleware';
+import express from 'express';
+import { ExpressAdapter } from '@nestjs/platform-express';
+import type { VercelRequest, VercelResponse } from '@vercel/node';
 
-export async function createApp(adapter?: AbstractHttpAdapter) {
+async function createApp(adapter?: AbstractHttpAdapter) {
   const app = adapter
     ? await NestFactory.create(AppModule, adapter, { bodyParser: false })
     : await NestFactory.create(AppModule, { bodyParser: false });
@@ -55,6 +58,36 @@ export async function createApp(adapter?: AbstractHttpAdapter) {
   return app;
 }
 
+// If Vercel (or another serverless builder) ends up treating this file as the function entrypoint,
+// provide a compatible default export handler. The preferred entrypoint remains `api/index.ts`.
+const server = express();
+let serverlessApp: unknown;
+let serverlessBootstrapPromise: Promise<express.Express> | undefined;
+
+async function bootstrapServerless() {
+  if (serverlessApp) return server;
+  if (serverlessBootstrapPromise) return serverlessBootstrapPromise;
+
+  serverlessBootstrapPromise = (async () => {
+    const nestApp = await createApp(new ExpressAdapter(server));
+    await nestApp.init();
+    serverlessApp = nestApp;
+    return server;
+  })();
+
+  return serverlessBootstrapPromise;
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const srv = await bootstrapServerless();
+  srv(req, res);
+}
+
+// Some Vercel runtimes load handlers via CommonJS `require()` and treat `module.exports` as the
+// "default export". Ensure `require('./main.js')` returns a function (not an object).
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(module as any).exports = handler;
+
 async function bootstrap() {
   const app = await createApp();
   const port = Number(process.env.PORT ?? 3000);
@@ -62,5 +95,8 @@ async function bootstrap() {
   console.log(`Backend listening on http://0.0.0.0:${port}`);
 }
 
-// Nest CLI entrypoint for local dev
-void bootstrap();
+// Nest CLI entrypoint for local dev / traditional server deploy.
+// Avoid listening when running on Vercel serverless.
+if (!process.env.VERCEL) {
+  void bootstrap();
+}
