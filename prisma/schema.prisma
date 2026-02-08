@@ -90,6 +90,7 @@ model users {
 
   reservations  reservations[]
   user_promos   user_promos[]
+  venue_stays   venue_stays[]
 
   @@index([venue_id])
 }
@@ -115,6 +116,28 @@ model venues {
   tables      venue_tables[]
   promos      promos[]
   users       users[]
+  venue_stays venue_stays[]
+}
+
+// ===============================
+// VENUE STAYS (PERMANENZA CLIENTI)
+// ===============================
+model venue_stays {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id     String   @db.Uuid
+  venue_id    String   @db.Uuid
+  entered_at  DateTime
+  exited_at   DateTime?
+  duration_ms Int?
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  user        users    @relation(fields: [user_id], references: [id])
+  venue       venues   @relation(fields: [venue_id], references: [id])
+
+  @@index([user_id, entered_at])
+  @@index([venue_id, entered_at])
+  @@index([venue_id, exited_at])
 }
 
 // ===============================

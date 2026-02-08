@@ -8,12 +8,22 @@ import { EventsModule } from './events/events.module';
 import { StaffModule } from './staff/staff.module';
 import { VenuesModule } from './venues/venues.module';
 import { ReservationsModule } from './reservations/reservations.module';
+import { VenueStaysModule } from './venue-stays/venue-stays.module';
 import { StorageModule } from './common/storage/storage.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { RolesGuard } from './auth/roles.guard';
 
 @Module({
-  imports: [PrismaModule, StorageModule, AuthModule, EventsModule, StaffModule, VenuesModule, ReservationsModule],
+  imports: [
+    PrismaModule,
+    StorageModule,
+    AuthModule,
+    EventsModule,
+    StaffModule,
+    VenuesModule,
+    ReservationsModule,
+    VenueStaysModule,
+  ],
   controllers: [AppController],
   providers: [
     AppService,
