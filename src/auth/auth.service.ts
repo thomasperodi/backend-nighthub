@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
@@ -9,6 +9,9 @@ import { JwtService } from '@nestjs/jwt';
 export type PublicUser = {
   id: string;
   email: string;
+  username?: string | null;
+  name?: string | null;
+  avatar?: string | null;
   role: string;
   venue_id?: string | null;
   created_at?: Date | null;
@@ -35,9 +38,17 @@ export class AuthService {
 
     const bcryptHash = hash as (s: string, rounds: number) => Promise<string>;
     const hashedPassword = await bcryptHash(dto.password, 10);
+    const username = String(dto.username || '')
+      .trim()
+      .toLowerCase();
+    if (!username) {
+      throw new BadRequestException('username required');
+    }
+
     const user = await this.prisma.users.create({
       data: {
         email: dto.email,
+        username,
         password_hash: hashedPassword,
         role,
       },
@@ -46,6 +57,9 @@ export class AuthService {
     const publicUser: PublicUser = {
       id: user.id,
       email: user.email,
+      username: user.username,
+      name: user.name,
+      avatar: user.avatar,
       role: user.role,
       venue_id: user.venue_id,
       created_at: user.created_at,
@@ -72,6 +86,9 @@ export class AuthService {
     const publicUser: PublicUser = {
       id: user.id,
       email: user.email,
+      username: user.username,
+      name: user.name,
+      avatar: user.avatar,
       role: user.role,
       venue_id: user.venue_id,
       created_at: user.created_at,

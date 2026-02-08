@@ -62,12 +62,19 @@ enum Gender {
   ALTRO
 }
 
+enum FriendRequestStatus {
+  pending
+  accepted
+  rejected
+}
+
 // ===============================
 // USERS
 // ===============================
 model users {
   id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   email         String   @unique
+  username      String?  @unique
   password_hash String
   role          UserRole
 
@@ -92,7 +99,14 @@ model users {
   user_promos   user_promos[]
   venue_stays   venue_stays[]
 
+  sent_friend_requests     friend_requests[] @relation("FriendRequestsSent")
+  received_friend_requests friend_requests[] @relation("FriendRequestsReceived")
+  friendships              friendships[]     @relation("UserFriendships")
+  friend_groups            friend_groups[]
+  group_memberships        friend_group_members[]
+
   @@index([venue_id])
+  @@index([username])
 }
 
 
@@ -117,6 +131,69 @@ model venues {
   promos      promos[]
   users       users[]
   venue_stays venue_stays[]
+}
+
+// ===============================
+// FRIEND REQUESTS
+// ===============================
+model friend_requests {
+  id           String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  from_user_id String               @db.Uuid
+  to_user_id   String               @db.Uuid
+  status       FriendRequestStatus  @default(pending)
+  created_at   DateTime             @default(now())
+  updated_at   DateTime             @updatedAt
+
+  from_user    users @relation("FriendRequestsSent", fields: [from_user_id], references: [id])
+  to_user      users @relation("FriendRequestsReceived", fields: [to_user_id], references: [id])
+
+  @@unique([from_user_id, to_user_id])
+  @@index([to_user_id, status])
+  @@index([from_user_id, status])
+}
+
+// ===============================
+// FRIENDSHIPS (BI-DIRECTIONAL)
+// ===============================
+model friendships {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id    String   @db.Uuid
+  friend_id  String   @db.Uuid
+  created_at DateTime @default(now())
+
+  user       users @relation("UserFriendships", fields: [user_id], references: [id])
+
+  @@unique([user_id, friend_id])
+  @@index([friend_id])
+}
+
+// ===============================
+// FRIEND GROUPS
+// ===============================
+model friend_groups {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  owner_id   String   @db.Uuid
+  name       String
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  owner      users @relation(fields: [owner_id], references: [id])
+  members    friend_group_members[]
+
+  @@index([owner_id])
+}
+
+model friend_group_members {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  group_id   String   @db.Uuid
+  user_id    String   @db.Uuid
+  created_at DateTime @default(now())
+
+  group      friend_groups @relation(fields: [group_id], references: [id])
+  user       users         @relation(fields: [user_id], references: [id])
+
+  @@unique([group_id, user_id])
+  @@index([user_id])
 }
 
 // ===============================

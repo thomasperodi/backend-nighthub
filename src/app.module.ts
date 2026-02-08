@@ -9,6 +9,7 @@ import { StaffModule } from './staff/staff.module';
 import { VenuesModule } from './venues/venues.module';
 import { ReservationsModule } from './reservations/reservations.module';
 import { VenueStaysModule } from './venue-stays/venue-stays.module';
+import { FriendsModule } from './friends/friends.module';
 import { StorageModule } from './common/storage/storage.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { RolesGuard } from './auth/roles.guard';
@@ -23,6 +24,7 @@ import { RolesGuard } from './auth/roles.guard';
     VenuesModule,
     ReservationsModule,
     VenueStaysModule,
+    FriendsModule,
   ],
   controllers: [AppController],
   providers: [
