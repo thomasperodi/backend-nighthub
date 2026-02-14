@@ -6,7 +6,7 @@ import {
   Delete,
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
-import { RegisterDto, LoginDto } from './dto';
+import { RegisterDto, LoginDto, PushTokenDto } from './dto';
 import { Public } from './public.decorator';
 import { CurrentUser } from './current-user.decorator';
 import type { RequestUser } from './types';
@@ -32,6 +32,15 @@ export class AuthController {
     const token = authorization?.replace(/^Bearer\s+/i, '') || undefined;
     const ok = this.authService.logout(token);
     return { success: ok };
+  }
+
+  @Post('push-token')
+  async setPushToken(
+    @Body() dto: PushTokenDto,
+    @CurrentUser() user: RequestUser,
+  ) {
+    await this.authService.setPushToken(user.id, dto.push_token);
+    return { success: true };
   }
 
   @Delete('me')

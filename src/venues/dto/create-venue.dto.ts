@@ -1,4 +1,4 @@
-import { IsString, IsOptional } from 'class-validator';
+import { IsString, IsOptional, IsInt, Min } from 'class-validator';
 
 export class CreateVenueDto {
   @IsString()
@@ -7,4 +7,9 @@ export class CreateVenueDto {
   @IsOptional()
   @IsString()
   city?: string;
+
+  @IsOptional()
+  @IsInt()
+  @Min(10)
+  radius_geofence?: number;
 }

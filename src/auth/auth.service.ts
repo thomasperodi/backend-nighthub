@@ -1,9 +1,9 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { hash, compare } from 'bcrypt';
-import { UserRole, users } from '@prisma/client';
+import { Prisma, UserRole, users } from '@prisma/client';
 import { JwtService } from '@nestjs/jwt';
 
 export type PublicUser = {
@@ -31,10 +31,11 @@ export class AuthService {
 
   async register(dto: RegisterDto): Promise<PublicUser> {
     const allowedRoles = new Set<string>(Object.values(UserRole));
-    const desiredRole = (dto.role ?? UserRole.client).toString();
-    const role = (
-      allowedRoles.has(desiredRole) ? desiredRole : UserRole.client
-    ) as UserRole;
+    const desiredRole = (dto.role ?? UserRole.client).toString().trim().toLowerCase();
+    if (!allowedRoles.has(desiredRole)) {
+      throw new BadRequestException('role invalid');
+    }
+    const role = desiredRole as UserRole;
 
     const bcryptHash = hash as (s: string, rounds: number) => Promise<string>;
     const hashedPassword = await bcryptHash(dto.password, 10);
@@ -45,14 +46,46 @@ export class AuthService {
       throw new BadRequestException('username required');
     }
 
-    const user = await this.prisma.users.create({
-      data: {
-        email: dto.email,
-        username,
-        password_hash: hashedPassword,
-        role,
-      },
-    });
+    const name = String(dto.name || '').trim();
+    if (!name) {
+      throw new BadRequestException('name required');
+    }
+
+    if ((role === UserRole.staff || role === UserRole.venue) && !dto.venue_id) {
+      throw new BadRequestException('venue_id required for staff/venue');
+    }
+    if (role === UserRole.client && dto.venue_id) {
+      throw new BadRequestException('venue_id not allowed for client');
+    }
+
+    const birthDate = dto.birth_date ? new Date(dto.birth_date) : undefined;
+    if (birthDate && Number.isNaN(birthDate.getTime())) {
+      throw new BadRequestException('birth_date must be ISO8601');
+    }
+
+    let user: users;
+    try {
+      user = await this.prisma.users.create({
+        data: {
+          email: dto.email,
+          username,
+          password_hash: hashedPassword,
+          role,
+          name: name || undefined,
+          phone: dto.phone ?? undefined,
+          avatar: dto.avatar ?? undefined,
+          sesso: dto.sesso ?? undefined,
+          birth_date: birthDate ?? undefined,
+          venue_id: dto.venue_id ?? undefined,
+        },
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        const target = Array.isArray(err.meta?.target) ? err.meta?.target.join(', ') : 'unique field';
+        throw new ConflictException(`User already exists (${target})`);
+      }
+      throw err;
+    }
 
     const publicUser: PublicUser = {
       id: user.id,
@@ -112,5 +145,17 @@ export class AuthService {
   async deleteUser(userId: string) {
     // remove related data first if needed, then delete user
     await this.prisma.users.delete({ where: { id: userId } });
+  }
+
+  async setPushToken(userId: string, pushToken: string) {
+    if (!pushToken) throw new BadRequestException('push_token required');
+
+    await this.prisma.users.update({
+      where: { id: userId },
+      data: {
+        push_token: pushToken,
+        push_token_updated_at: new Date(),
+      },
+    });
   }
 }

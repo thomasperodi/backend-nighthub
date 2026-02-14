@@ -225,10 +225,44 @@ export class StaffService {
     return Gender.ALTRO;
   }
 
+  private async sendExpoPush(params: {
+    token: string;
+    title: string;
+    body: string;
+    data?: Record<string, unknown>;
+  }) {
+    const token = params.token || '';
+    const isExpoToken =
+      token.startsWith('ExponentPushToken') || token.startsWith('ExpoPushToken');
+    if (!isExpoToken) return;
+
+    try {
+      await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          to: token,
+          title: params.title,
+          body: params.body,
+          sound: 'default',
+          priority: 'high',
+          content_available: true,
+          data: params.data ?? {},
+        }),
+      });
+    } catch {
+      // Best-effort only.
+    }
+  }
+
   async recordEntry(dto: RecordEntryDto) {
     const quantity = dto.quantity ?? 1;
     if (quantity <= 0)
       throw new BadRequestException('quantity must be positive');
+
+    if (dto.user_id && quantity !== 1) {
+      throw new BadRequestException('quantity must be 1 when user_id is provided');
+    }
 
     const payload = dto as unknown as Record<string, unknown>;
     const eventIdInput =
@@ -243,20 +277,59 @@ export class StaffService {
     await this.ensureEvent(eventId);
 
     const sesso = this.entryTypeToGender(dto.entry_type ?? 'free');
+    const method = dto.user_id ? EntryMethod.QR : EntryMethod.RAPIDO;
     const createData: Prisma.entriesCreateManyInput[] = Array.from(
       { length: quantity },
       () => ({
         event_id: eventId,
         staff_id: dto.staff_id ?? null,
-        user_id: null,
+        user_id: dto.user_id ?? null,
         sesso,
         price: new Prisma.Decimal(0),
-        method: EntryMethod.RAPIDO,
+        method,
       }),
     );
 
     await this.prisma.entries.createMany({ data: createData });
     const stats = await this.eventsService.recalculateEventStats(eventId);
+
+    if (dto.user_id) {
+      const user = await this.prisma.users.findUnique({
+        where: { id: dto.user_id },
+        select: { push_token: true },
+      });
+
+      const event = await this.prisma.events.findUnique({
+        where: { id: eventId },
+        include: { venue: true },
+      });
+
+      const venue = event?.venue ?? null;
+      const latitude = venue?.latitude ? Number(venue.latitude) : null;
+      const longitude = venue?.longitude ? Number(venue.longitude) : null;
+      const radius = venue?.radius_geofence ?? 100;
+
+      if (
+        user?.push_token &&
+        Number.isFinite(latitude) &&
+        Number.isFinite(longitude) &&
+        venue?.id
+      ) {
+        await this.sendExpoPush({
+          token: user.push_token,
+          title: 'Ingresso al locale',
+          body: `Monitoraggio posizione attivato per ${venue.name ?? 'il locale'}.`,
+          data: {
+            type: 'venue_stay',
+            venue_id: venue.id,
+            latitude,
+            longitude,
+            radius,
+          },
+        });
+      }
+    }
+
     return { success: true, created: quantity, stats };
   }
 

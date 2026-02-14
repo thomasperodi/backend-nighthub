@@ -24,7 +24,11 @@ export class VenuesService {
     return v;
   }
 
-  async createVenue(input: { name: string; city?: string }): Promise<venues> {
+  async createVenue(input: {
+    name: string;
+    city?: string;
+    radius_geofence?: number;
+  }): Promise<venues> {
     if (!input || !input.name) {
       throw new BadRequestException('Missing required fields');
     }
@@ -34,18 +38,29 @@ export class VenuesService {
       city: input.city ?? undefined,
     };
 
+    if (input.radius_geofence !== undefined) {
+      data.radius_geofence = input.radius_geofence;
+    }
+
     return await this.prisma.venues.create({ data });
   }
 
   async updateVenue(
     id: string,
-    updates: Partial<{ name?: string; city?: string }>,
+    updates: Partial<{
+      name?: string;
+      city?: string;
+      radius_geofence?: number;
+    }>,
   ): Promise<venues> {
     await this.getVenue(id);
 
     const data: Prisma.venuesUpdateInput = {};
     if (updates.name !== undefined) data.name = updates.name;
     if (updates.city !== undefined) data.city = updates.city;
+    if (updates.radius_geofence !== undefined) {
+      data.radius_geofence = updates.radius_geofence;
+    }
 
     return await this.prisma.venues.update({ where: { id }, data });
   }

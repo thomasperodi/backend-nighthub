@@ -81,6 +81,8 @@ model users {
   name          String?
   phone         String?
   avatar        String?
+  push_token    String?
+  push_token_updated_at DateTime?
 
   sesso         Gender?
   birth_date    DateTime?
@@ -123,6 +125,7 @@ model venues {
   image       String?
   latitude    Decimal? @db.Decimal(9,6)
   longitude   Decimal? @db.Decimal(9,6)
+  radius_geofence Int    @default(100)
   created_at  DateTime @default(now())
   updated_at  DateTime @updatedAt
 
