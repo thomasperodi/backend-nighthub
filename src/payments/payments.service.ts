@@ -199,132 +199,137 @@ private calcGrossCentsFromNet(netEuro: number): number {
     };
   }
 
-  async createEntryPaymentSheetIntent(params: {
-    userId: string;
-    eventId: string;
-    quantity?: number;
-  }) {
-    const quantity = this.parseQuantity(params.quantity);
+async createEntryPaymentSheetIntent(params: {
+  userId: string;
+  eventId: string;
+  quantity?: number;
+}) {
+  const quantity = this.parseQuantity(params.quantity);
 
-    const event = await this.prisma.events.findUnique({
-      where: { id: params.eventId },
-      select: {
-        id: true,
-        venue_id: true,
-        name: true,
-        access_mode: true,
-        presale_price: true,
-        presale_currency: true,
-        presale_capacity: true,
-        presale_sold: true,
-        venue: {
-          select: {
-            stripe_account_id: true,
-            stripe_charges_enabled: true,
-            stripe_payouts_enabled: true,
-          },
+  const event = await this.prisma.events.findUnique({
+    where: { id: params.eventId },
+    select: {
+      id: true,
+      venue_id: true,
+      name: true,
+      access_mode: true,
+      presale_price: true,
+      presale_currency: true,
+      presale_capacity: true,
+      presale_sold: true,
+      venue: {
+        select: {
+          stripe_account_id: true,
+          stripe_charges_enabled: true,
+          stripe_payouts_enabled: true,
         },
       },
-    });
-
-    if (!event) throw new NotFoundException('Event not found');
-    if (event.access_mode !== EventAccessMode.PRE_SALE) {
-      throw new BadRequestException('This event is not enabled for pre-sale');
-    }
-
-    const venueStripeAccountId = event.venue?.stripe_account_id;
-    if (!venueStripeAccountId) {
-      throw new BadRequestException(
-        'Questo locale non ha ancora collegato Stripe Connect',
-      );
-    }
-
-    if (
-      !event.venue?.stripe_charges_enabled ||
-      !event.venue?.stripe_payouts_enabled
-    ) {
-      throw new BadRequestException(
-        'Account Stripe del locale non ancora abilitato ai pagamenti',
-      );
-    }
-
-    const existingActive = await this.prisma.reservations.findFirst({
-      where: {
-        user_id: params.userId,
-        event_id: params.eventId,
-        status: { in: ['pending', 'confirmed', 'completed'] },
-      },
-      select: { id: true },
-    });
-
-    if (existingActive) {
-      throw new BadRequestException('Hai già una prenotazione per questa serata');
-    }
-
-    const unitPrice = event.presale_price ? Number(event.presale_price) : 0;
-    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
-      throw new BadRequestException('Invalid presale price for this event');
-    }
-
-    if (
-      event.presale_capacity !== null &&
-      event.presale_capacity !== undefined &&
-      event.presale_sold + quantity > event.presale_capacity
-    ) {
-      throw new BadRequestException('Prevendita terminata per questo evento');
-    }
-
-    const stripe = this.getStripeClient();
-    const currency = (event.presale_currency || 'eur').toLowerCase();
-
-
-const paymentIntent = await stripe.paymentIntents.create(
-  {
-    amount: grossCents, // l'utente paga tutto
-    currency,
-    automatic_payment_methods: { enabled: true },
-    transfer_data: {
-      destination: venueStripeAccountId, // il locale riceve il netto
     },
-    application_fee_amount: applicationFee, // residuo che va a te (piattaforma)
-    metadata: {
-      app: 'NightHub',
-      type: 'entry_presale',
+  });
+
+  if (!event) throw new NotFoundException('Event not found');
+  if (event.access_mode !== EventAccessMode.PRE_SALE) {
+    throw new BadRequestException('This event is not enabled for pre-sale');
+  }
+
+  const venueStripeAccountId = event.venue?.stripe_account_id;
+  if (!venueStripeAccountId) {
+    throw new BadRequestException(
+      'Questo locale non ha ancora collegato Stripe Connect',
+    );
+  }
+
+  if (
+    !event.venue?.stripe_charges_enabled ||
+    !event.venue?.stripe_payouts_enabled
+  ) {
+    throw new BadRequestException(
+      'Account Stripe del locale non ancora abilitato ai pagamenti',
+    );
+  }
+
+  const existingActive = await this.prisma.reservations.findFirst({
+    where: {
       user_id: params.userId,
       event_id: params.eventId,
-      venue_id: event.venue_id,
-      quantity: String(quantity),
+      status: { in: ['pending', 'confirmed', 'completed'] },
     },
-  },
-  {
-    stripeAccount: venueStripeAccountId, // Direct Charge sull'account del locale
-  },
-);
+    select: { id: true },
+  });
 
+  if (existingActive) {
+    throw new BadRequestException('Hai già una prenotazione per questa serata');
+  }
 
+  const unitPrice = event.presale_price ? Number(event.presale_price) : 0;
+  if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+    throw new BadRequestException('Invalid presale price for this event');
+  }
 
-    await this.prisma.ticket_orders.create({
-      data: {
+  if (
+    event.presale_capacity !== null &&
+    event.presale_capacity !== undefined &&
+    event.presale_sold + quantity > event.presale_capacity
+  ) {
+    throw new BadRequestException('Prevendita terminata per questo evento');
+  }
+
+  // ✅ Calcolo importi
+  const netTotal = unitPrice * quantity; // prezzo totale netto
+  const grossCents = this.calcGrossCentsFromNet(netTotal); // prezzo totale l'utente paga in centesimi
+  const netCents = Math.round(netTotal * 100); // quello che riceve il locale
+  const applicationFee = grossCents - netCents; // residuo che va a piattaforma
+  const amountTotal = grossCents / 100; // totale in euro per il frontend
+
+  const stripe = this.getStripeClient();
+  const currency = (event.presale_currency || 'eur').toLowerCase();
+
+  const paymentIntent = await stripe.paymentIntents.create(
+    {
+      amount: grossCents, // l'utente paga tutto
+      currency,
+      automatic_payment_methods: { enabled: true },
+      transfer_data: {
+        destination: venueStripeAccountId, // il locale riceve il netto
+      },
+      application_fee_amount: applicationFee, // residuo che va a piattaforma
+      metadata: {
+        app: 'NightHub',
+        type: 'entry_presale',
         user_id: params.userId,
         event_id: params.eventId,
-        stripe_account_id: venueStripeAccountId,
-        status: TicketOrderStatus.created,
-        quantity,
-        amount_total: amountTotal,
-        currency,
-        stripe_session_id: paymentIntent.id,
-        stripe_payment_intent: paymentIntent.id,
+        venue_id: event.venue_id,
+        quantity: String(quantity),
       },
-    });
+    },
+    {
+      stripeAccount: venueStripeAccountId, // Direct Charge sull'account del locale
+    },
+  );
 
-    return {
-      payment_intent_id: paymentIntent.id,
-      payment_intent_client_secret: paymentIntent.client_secret,
-      amount_total: Number(amountTotal),
-      currency,
+  await this.prisma.ticket_orders.create({
+    data: {
+      user_id: params.userId,
+      event_id: params.eventId,
+      stripe_account_id: venueStripeAccountId,
+      status: TicketOrderStatus.created,
       quantity,
-    };
-  }
+      amount_total: amountTotal,
+      currency,
+      stripe_session_id: paymentIntent.id,
+      stripe_payment_intent: paymentIntent.id,
+    },
+  });
+
+  return {
+    payment_intent_id: paymentIntent.id,
+    payment_intent_client_secret: paymentIntent.client_secret,
+    amount_total: Number(amountTotal),
+    currency,
+    quantity,
+  };
+}
+
 
   async confirmPaymentIntent(params: { userId: string; paymentIntentId: string }) {
     const order = await this.prisma.ticket_orders.findFirst({
