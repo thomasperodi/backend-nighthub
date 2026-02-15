@@ -23,6 +23,18 @@ export class PaymentsService {
     }
     return new Stripe(secret, { apiVersion: '2025-02-24.acacia' });
   }
+  // ---------- STRIPE FEE CONFIG ----------
+private readonly STRIPE_PERCENT = 0.029;
+private readonly STRIPE_FIXED_EUR = 0.25;
+private readonly STRIPE_BUFFER_CENTS = 3;
+
+private calcGrossCentsFromNet(netEuro: number): number {
+  const gross =
+    (netEuro + this.STRIPE_FIXED_EUR) /
+    (1 - this.STRIPE_PERCENT);
+
+  return Math.ceil(gross * 100) + this.STRIPE_BUFFER_CENTS;
+}
 
   private parseQuantity(value?: number): number {
     const quantity = value ?? 1;
@@ -118,6 +130,7 @@ export class PaymentsService {
 
     const successUrl = `${baseReturnUrl}?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
     const cancelUrl = `${baseReturnUrl}?checkout=cancel`;
+    const grossUnitCents = this.calcGrossCentsFromNet(unitPrice);
 
     const session = await stripe.checkout.sessions.create(
       {
@@ -129,7 +142,7 @@ export class PaymentsService {
             quantity,
             price_data: {
               currency,
-              unit_amount: Math.round(unitPrice * 100),
+              unit_amount: grossUnitCents,
               product_data: {
                 name: `${event.name} · Ingresso prevendita`,
               },
@@ -252,8 +265,10 @@ export class PaymentsService {
 
     const stripe = this.getStripeClient();
     const currency = (event.presale_currency || 'eur').toLowerCase();
-    const amountTotal = new Prisma.Decimal(unitPrice).mul(quantity);
-    const amountInCents = Math.round(Number(amountTotal) * 100);
+    const netTotal = unitPrice * quantity;
+    const amountInCents = this.calcGrossCentsFromNet(netTotal);
+    const amountTotal = new Prisma.Decimal(amountInCents).div(100);
+
 
     const paymentIntent = await stripe.paymentIntents.create({
       amount: amountInCents,
