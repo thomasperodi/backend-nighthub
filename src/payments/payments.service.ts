@@ -27,7 +27,7 @@ export class PaymentsService {
 private readonly STRIPE_PERCENT = 0.029;
 private readonly STRIPE_FIXED_EUR = 0.25;
 private readonly PLATFORM_MARGIN_EUR = 0.10;
-private readonly STRIPE_BUFFER_CENTS = 3;
+private readonly SAFETY_BUFFER_CENTS = 3;
 
 private calcGrossCentsFromNet(netEuro: number): number {
   const gross =
