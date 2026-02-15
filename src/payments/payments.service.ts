@@ -17,7 +17,7 @@ export class PaymentsService {
   ) {}
 
   private getStripeClient(): Stripe {
-    const secret = process.env.STRIPE_SECRET_KEY;
+    const secret = (process.env.STRIPE_SECRET_KEY || '').trim();
     if (!secret) {
       throw new BadRequestException('Stripe is not configured (missing STRIPE_SECRET_KEY)');
     }
