@@ -61,6 +61,37 @@ export class VenuesController {
     return this.venuesService.updateVenue(id, body);
   }
 
+  @Post(':id/stripe/connect/onboarding')
+  @Roles('venue', 'admin')
+  createStripeConnectOnboarding(
+    @Param('id') id: string,
+    @Body() body: { refresh_url?: string; return_url?: string; email?: string },
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+    }
+
+    return this.venuesService.createStripeConnectOnboardingLink({
+      venueId: id,
+      refreshUrl: body?.refresh_url,
+      returnUrl: body?.return_url,
+      email: body?.email,
+    });
+  }
+
+  @Get(':id/stripe/connect/status')
+  @Roles('venue', 'admin')
+  getStripeConnectStatus(
+    @Param('id') id: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+    }
+    return this.venuesService.getStripeConnectStatus(id);
+  }
+
   @Delete(':id')
   @Roles('admin')
   delete(@Param('id') id: string) {

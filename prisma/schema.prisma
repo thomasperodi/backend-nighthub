@@ -27,6 +27,18 @@ enum EventStatus {
   CLOSED
 }
 
+enum EventAccessMode {
+  LIST
+  PRE_SALE
+}
+
+enum TicketOrderStatus {
+  created
+  paid
+  cancelled
+  failed
+}
+
 enum ReservationStatus {
   pending
   confirmed
@@ -98,6 +110,7 @@ model users {
   staff_entries  entries[] @relation("StaffEntries")
 
   reservations  reservations[]
+  ticket_orders ticket_orders[]
   user_promos   user_promos[]
   venue_stays   venue_stays[]
 
@@ -126,6 +139,10 @@ model venues {
   latitude    Decimal? @db.Decimal(9,6)
   longitude   Decimal? @db.Decimal(9,6)
   radius_geofence Int    @default(100)
+  stripe_account_id String? @unique
+  stripe_charges_enabled Boolean @default(false)
+  stripe_payouts_enabled Boolean @default(false)
+  stripe_onboarding_completed_at DateTime?
   created_at  DateTime @default(now())
   updated_at  DateTime @updatedAt
 
@@ -233,6 +250,11 @@ model events {
   start_time  DateTime?   @db.Time(6)
   end_time    DateTime?   @db.Time(6)
   status      EventStatus @default(DRAFT)
+  access_mode EventAccessMode @default(LIST)
+  presale_price Decimal?
+  presale_currency String @default("eur")
+  presale_capacity Int?
+  presale_sold Int @default(0)
   created_at  DateTime    @default(now())
   updated_at  DateTime    @updatedAt
 
@@ -242,6 +264,7 @@ model events {
   entry_prices event_entry_prices[]
   event_tables event_tables[]
   reservations reservations[]
+  ticket_orders ticket_orders[]
   promos      promos[]
   bar_sales   bar_sales[]
   cloakroom_sales cloakroom_sales[]
@@ -434,15 +457,50 @@ model reservations {
   status       ReservationStatus @default(pending)
   guests       Int
   total_amount Decimal?
+  qr_token     String?           @unique
+  qr_payload   String?
+  checked_in_at DateTime?
+  checked_in_by_staff_id String? @db.Uuid
+  checkin_entry_id String?       @db.Uuid
   created_at   DateTime          @default(now())
 
   user  users  @relation(fields: [user_id], references: [id])
   event events @relation(fields: [event_id], references: [id])
   venue_table venue_tables? @relation(fields: [venue_table_id], references: [id])
+  ticket_order ticket_orders?
 
   @@index([event_id])
   @@index([user_id])
   @@index([venue_table_id])
   @@index([event_id, created_at])
   @@index([user_id, created_at])
+  @@index([event_id, type, status])
+  @@index([checked_in_by_staff_id])
+}
+
+model ticket_orders {
+  id                   String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id              String            @db.Uuid
+  event_id             String            @db.Uuid
+  stripe_account_id    String
+  reservation_id       String?           @unique @db.Uuid
+  status               TicketOrderStatus @default(created)
+  quantity             Int               @default(1)
+  amount_total         Decimal
+  currency             String            @default("eur")
+  stripe_session_id    String            @unique
+  stripe_payment_intent String?
+  checkout_url         String?
+  paid_at              DateTime?
+  created_at           DateTime          @default(now())
+  updated_at           DateTime          @updatedAt
+
+  user                 users             @relation(fields: [user_id], references: [id])
+  event                events            @relation(fields: [event_id], references: [id])
+  reservation          reservations?     @relation(fields: [reservation_id], references: [id])
+
+  @@index([user_id, created_at])
+  @@index([event_id, created_at])
+  @@index([status, created_at])
+  @@index([stripe_account_id, created_at])
 }

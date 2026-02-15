@@ -136,6 +136,34 @@ export class ReservationsController {
     return this.reservationsService.createReservation(body);
   }
 
+  @Post('scan-entry-qr')
+  @Roles('staff', 'venue', 'admin')
+  async scanEntryQr(@Body() body: any, @CurrentUser() user: RequestUser) {
+    const eventId = body?.event_id ?? body?.eventId;
+    const qrData = body?.qr_data ?? body?.qrData ?? body?.data;
+    const adminStaffId = body?.staff_id;
+
+    if (!eventId) throw new BadRequestException('event_id required');
+    if (!qrData) throw new BadRequestException('qr_data required');
+
+    const staffId =
+      user.role === 'admin' && typeof adminStaffId === 'string' && adminStaffId
+        ? adminStaffId
+        : user.id;
+
+    if (user.role !== 'admin') {
+      const venueId = user.venue_id ?? undefined;
+      if (!venueId) throw new ForbiddenException('Missing venue_id for this user');
+      await this.reservationsService.assertEventBelongsToVenue(eventId, venueId);
+    }
+
+    return this.reservationsService.checkInEntryReservationByQr({
+      eventId,
+      staffId,
+      qrData,
+    });
+  }
+
   @Patch(':id')
   @Roles('venue', 'admin')
   async update(

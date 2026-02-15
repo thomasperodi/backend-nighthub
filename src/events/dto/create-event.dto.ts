@@ -5,6 +5,10 @@ export class CreateEventDto {
   start_time?: string; // HH:MM or full ISO time
   end_time?: string; // HH:MM or full ISO time
   status?: string; // DRAFT | LIVE | CLOSED
+  access_mode?: string; // LIST | PRE_SALE
+  presale_price?: number | string;
+  presale_currency?: string;
+  presale_capacity?: number;
 
   description?: string;
   image?: string; // URL or data URL (base64)

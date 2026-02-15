@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import {
   DiscountType,
+  EventAccessMode,
   EventStatus,
   Gender,
   Prisma,
@@ -360,6 +361,10 @@ export class EventsService {
             discount_value: this.decimalToNumber(p.discount_value),
           }))
         : e.promos,
+      presale_price:
+        e.presale_price === null || e.presale_price === undefined
+          ? null
+          : this.decimalToNumber(e.presale_price),
     };
   }
   /* eslint-enable @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-argument */
@@ -398,6 +403,39 @@ export class EventsService {
       );
     }
     return normalized as PromoStatus;
+  }
+
+  private normalizeAccessMode(mode?: string): EventAccessMode | undefined {
+    if (!mode) return undefined;
+    const normalized = mode.toUpperCase();
+    const allowed = new Set<string>(Object.values(EventAccessMode));
+    if (!allowed.has(normalized)) {
+      throw new BadRequestException(
+        `Invalid access_mode. Allowed: ${Array.from(allowed).join(', ')}`,
+      );
+    }
+    return normalized as EventAccessMode;
+  }
+
+  private normalizeCurrency(currency?: string): string | undefined {
+    if (!currency) return undefined;
+    const normalized = currency.trim().toLowerCase();
+    if (!/^[a-z]{3}$/.test(normalized)) {
+      throw new BadRequestException('Invalid presale_currency (ISO 4217)');
+    }
+    return normalized;
+  }
+
+  private parsePositiveInt(
+    value: number | string | null | undefined,
+    field: string,
+  ): number | undefined {
+    if (value === undefined || value === null || value === '') return undefined;
+    const n = typeof value === 'string' ? Number(value) : value;
+    if (!Number.isInteger(n) || n < 1) {
+      throw new BadRequestException(`${field} must be an integer >= 1`);
+    }
+    return n;
   }
 
   private parsePrice(value: number | string): Prisma.Decimal {
@@ -745,6 +783,22 @@ export class EventsService {
     }
     const start_time = this.parseTime(dto.start_time);
     const end_time = this.parseTime(dto.end_time);
+    const accessMode = this.normalizeAccessMode(dto.access_mode) ?? EventAccessMode.LIST;
+    const presalePrice =
+      dto.presale_price === undefined || dto.presale_price === null
+        ? undefined
+        : this.parsePrice(dto.presale_price);
+    const presaleCurrency = this.normalizeCurrency(dto.presale_currency) ?? 'eur';
+    const presaleCapacity = this.parsePositiveInt(
+      dto.presale_capacity,
+      'presale_capacity',
+    );
+
+    if (accessMode === EventAccessMode.PRE_SALE && !presalePrice) {
+      throw new BadRequestException(
+        'presale_price is required when access_mode is PRE_SALE',
+      );
+    }
 
     if (!dto.venue_id) {
       throw new BadRequestException('venue_id is required');
@@ -797,6 +851,14 @@ export class EventsService {
         start_time,
         end_time,
         status,
+        access_mode: accessMode,
+        presale_price:
+          accessMode === EventAccessMode.PRE_SALE ? presalePrice : null,
+        presale_currency: presaleCurrency,
+        presale_capacity:
+          accessMode === EventAccessMode.PRE_SALE
+            ? (presaleCapacity ?? null)
+            : null,
         entry_prices: entryPricesCreate.length
           ? { create: entryPricesCreate }
           : undefined,
@@ -824,6 +886,26 @@ export class EventsService {
     const date = this.parseDate(dto.date);
     const start_time = this.parseTime(dto.start_time);
     const end_time = this.parseTime(dto.end_time);
+    const accessMode = this.normalizeAccessMode(dto.access_mode);
+    const presalePrice =
+      dto.presale_price === undefined || dto.presale_price === null
+        ? undefined
+        : this.parsePrice(dto.presale_price);
+    const presaleCurrency = this.normalizeCurrency(dto.presale_currency);
+    const presaleCapacity = this.parsePositiveInt(
+      dto.presale_capacity,
+      'presale_capacity',
+    );
+
+    if (
+      accessMode === EventAccessMode.PRE_SALE &&
+      dto.presale_price !== null &&
+      !presalePrice
+    ) {
+      throw new BadRequestException(
+        'presale_price is required when access_mode is PRE_SALE',
+      );
+    }
 
     const venueId = dto.venue_id ?? existing.venue_id;
 
@@ -847,6 +929,20 @@ export class EventsService {
           start_time,
           end_time,
           status,
+          access_mode: accessMode,
+          presale_price:
+            dto.presale_price === null
+              ? null
+              : dto.presale_price !== undefined
+                ? presalePrice
+                : undefined,
+          presale_currency: presaleCurrency,
+          presale_capacity:
+            dto.presale_capacity === null
+              ? null
+              : dto.presale_capacity !== undefined
+                ? presaleCapacity
+                : undefined,
         },
       });
 

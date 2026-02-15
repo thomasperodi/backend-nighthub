@@ -5,6 +5,10 @@ export class UpdateEventDto {
   start_time?: string;
   end_time?: string;
   status?: string;
+  access_mode?: string;
+  presale_price?: number | string | null;
+  presale_currency?: string;
+  presale_capacity?: number | null;
 
   description?: string;
   image?: string;

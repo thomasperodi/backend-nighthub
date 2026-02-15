@@ -5,12 +5,24 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma, venues, events, promos, venue_tables } from '@prisma/client';
+import Stripe from 'stripe';
 import { CreateVenueTablesBulkDto } from './dto/create-venue-tables-bulk.dto';
 import { UpdateVenueTableDto } from './dto/update-venue-table.dto';
 
 @Injectable()
 export class VenuesService {
   constructor(private readonly prisma: PrismaService) {}
+
+  private getStripeClient(): Stripe {
+    const secret = process.env.STRIPE_SECRET_KEY;
+    if (!secret) {
+      throw new BadRequestException(
+        'Stripe not configured: missing STRIPE_SECRET_KEY',
+      );
+    }
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+    return new Stripe(secret, { apiVersion: '2025-02-24.acacia' });
+  }
 
   async listVenues(): Promise<venues[]> {
     return await this.prisma.venues.findMany({
@@ -28,6 +40,7 @@ export class VenuesService {
     name: string;
     city?: string;
     radius_geofence?: number;
+    stripe_account_id?: string;
   }): Promise<venues> {
     if (!input || !input.name) {
       throw new BadRequestException('Missing required fields');
@@ -41,6 +54,9 @@ export class VenuesService {
     if (input.radius_geofence !== undefined) {
       data.radius_geofence = input.radius_geofence;
     }
+    if (input.stripe_account_id !== undefined) {
+      data.stripe_account_id = input.stripe_account_id;
+    }
 
     return await this.prisma.venues.create({ data });
   }
@@ -51,6 +67,7 @@ export class VenuesService {
       name?: string;
       city?: string;
       radius_geofence?: number;
+      stripe_account_id?: string;
     }>,
   ): Promise<venues> {
     await this.getVenue(id);
@@ -60,6 +77,9 @@ export class VenuesService {
     if (updates.city !== undefined) data.city = updates.city;
     if (updates.radius_geofence !== undefined) {
       data.radius_geofence = updates.radius_geofence;
+    }
+    if (updates.stripe_account_id !== undefined) {
+      data.stripe_account_id = updates.stripe_account_id;
     }
 
     return await this.prisma.venues.update({ where: { id }, data });
@@ -75,6 +95,122 @@ export class VenuesService {
       where: { venue_id: venueId },
       orderBy: { date: 'desc' },
     });
+  }
+
+  async createStripeConnectOnboardingLink(params: {
+    venueId: string;
+    refreshUrl?: string;
+    returnUrl?: string;
+    email?: string;
+  }) {
+    /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call */
+    const venue = await this.prisma.venues.findUnique({
+      where: { id: params.venueId },
+      select: {
+        id: true,
+        name: true,
+        stripe_account_id: true,
+      },
+    });
+    if (!venue) throw new NotFoundException('Venue not found');
+
+    const stripe = this.getStripeClient();
+
+    let stripeAccountId = venue.stripe_account_id;
+    if (!stripeAccountId) {
+      const account = await stripe.accounts.create({
+        type: 'express',
+        country: 'IT',
+        email: params.email,
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true },
+        },
+        business_profile: {
+          name: venue.name,
+        },
+      });
+      stripeAccountId = account.id;
+
+      await this.prisma.venues.update({
+        where: { id: params.venueId },
+        data: { stripe_account_id: stripeAccountId },
+      });
+    }
+
+    const fallbackBase =
+      process.env.STRIPE_CONNECT_RETURN_URL || 'https://example.com/stripe';
+    const accountLink = await stripe.accountLinks.create({
+      account: stripeAccountId,
+      type: 'account_onboarding',
+      refresh_url:
+        params.refreshUrl ||
+        `${fallbackBase}?refresh=1&venue_id=${params.venueId}`,
+      return_url:
+        params.returnUrl ||
+        `${fallbackBase}?success=1&venue_id=${params.venueId}`,
+    });
+
+    return {
+      venue_id: params.venueId,
+      stripe_account_id: stripeAccountId,
+      onboarding_url: accountLink.url,
+      expires_at: accountLink.expires_at,
+    };
+    /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call */
+  }
+
+  async getStripeConnectStatus(venueId: string) {
+    /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call */
+    const venue = await this.prisma.venues.findUnique({
+      where: { id: venueId },
+      select: {
+        id: true,
+        stripe_account_id: true,
+        stripe_charges_enabled: true,
+        stripe_payouts_enabled: true,
+        stripe_onboarding_completed_at: true,
+      },
+    });
+    if (!venue) throw new NotFoundException('Venue not found');
+
+    if (!venue.stripe_account_id) {
+      return {
+        venue_id: venueId,
+        connected: false,
+        charges_enabled: false,
+        payouts_enabled: false,
+        details_submitted: false,
+      };
+    }
+
+    const stripe = this.getStripeClient();
+    const account = await stripe.accounts.retrieve(venue.stripe_account_id);
+
+    const chargesEnabled = Boolean(account.charges_enabled);
+    const payoutsEnabled = Boolean(account.payouts_enabled);
+    const detailsSubmitted = Boolean(account.details_submitted);
+
+    await this.prisma.venues.update({
+      where: { id: venueId },
+      data: {
+        stripe_charges_enabled: chargesEnabled,
+        stripe_payouts_enabled: payoutsEnabled,
+        stripe_onboarding_completed_at:
+          chargesEnabled && payoutsEnabled ? new Date() : null,
+      },
+    });
+
+    return {
+      venue_id: venueId,
+      connected: true,
+      stripe_account_id: venue.stripe_account_id,
+      charges_enabled: chargesEnabled,
+      payouts_enabled: payoutsEnabled,
+      details_submitted: detailsSubmitted,
+      requirements_due: account.requirements?.currently_due ?? [],
+    };
+    /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call */
   }
 
   async listPromos(venueId: string): Promise<promos[]> {

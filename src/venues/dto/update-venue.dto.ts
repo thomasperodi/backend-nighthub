@@ -13,4 +13,8 @@ export class UpdateVenueDto {
   @IsInt()
   @Min(10)
   radius_geofence?: number;
+
+  @IsOptional()
+  @IsString()
+  stripe_account_id?: string;
 }
