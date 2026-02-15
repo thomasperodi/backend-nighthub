@@ -275,6 +275,10 @@ private calcGrossCentsFromNet(netEuro: number): number {
       amount: amountInCents,
       currency,
       automatic_payment_methods: { enabled: true },
+       transfer_data: {
+      destination: venueStripeAccountId, // il locale riceve il netto
+    },
+    application_fee_amount: applicationFee,
       metadata: {
         app: 'NightHub',
         type: 'entry_presale',
