@@ -270,14 +270,11 @@ private calcGrossCentsFromNet(netEuro: number): number {
 
 
 
-    const paymentIntent = await stripe.paymentIntents.create({
+     const paymentIntent = await stripe.paymentIntents.create(
+    {
       amount: amountInCents,
       currency,
       automatic_payment_methods: { enabled: true },
-      transfer_data: {
-        destination: venueStripeAccountId,
-      },
-      application_fee_amount: 0,
       metadata: {
         app: 'NightHub',
         type: 'entry_presale',
@@ -286,7 +283,11 @@ private calcGrossCentsFromNet(netEuro: number): number {
         venue_id: event.venue_id,
         quantity: String(quantity),
       },
-    });
+    },
+    {
+      stripeAccount: venueStripeAccountId, // ✅ Direct charge
+    }
+  );
 
     await this.prisma.ticket_orders.create({
       data: {
@@ -334,7 +335,9 @@ private calcGrossCentsFromNet(netEuro: number): number {
     }
 
     const stripe = this.getStripeClient();
-    const paymentIntent = await stripe.paymentIntents.retrieve(params.paymentIntentId);
+    const paymentIntent = await stripe.paymentIntents.retrieve(params.paymentIntentId, {}, {
+      stripeAccount: order.stripe_account_id,
+    });
     if (paymentIntent.status !== 'succeeded') {
       const nextStatus =
         paymentIntent.status === 'canceled'
