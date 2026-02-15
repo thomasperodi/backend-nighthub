@@ -270,16 +270,20 @@ private calcGrossCentsFromNet(netEuro: number): number {
 
     const stripe = this.getStripeClient();
     const currency = (event.presale_currency || 'eur').toLowerCase();
-    const netTotal = unitPrice * quantity;
-    const amountInCents = this.calcGrossCentsFromNet(netTotal);
-    const amountTotal = new Prisma.Decimal(amountInCents).div(100);
+const netTotal = unitPrice * quantity; // prezzo totale netto del biglietto
+const grossCents = this.calcGrossCentsFromNet(netTotal); // utente paga prezzo + fee + buffer
+const netCents = Math.round(netTotal * 100); // quello che deve ricevere il locale
+const applicationFee = grossCents - netCents; // eventuali centesimi residui alla piattaforma
 
-
-   const paymentIntent = await stripe.paymentIntents.create(
+const paymentIntent = await stripe.paymentIntents.create(
   {
-    amount: amountInCents,
+    amount: grossCents, // l'utente paga tutto
     currency,
     automatic_payment_methods: { enabled: true },
+    transfer_data: {
+      destination: venueStripeAccountId, // il locale riceve il netto
+    },
+    application_fee_amount: applicationFee, // residuo che va a te (piattaforma)
     metadata: {
       app: 'NightHub',
       type: 'entry_presale',
@@ -290,9 +294,10 @@ private calcGrossCentsFromNet(netEuro: number): number {
     },
   },
   {
-    stripeAccount: venueStripeAccountId, // ✅ DIRECT CHARGE
+    stripeAccount: venueStripeAccountId, // Direct Charge sull'account del locale
   },
 );
+
 
 
     await this.prisma.ticket_orders.create({
@@ -341,7 +346,15 @@ private calcGrossCentsFromNet(netEuro: number): number {
     }
 
     const stripe = this.getStripeClient();
-    const paymentIntent = await stripe.paymentIntents.retrieve(params.paymentIntentId);
+    if (!order.stripe_account_id) {
+  throw new BadRequestException('Missing stripe account id on order');
+}
+
+const paymentIntent = await stripe.paymentIntents.retrieve(
+  params.paymentIntentId,
+  { stripeAccount: order.stripe_account_id }
+);
+
     if (paymentIntent.status !== 'succeeded') {
       const nextStatus =
         paymentIntent.status === 'canceled'
