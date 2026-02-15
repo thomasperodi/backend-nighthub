@@ -133,9 +133,7 @@ private calcGrossCentsFromNet(netEuro: number): number {
 
     const successUrl = `${baseReturnUrl}?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
     const cancelUrl = `${baseReturnUrl}?checkout=cancel`;
-    const grossTotalCents = this.calcGrossCentsFromNet(unitPrice * quantity);
-    const grossUnitCents = Math.ceil(grossTotalCents / quantity);
-
+    const grossUnitCents = this.calcGrossCentsFromNet(unitPrice);
 
     const session = await stripe.checkout.sessions.create(
       {
@@ -275,25 +273,23 @@ private calcGrossCentsFromNet(netEuro: number): number {
     const amountTotal = new Prisma.Decimal(amountInCents).div(100);
 
 
-   const paymentIntent = await stripe.paymentIntents.create(
-  {
-    amount: amountInCents,
-    currency,
-    automatic_payment_methods: { enabled: true },
-    metadata: {
-      app: 'NightHub',
-      type: 'entry_presale',
-      user_id: params.userId,
-      event_id: params.eventId,
-      venue_id: event.venue_id,
-      quantity: String(quantity),
-    },
-  },
-  {
-    stripeAccount: venueStripeAccountId, // ✅ DIRECT CHARGE
-  },
-);
-
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amountInCents,
+      currency,
+      automatic_payment_methods: { enabled: true },
+      transfer_data: {
+        destination: venueStripeAccountId,
+      },
+      application_fee_amount: 0,
+      metadata: {
+        app: 'NightHub',
+        type: 'entry_presale',
+        user_id: params.userId,
+        event_id: params.eventId,
+        venue_id: event.venue_id,
+        quantity: String(quantity),
+      },
+    });
 
     await this.prisma.ticket_orders.create({
       data: {
