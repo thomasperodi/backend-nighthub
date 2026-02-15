@@ -278,7 +278,7 @@ private calcGrossCentsFromNet(netEuro: number): number {
        transfer_data: {
       destination: venueStripeAccountId, // il locale riceve il netto
     },
-    application_fee_amount: applicationFee,
+    application_fee_amount: 0,
       metadata: {
         app: 'NightHub',
         type: 'entry_presale',
