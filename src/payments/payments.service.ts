@@ -134,6 +134,8 @@ private calcGrossCentsFromNet(netEuro: number): number {
     const cancelUrl = `${baseReturnUrl}?checkout=cancel`;
     const grossTotalCents = this.calcGrossCentsFromNet(unitPrice * quantity);
     const grossUnitCents = Math.ceil(grossTotalCents / quantity);
+    const grossCents = this.calcGrossCentsFromNet(netTotal); // utente paga prezzo + fee + buffer
+    const amountTotal = grossCents / 100
    
 
 
@@ -271,8 +273,7 @@ private calcGrossCentsFromNet(netEuro: number): number {
     const stripe = this.getStripeClient();
     const currency = (event.presale_currency || 'eur').toLowerCase();
 const netTotal = unitPrice * quantity; // prezzo totale netto del biglietto
-const grossCents = this.calcGrossCentsFromNet(netTotal); // utente paga prezzo + fee + buffer
-     const amountTotal = grossCents / 100
+
 const netCents = Math.round(netTotal * 100); // quello che deve ricevere il locale
 const applicationFee = grossCents - netCents; // eventuali centesimi residui alla piattaforma
 
