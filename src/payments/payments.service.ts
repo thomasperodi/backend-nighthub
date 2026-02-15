@@ -135,6 +135,7 @@ private calcGrossCentsFromNet(netEuro: number): number {
     const cancelUrl = `${baseReturnUrl}?checkout=cancel`;
     const grossTotalCents = this.calcGrossCentsFromNet(unitPrice * quantity);
     const grossUnitCents = Math.ceil(grossTotalCents / quantity);
+    const amountTotal = grossCents / 100
 
 
     const session = await stripe.checkout.sessions.create(
