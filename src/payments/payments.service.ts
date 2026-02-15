@@ -26,18 +26,14 @@ export class PaymentsService {
   // ---------- STRIPE FEE CONFIG ----------
 private readonly STRIPE_PERCENT = 0.029;
 private readonly STRIPE_FIXED_EUR = 0.25;
-private readonly PLATFORM_MARGIN_EUR = 0.10;
-private readonly SAFETY_BUFFER_CENTS = 3;
+//private readonly PLATFORM_MARGIN_EUR = 0.10;
+private readonly SAFETY_BUFFER_CENTS = 4;
 
 private calcGrossCentsFromNet(netEuro: number): number {
-  const gross =
-    (netEuro +
-      this.STRIPE_FIXED_EUR +
-      this.PLATFORM_MARGIN_EUR) /
-    (1 - this.STRIPE_PERCENT);
-
+  const gross = (netEuro + this.STRIPE_FIXED_EUR) / (1 - this.STRIPE_PERCENT);
   return Math.ceil(gross * 100) + this.SAFETY_BUFFER_CENTS;
 }
+
 
   private parseQuantity(value?: number): number {
     const quantity = value ?? 1;
@@ -270,7 +266,8 @@ private calcGrossCentsFromNet(netEuro: number): number {
     const currency = (event.presale_currency || 'eur').toLowerCase();
     const netTotal = unitPrice * quantity;
     const amountInCents = this.calcGrossCentsFromNet(netTotal);
-    const amountTotal = new Prisma.Decimal(amountInCents).div(100);
+    const amountTotal = new Prisma.Decimal(unitPrice).mul(quantity);
+
 
 
     const paymentIntent = await stripe.paymentIntents.create({
