@@ -335,9 +335,10 @@ private calcGrossCentsFromNet(netEuro: number): number {
     }
 
     const stripe = this.getStripeClient();
-    const paymentIntent = await stripe.paymentIntents.retrieve(params.paymentIntentId, {}, {
-      stripeAccount: order.stripe_account_id,
-    });
+    const paymentIntent = await stripe.paymentIntents.retrieve(
+  params.paymentIntentId,
+  { stripeAccount: order.stripe_account_id }
+);
     if (paymentIntent.status !== 'succeeded') {
       const nextStatus =
         paymentIntent.status === 'canceled'
