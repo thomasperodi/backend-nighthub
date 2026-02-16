@@ -3,7 +3,13 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { EventAccessMode, Prisma, ReservationStatus, ReservationType, TicketOrderStatus } from '@prisma/client';
+import {
+  EventAccessMode,
+  Prisma,
+  ReservationStatus,
+  ReservationType,
+  TicketOrderStatus,
+} from '@prisma/client';
 import { randomUUID } from 'crypto';
 import Stripe from 'stripe';
 import { PrismaService } from '../prisma/prisma.service';
@@ -17,17 +23,30 @@ export class PaymentsService {
   ) {}
 
   private getStripeClient(): Stripe {
-    const secret = process.env.STRIPE_SECRET_KEY;
+    const secret = (process.env.STRIPE_SECRET_KEY || '').trim();
     if (!secret) {
-      throw new BadRequestException('Stripe is not configured (missing STRIPE_SECRET_KEY)');
+      throw new BadRequestException(
+        'Stripe is not configured (missing STRIPE_SECRET_KEY)',
+      );
     }
     return new Stripe(secret, { apiVersion: '2025-02-24.acacia' });
+  }
+
+  private readonly STRIPE_PERCENT = 0.029;
+  private readonly STRIPE_FIXED_EUR = 0.25;
+  private readonly SAFETY_BUFFER_CENTS = 4;
+
+  private calcGrossCentsFromNet(netEuro: number): number {
+    const gross = (netEuro + this.STRIPE_FIXED_EUR) / (1 - this.STRIPE_PERCENT);
+    return Math.ceil(gross * 100) + this.SAFETY_BUFFER_CENTS;
   }
 
   private parseQuantity(value?: number): number {
     const quantity = value ?? 1;
     if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10) {
-      throw new BadRequestException('quantity must be an integer between 1 and 10');
+      throw new BadRequestException(
+        'quantity must be an integer between 1 and 10',
+      );
     }
     return quantity;
   }
@@ -91,7 +110,9 @@ export class PaymentsService {
     });
 
     if (existingActive) {
-      throw new BadRequestException('Hai già una prenotazione per questa serata');
+      throw new BadRequestException(
+        'Hai già una prenotazione per questa serata',
+      );
     }
 
     const unitPrice = event.presale_price ? Number(event.presale_price) : 0;
@@ -118,6 +139,8 @@ export class PaymentsService {
 
     const successUrl = `${baseReturnUrl}?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
     const cancelUrl = `${baseReturnUrl}?checkout=cancel`;
+    const netTotal = unitPrice * quantity;
+    const grossTotalCents = this.calcGrossCentsFromNet(netTotal);
 
     const session = await stripe.checkout.sessions.create(
       {
@@ -126,12 +149,12 @@ export class PaymentsService {
         cancel_url: cancelUrl,
         line_items: [
           {
-            quantity,
+            quantity: 1,
             price_data: {
               currency,
-              unit_amount: Math.round(unitPrice * 100),
+              unit_amount: grossTotalCents,
               product_data: {
-                name: `${event.name} · Ingresso prevendita`,
+                name: `${event.name} · Ingresso prevendita x${quantity}`,
               },
             },
           },
@@ -234,7 +257,9 @@ export class PaymentsService {
     });
 
     if (existingActive) {
-      throw new BadRequestException('Hai già una prenotazione per questa serata');
+      throw new BadRequestException(
+        'Hai già una prenotazione per questa serata',
+      );
     }
 
     const unitPrice = event.presale_price ? Number(event.presale_price) : 0;
@@ -252,8 +277,9 @@ export class PaymentsService {
 
     const stripe = this.getStripeClient();
     const currency = (event.presale_currency || 'eur').toLowerCase();
+    const netTotal = unitPrice * quantity;
+    const amountInCents = this.calcGrossCentsFromNet(netTotal);
     const amountTotal = new Prisma.Decimal(unitPrice).mul(quantity);
-    const amountInCents = Math.round(Number(amountTotal) * 100);
 
     const paymentIntent = await stripe.paymentIntents.create(
       {
@@ -297,7 +323,10 @@ export class PaymentsService {
     };
   }
 
-  async confirmPaymentIntent(params: { userId: string; paymentIntentId: string }) {
+  async confirmPaymentIntent(params: {
+    userId: string;
+    paymentIntentId: string;
+  }) {
     const order = await this.prisma.ticket_orders.findFirst({
       where: {
         user_id: params.userId,
@@ -311,7 +340,9 @@ export class PaymentsService {
     if (!order) throw new NotFoundException('Payment intent not found');
 
     if (order.status === TicketOrderStatus.paid && order.reservation_id) {
-      const reservation = await this.reservationsService.getReservation(order.reservation_id);
+      const reservation = await this.reservationsService.getReservation(
+        order.reservation_id,
+      );
       return {
         paid: true,
         reservation,
@@ -346,7 +377,9 @@ export class PaymentsService {
     }
 
     const reservation = await this.prisma.$transaction(async (tx) => {
-      const currentOrder = await tx.ticket_orders.findUnique({ where: { id: order.id } });
+      const currentOrder = await tx.ticket_orders.findUnique({
+        where: { id: order.id },
+      });
       if (!currentOrder) throw new NotFoundException('Ticket order not found');
 
       if (
@@ -391,7 +424,9 @@ export class PaymentsService {
       });
 
       if (!event || event.access_mode !== EventAccessMode.PRE_SALE) {
-        throw new BadRequestException('Event is not available for pre-sale anymore');
+        throw new BadRequestException(
+          'Event is not available for pre-sale anymore',
+        );
       }
 
       if (
@@ -466,11 +501,16 @@ export class PaymentsService {
     return {
       paid: true,
       order_status: TicketOrderStatus.paid,
-      reservation: await this.reservationsService.getReservation(reservation.id),
+      reservation: await this.reservationsService.getReservation(
+        reservation.id,
+      ),
     };
   }
 
-  async confirmCheckoutSession(params: { userId: string; stripeSessionId: string }) {
+  async confirmCheckoutSession(params: {
+    userId: string;
+    stripeSessionId: string;
+  }) {
     const order = await this.prisma.ticket_orders.findUnique({
       where: { stripe_session_id: params.stripeSessionId },
       include: {
@@ -486,10 +526,13 @@ export class PaymentsService {
     });
 
     if (!order) throw new NotFoundException('Checkout session not found');
-    if (order.user_id !== params.userId) throw new NotFoundException('Checkout session not found');
+    if (order.user_id !== params.userId)
+      throw new NotFoundException('Checkout session not found');
 
     if (order.status === TicketOrderStatus.paid && order.reservation_id) {
-      const reservation = await this.reservationsService.getReservation(order.reservation_id);
+      const reservation = await this.reservationsService.getReservation(
+        order.reservation_id,
+      );
       return {
         paid: true,
         reservation,
@@ -507,13 +550,18 @@ export class PaymentsService {
 
     const paymentStatus = session.payment_status;
     if (paymentStatus !== 'paid') {
-      const status = paymentStatus === 'unpaid' ? TicketOrderStatus.created : TicketOrderStatus.failed;
+      const status =
+        paymentStatus === 'unpaid'
+          ? TicketOrderStatus.created
+          : TicketOrderStatus.failed;
       await this.prisma.ticket_orders.update({
         where: { id: order.id },
         data: {
           status,
           stripe_payment_intent:
-            typeof session.payment_intent === 'string' ? session.payment_intent : null,
+            typeof session.payment_intent === 'string'
+              ? session.payment_intent
+              : null,
         },
       });
 
@@ -524,7 +572,9 @@ export class PaymentsService {
     }
 
     const reservation = await this.prisma.$transaction(async (tx) => {
-      const currentOrder = await tx.ticket_orders.findUnique({ where: { id: order.id } });
+      const currentOrder = await tx.ticket_orders.findUnique({
+        where: { id: order.id },
+      });
       if (!currentOrder) throw new NotFoundException('Ticket order not found');
 
       if (
@@ -572,7 +622,9 @@ export class PaymentsService {
       });
 
       if (!event || event.access_mode !== EventAccessMode.PRE_SALE) {
-        throw new BadRequestException('Event is not available for pre-sale anymore');
+        throw new BadRequestException(
+          'Event is not available for pre-sale anymore',
+        );
       }
 
       if (
@@ -650,7 +702,9 @@ export class PaymentsService {
     return {
       paid: true,
       order_status: TicketOrderStatus.paid,
-      reservation: await this.reservationsService.getReservation(reservation.id),
+      reservation: await this.reservationsService.getReservation(
+        reservation.id,
+      ),
     };
   }
 }
