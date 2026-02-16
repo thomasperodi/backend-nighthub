@@ -255,23 +255,24 @@ export class PaymentsService {
     const amountTotal = new Prisma.Decimal(unitPrice).mul(quantity);
     const amountInCents = Math.round(Number(amountTotal) * 100);
 
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amountInCents,
-      currency,
-      automatic_payment_methods: { enabled: true },
-      transfer_data: {
-        destination: venueStripeAccountId,
+    const paymentIntent = await stripe.paymentIntents.create(
+      {
+        amount: amountInCents,
+        currency,
+        automatic_payment_methods: { enabled: true },
+        metadata: {
+          app: 'NightHub',
+          type: 'entry_presale',
+          user_id: params.userId,
+          event_id: params.eventId,
+          venue_id: event.venue_id,
+          quantity: String(quantity),
+        },
       },
-      application_fee_amount: 0,
-      metadata: {
-        app: 'NightHub',
-        type: 'entry_presale',
-        user_id: params.userId,
-        event_id: params.eventId,
-        venue_id: event.venue_id,
-        quantity: String(quantity),
+      {
+        stripeAccount: venueStripeAccountId,
       },
-    });
+    );
 
     await this.prisma.ticket_orders.create({
       data: {
@@ -319,7 +320,12 @@ export class PaymentsService {
     }
 
     const stripe = this.getStripeClient();
-    const paymentIntent = await stripe.paymentIntents.retrieve(params.paymentIntentId);
+    const paymentIntent = await stripe.paymentIntents.retrieve(
+      params.paymentIntentId,
+      {
+        stripeAccount: order.stripe_account_id,
+      },
+    );
     if (paymentIntent.status !== 'succeeded') {
       const nextStatus =
         paymentIntent.status === 'canceled'
