@@ -233,7 +233,8 @@ export class StaffService {
   }) {
     const token = params.token || '';
     const isExpoToken =
-      token.startsWith('ExponentPushToken') || token.startsWith('ExpoPushToken');
+      token.startsWith('ExponentPushToken') ||
+      token.startsWith('ExpoPushToken');
     if (!isExpoToken) return;
 
     try {
@@ -261,7 +262,9 @@ export class StaffService {
       throw new BadRequestException('quantity must be positive');
 
     if (dto.user_id && quantity !== 1) {
-      throw new BadRequestException('quantity must be 1 when user_id is provided');
+      throw new BadRequestException(
+        'quantity must be 1 when user_id is provided',
+      );
     }
 
     const payload = dto as unknown as Record<string, unknown>;
@@ -465,17 +468,46 @@ export class StaffService {
     venueId?: string;
     onlyBooked?: boolean;
   }) {
-    const { eventId, venueId, onlyBooked } = params;
+    const { eventId, venueId } = params;
 
-    if (eventId) {
-      await this.ensureEventTablesSeeded(eventId);
+    if (!eventId) {
+      return [];
+    }
+
+    await this.ensureEventTablesSeeded(eventId);
+
+    const groupedReservations = await this.prisma.reservations.groupBy({
+      by: ['venue_table_id'],
+      where: {
+        event_id: eventId,
+        type: 'table',
+        status: 'confirmed',
+        venue_table_id: { not: null },
+        ...(venueId ? { venue_table: { venue_id: venueId } } : {}),
+      },
+      _sum: { guests: true },
+    });
+
+    const prenotatiByVenueTableId = new Map<string, number>();
+    for (const reservation of groupedReservations) {
+      const venueTableId = reservation.venue_table_id;
+      if (!venueTableId) continue;
+      prenotatiByVenueTableId.set(
+        venueTableId,
+        Number(reservation._sum.guests ?? 0),
+      );
+    }
+
+    const bookedVenueTableIds = Array.from(prenotatiByVenueTableId.keys());
+    if (!bookedVenueTableIds.length) {
+      return [];
     }
 
     const tables = await this.prisma.event_tables.findMany({
       where: {
-        ...(eventId ? { event_id: eventId } : {}),
+        event_id: eventId,
+        venue_table_id: { in: bookedVenueTableIds },
         ...(venueId ? { venue_table: { venue_id: venueId } } : {}),
-        ...(onlyBooked ? { prenotati: { gt: 0 } } : {}),
       },
       include: { venue_table: true, event: true },
       orderBy: [{ venue_table: { numero: 'asc' } }],
@@ -483,8 +515,9 @@ export class StaffService {
 
     return tables.map((t) => ({
       ...t,
+      prenotati: prenotatiByVenueTableId.get(t.venue_table_id) ?? 0,
       stato:
-        t.entrati >= (t.prenotati ?? 0)
+        t.entrati >= (prenotatiByVenueTableId.get(t.venue_table_id) ?? 0)
           ? 'completo'
           : t.entrati > 0
             ? 'parziale'
