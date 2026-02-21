@@ -133,7 +133,10 @@ export class ReservationsController {
     if (!venueId) throw new ForbiddenException('Missing venue_id for this user');
     await this.reservationsService.assertEventBelongsToVenue(String(eventId), venueId);
 
-    return this.reservationsService.createReservation(body);
+    return this.reservationsService.createReservation({
+      ...(body ?? {}),
+      user_id: user.id,
+    });
   }
 
   @Post('scan-entry-qr')
