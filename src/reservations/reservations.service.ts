@@ -289,20 +289,28 @@ export class ReservationsService {
     });
     if (!event) throw new NotFoundException('Event not found');
 
-    const existingReservationForEvent = await this.prisma.reservations.findFirst({
-      where: {
-        user_id: userId,
-        event_id: eventId,
-        status: { in: ['pending', 'confirmed', 'completed'] },
-      },
-      select: { id: true, type: true, status: true },
-    });
+    // ❗ Saltiamo il controllo duplicati se è un account venue
+const userRecord = await this.prisma.users.findUnique({
+  where: { id: userId },
+  select: { role: true },
+});
 
-    if (existingReservationForEvent) {
-      throw new BadRequestException(
-        'Hai già una prenotazione per questa serata',
-      );
-    }
+if (userRecord?.role !== 'venue') {
+  const existingReservationForEvent = await this.prisma.reservations.findFirst({
+    where: {
+      user_id: userId,
+      event_id: eventId,
+      status: { in: ['pending', 'confirmed', 'completed'] },
+    },
+    select: { id: true },
+  });
+
+  if (existingReservationForEvent) {
+    throw new BadRequestException(
+      'Hai già una prenotazione per questa serata',
+    );
+  }
+}
 
     const venueTableId: string | null | undefined = normalized.venue_table_id ?? null;
 
