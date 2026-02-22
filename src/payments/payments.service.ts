@@ -5,7 +5,6 @@ import {
 } from '@nestjs/common';
 import {
   EventAccessMode,
-  Prisma,
   ReservationStatus,
   ReservationType,
   TicketOrderStatus,
@@ -17,6 +16,8 @@ import { ReservationsService } from '../reservations/reservations.service';
 
 @Injectable()
 export class PaymentsService {
+  private stripeOwnerAccountId?: string;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly reservationsService: ReservationsService,
@@ -31,13 +32,17 @@ export class PaymentsService {
     }
     return new Stripe(secret, { apiVersion: '2025-02-24.acacia' });
   }
-
+  // ---------- STRIPE FEE CONFIG ----------
   private readonly STRIPE_PERCENT = 0.029;
   private readonly STRIPE_FIXED_EUR = 0.25;
-  private readonly SAFETY_BUFFER_CENTS = 4;
+  private readonly PLATFORM_MARGIN_EUR = 0.1;
+  private readonly SAFETY_BUFFER_CENTS = 3;
 
   private calcGrossCentsFromNet(netEuro: number): number {
-    const gross = (netEuro + this.STRIPE_FIXED_EUR) / (1 - this.STRIPE_PERCENT);
+    const gross =
+      (netEuro + this.STRIPE_FIXED_EUR + this.PLATFORM_MARGIN_EUR) /
+      (1 - this.STRIPE_PERCENT);
+
     return Math.ceil(gross * 100) + this.SAFETY_BUFFER_CENTS;
   }
 
@@ -49,6 +54,114 @@ export class PaymentsService {
       );
     }
     return quantity;
+  }
+
+  private parsePositiveCents(value?: string | null): number | null {
+    if (!value) return null;
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isInteger(parsed) || parsed <= 0) return null;
+    return parsed;
+  }
+
+  private async getStripeOwnerAccountId(
+    stripe: Stripe,
+  ): Promise<string | null> {
+    if (this.stripeOwnerAccountId !== undefined) {
+      return this.stripeOwnerAccountId;
+    }
+
+    try {
+      const account = await stripe.accounts.retrieve();
+      const accountId = account?.id ?? null;
+      this.stripeOwnerAccountId = accountId ?? '';
+      return accountId;
+    } catch {
+      this.stripeOwnerAccountId = '';
+      return null;
+    }
+  }
+
+  private async assertVenueAccountIsNotStripeOwner(
+    stripe: Stripe,
+    venueStripeAccountId: string,
+  ): Promise<void> {
+    const ownerAccountId = await this.getStripeOwnerAccountId(stripe);
+    if (ownerAccountId && ownerAccountId === venueStripeAccountId) {
+      throw new BadRequestException(
+        'Configurazione Stripe non valida: il conto del locale coincide con il conto Stripe usato dal backend. Usa una chiave piattaforma e un account Connect diverso per il locale.',
+      );
+    }
+  }
+
+  private extractExpandableId(
+    value: string | { id: string } | null | undefined,
+  ): string | null {
+    if (!value) return null;
+    if (typeof value === 'string') return value;
+    return value.id ?? null;
+  }
+
+  private async resolveNetTicketCents(params: {
+    eventId: string;
+    quantity: number;
+    metadataNetCents?: string | null;
+  }): Promise<number> {
+    const fromMetadata = this.parsePositiveCents(params.metadataNetCents);
+    if (fromMetadata) return fromMetadata;
+
+    const event = await this.prisma.events.findUnique({
+      where: { id: params.eventId },
+      select: { presale_price: true },
+    });
+
+    const unitPrice = event?.presale_price ? Number(event.presale_price) : 0;
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+      throw new BadRequestException('Invalid presale price for this event');
+    }
+
+    const cents = Math.round(unitPrice * params.quantity * 100);
+    if (cents <= 0) {
+      throw new BadRequestException('Invalid net transfer amount');
+    }
+
+    return cents;
+  }
+
+  private async transferNetTicketToVenue(params: {
+    stripe: Stripe;
+    orderId: string;
+    destinationAccountId: string;
+    currency: string;
+    netTicketCents: number;
+    sourceChargeId?: string | null;
+    eventId: string;
+    userId: string;
+  }): Promise<void> {
+    await this.assertVenueAccountIsNotStripeOwner(
+      params.stripe,
+      params.destinationAccountId,
+    );
+
+    const transferData: Stripe.TransferCreateParams = {
+      amount: params.netTicketCents,
+      currency: params.currency.toLowerCase(),
+      destination: params.destinationAccountId,
+      metadata: {
+        app: 'NightHub',
+        type: 'ticket_net_transfer',
+        order_id: params.orderId,
+        event_id: params.eventId,
+        user_id: params.userId,
+      },
+    };
+
+    if (params.sourceChargeId) {
+      transferData.source_transaction = params.sourceChargeId;
+    }
+
+    await params.stripe.transfers.create(transferData, {
+      idempotencyKey: `ticket_order_${params.orderId}_net_transfer`,
+    });
   }
 
   async createEntryCheckoutSession(params: {
@@ -129,8 +242,8 @@ export class PaymentsService {
     }
 
     const stripe = this.getStripeClient();
+    await this.assertVenueAccountIsNotStripeOwner(stripe, venueStripeAccountId);
     const currency = (event.presale_currency || 'eur').toLowerCase();
-    const amountTotal = new Prisma.Decimal(unitPrice).mul(quantity);
 
     const baseReturnUrl =
       process.env.STRIPE_CHECKOUT_RETURN_URL ||
@@ -139,41 +252,38 @@ export class PaymentsService {
 
     const successUrl = `${baseReturnUrl}?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
     const cancelUrl = `${baseReturnUrl}?checkout=cancel`;
-    const netTotal = unitPrice * quantity;
-    const grossTotalCents = this.calcGrossCentsFromNet(netTotal);
+    const grossTotalCents = this.calcGrossCentsFromNet(unitPrice * quantity);
+    const grossUnitCents = Math.ceil(grossTotalCents / quantity);
+    const amountTotal = grossTotalCents / 100;
 
-    const session = await stripe.checkout.sessions.create(
-      {
-        mode: 'payment',
-        success_url: successUrl,
-        cancel_url: cancelUrl,
-        line_items: [
-          {
-            quantity: 1,
-            price_data: {
-              currency,
-              unit_amount: grossTotalCents,
-              product_data: {
-                name: `${event.name} · Ingresso prevendita x${quantity}`,
-              },
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      line_items: [
+        {
+          quantity,
+          price_data: {
+            currency,
+            unit_amount: grossUnitCents,
+            product_data: {
+              name: `${event.name} · Ingresso prevendita`,
             },
           },
-        ],
-        metadata: {
-          app: 'NightHub',
-          type: 'entry_presale',
-          user_id: params.userId,
-          event_id: params.eventId,
-          venue_id: event.venue_id,
-          quantity: String(quantity),
         },
-        client_reference_id: params.userId,
-        allow_promotion_codes: true,
+      ],
+      metadata: {
+        app: 'NightHub',
+        type: 'entry_presale',
+        user_id: params.userId,
+        event_id: params.eventId,
+        venue_id: event.venue_id,
+        quantity: String(quantity),
+        net_ticket_cents: String(Math.round(unitPrice * quantity * 100)),
       },
-      {
-        stripeAccount: venueStripeAccountId,
-      },
-    );
+      client_reference_id: params.userId,
+      allow_promotion_codes: true,
+    });
 
     await this.prisma.ticket_orders.create({
       data: {
@@ -276,29 +386,30 @@ export class PaymentsService {
     }
 
     const stripe = this.getStripeClient();
+    await this.assertVenueAccountIsNotStripeOwner(stripe, venueStripeAccountId);
     const currency = (event.presale_currency || 'eur').toLowerCase();
-    const netTotal = unitPrice * quantity;
-    const amountInCents = this.calcGrossCentsFromNet(netTotal);
-    const amountTotal = new Prisma.Decimal(unitPrice).mul(quantity);
+    const netTotal = unitPrice * quantity; // prezzo totale netto del biglietto
+    const grossCents = this.calcGrossCentsFromNet(netTotal); // utente paga prezzo + fee + buffer
+    const netCents = Math.round(netTotal * 100); // quello che deve ricevere il locale
+    const applicationFee = grossCents - netCents; // eventuali centesimi residui alla piattaforma
+    const amountTotal = grossCents / 100;
 
-    const paymentIntent = await stripe.paymentIntents.create(
-      {
-        amount: amountInCents,
-        currency,
-        automatic_payment_methods: { enabled: true },
-        metadata: {
-          app: 'NightHub',
-          type: 'entry_presale',
-          user_id: params.userId,
-          event_id: params.eventId,
-          venue_id: event.venue_id,
-          quantity: String(quantity),
-        },
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: grossCents,
+      currency,
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        app: 'NightHub',
+        type: 'entry_presale',
+        user_id: params.userId,
+        event_id: params.eventId,
+        venue_id: event.venue_id,
+        quantity: String(quantity),
+        net_ticket_cents: String(netCents),
+        venue_net_cents: String(netCents),
+        platform_fee_cents: String(applicationFee),
       },
-      {
-        stripeAccount: venueStripeAccountId,
-      },
-    );
+    });
 
     await this.prisma.ticket_orders.create({
       data: {
@@ -351,12 +462,14 @@ export class PaymentsService {
     }
 
     const stripe = this.getStripeClient();
+    if (!order.stripe_account_id) {
+      throw new BadRequestException('Missing stripe account id on order');
+    }
+
     const paymentIntent = await stripe.paymentIntents.retrieve(
       params.paymentIntentId,
-      {
-        stripeAccount: order.stripe_account_id,
-      },
     );
+
     if (paymentIntent.status !== 'succeeded') {
       const nextStatus =
         paymentIntent.status === 'canceled'
@@ -375,6 +488,30 @@ export class PaymentsService {
         order_status: nextStatus,
       };
     }
+
+    const sourceChargeId = this.extractExpandableId(
+      paymentIntent.latest_charge as string | { id: string } | null | undefined,
+    );
+
+    const netTicketCents = await this.resolveNetTicketCents({
+      eventId: order.event_id,
+      quantity: order.quantity,
+      metadataNetCents:
+        paymentIntent.metadata?.net_ticket_cents ??
+        paymentIntent.metadata?.venue_net_cents ??
+        null,
+    });
+
+    await this.transferNetTicketToVenue({
+      stripe,
+      orderId: order.id,
+      destinationAccountId: order.stripe_account_id,
+      currency: order.currency,
+      netTicketCents,
+      sourceChargeId,
+      eventId: order.event_id,
+      userId: order.user_id,
+    });
 
     const reservation = await this.prisma.$transaction(async (tx) => {
       const currentOrder = await tx.ticket_orders.findUnique({
@@ -543,9 +680,6 @@ export class PaymentsService {
     const stripe = this.getStripeClient();
     const session = await stripe.checkout.sessions.retrieve(
       params.stripeSessionId,
-      {
-        stripeAccount: order.stripe_account_id,
-      },
     );
 
     const paymentStatus = session.payment_status;
@@ -570,6 +704,49 @@ export class PaymentsService {
         order_status: status,
       };
     }
+
+    const sessionPaymentIntentId =
+      typeof session.payment_intent === 'string'
+        ? session.payment_intent
+        : null;
+
+    let sourceChargeId: string | null = null;
+    let paymentIntentNetCents: string | null = null;
+
+    if (sessionPaymentIntentId) {
+      const paymentIntent = await stripe.paymentIntents.retrieve(
+        sessionPaymentIntentId,
+      );
+      sourceChargeId = this.extractExpandableId(
+        paymentIntent.latest_charge as
+          | string
+          | { id: string }
+          | null
+          | undefined,
+      );
+      paymentIntentNetCents =
+        paymentIntent.metadata?.net_ticket_cents ??
+        paymentIntent.metadata?.venue_net_cents ??
+        null;
+    }
+
+    const netTicketCents = await this.resolveNetTicketCents({
+      eventId: order.event_id,
+      quantity: order.quantity,
+      metadataNetCents:
+        session.metadata?.net_ticket_cents ?? paymentIntentNetCents,
+    });
+
+    await this.transferNetTicketToVenue({
+      stripe,
+      orderId: order.id,
+      destinationAccountId: order.stripe_account_id,
+      currency: order.currency,
+      netTicketCents,
+      sourceChargeId,
+      eventId: order.event_id,
+      userId: order.user_id,
+    });
 
     const reservation = await this.prisma.$transaction(async (tx) => {
       const currentOrder = await tx.ticket_orders.findUnique({

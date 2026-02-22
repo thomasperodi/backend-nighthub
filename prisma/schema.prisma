@@ -143,6 +143,12 @@ model venues {
   stripe_charges_enabled Boolean @default(false)
   stripe_payouts_enabled Boolean @default(false)
   stripe_onboarding_completed_at DateTime?
+  contract_start_at DateTime?
+  contract_end_at DateTime?
+  contract_status String?
+  contract_monthly_fee Decimal? @db.Decimal(10,2)
+  contract_auto_renew Boolean @default(false)
+  contract_notes String?
   created_at  DateTime @default(now())
   updated_at  DateTime @updatedAt
 

@@ -233,7 +233,8 @@ export class StaffService {
   }) {
     const token = params.token || '';
     const isExpoToken =
-      token.startsWith('ExponentPushToken') || token.startsWith('ExpoPushToken');
+      token.startsWith('ExponentPushToken') ||
+      token.startsWith('ExpoPushToken');
     if (!isExpoToken) return;
 
     try {
@@ -261,7 +262,9 @@ export class StaffService {
       throw new BadRequestException('quantity must be positive');
 
     if (dto.user_id && quantity !== 1) {
-      throw new BadRequestException('quantity must be 1 when user_id is provided');
+      throw new BadRequestException(
+        'quantity must be 1 when user_id is provided',
+      );
     }
 
     const payload = dto as unknown as Record<string, unknown>;

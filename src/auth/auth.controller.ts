@@ -1,10 +1,4 @@
-import {
-  Controller,
-  Post,
-  Body,
-  Headers,
-  Delete,
-} from '@nestjs/common';
+import { Controller, Post, Body, Headers, Delete } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { RegisterDto, LoginDto, PushTokenDto } from './dto';
 import { Public } from './public.decorator';

@@ -12,6 +12,7 @@ import { VenueStaysModule } from './venue-stays/venue-stays.module';
 import { FriendsModule } from './friends/friends.module';
 import { StorageModule } from './common/storage/storage.module';
 import { PaymentsModule } from './payments/payments.module';
+import { AdminModule } from './admin/admin.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { RolesGuard } from './auth/roles.guard';
 
@@ -27,6 +28,7 @@ import { RolesGuard } from './auth/roles.guard';
     PaymentsModule,
     VenueStaysModule,
     FriendsModule,
+    AdminModule,
   ],
   controllers: [AppController],
   providers: [
