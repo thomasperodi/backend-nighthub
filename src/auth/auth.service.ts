@@ -1,4 +1,8 @@
-import { BadRequestException, ConflictException, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
@@ -31,7 +35,10 @@ export class AuthService {
 
   async register(dto: RegisterDto): Promise<PublicUser> {
     const allowedRoles = new Set<string>(Object.values(UserRole));
-    const desiredRole = (dto.role ?? UserRole.client).toString().trim().toLowerCase();
+    const desiredRole = (dto.role ?? UserRole.client)
+      .toString()
+      .trim()
+      .toLowerCase();
     if (!allowedRoles.has(desiredRole)) {
       throw new BadRequestException('role invalid');
     }
@@ -80,8 +87,13 @@ export class AuthService {
         },
       });
     } catch (err) {
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-        const target = Array.isArray(err.meta?.target) ? err.meta?.target.join(', ') : 'unique field';
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002'
+      ) {
+        const target = Array.isArray(err.meta?.target)
+          ? err.meta?.target.join(', ')
+          : 'unique field';
         throw new ConflictException(`User already exists (${target})`);
       }
       throw err;

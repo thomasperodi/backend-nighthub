@@ -199,6 +199,9 @@ export class ReservationsController {
 
     if (user.role === 'client') {
       if (r.user_id !== user.id) throw new ForbiddenException('Forbidden');
+      if (r.type === 'entry') {
+        throw new BadRequestException('Gli ingressi non sono annullabili dal cliente');
+      }
     } else if (user.role !== 'admin') {
       const venueId = user.venue_id ?? undefined;
       if (!venueId) throw new ForbiddenException('Missing venue_id for this user');
