@@ -459,6 +459,7 @@ model reservations {
   user_id      String            @db.Uuid
   event_id     String            @db.Uuid
   venue_table_id String?         @db.Uuid
+  table_name   String?
   type         ReservationType
   status       ReservationStatus @default(pending)
   guests       Int

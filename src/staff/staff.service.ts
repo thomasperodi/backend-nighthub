@@ -462,6 +462,46 @@ export class StaffService {
     });
   }
 
+  private async resolveReservationTableNames(params: {
+    eventId: string;
+    venueId?: string;
+  }): Promise<Map<string, string>> {
+    const { eventId, venueId } = params;
+
+    const venueFilter = venueId
+      ? Prisma.sql`AND vt.venue_id = ${venueId}::uuid`
+      : Prisma.empty;
+
+    const rows = await this.prisma.$queryRaw<
+      Array<{ venue_table_id: string | null; table_name: string | null }>
+    >(Prisma.sql`
+      SELECT r.venue_table_id, r.table_name
+      FROM reservations r
+      JOIN venue_tables vt ON vt.id = r.venue_table_id
+      WHERE r.event_id = ${eventId}::uuid
+        AND r.type = 'table'
+        AND r.status IN ('pending', 'confirmed', 'completed')
+        AND r.table_name IS NOT NULL
+        AND BTRIM(r.table_name) <> ''
+        ${venueFilter}
+      ORDER BY r.created_at DESC
+    `);
+
+    const tableNameByVenueTableId = new Map<string, string>();
+    for (const row of rows) {
+      const venueTableId = row?.venue_table_id
+        ? String(row.venue_table_id)
+        : '';
+      const tableName = row?.table_name ? String(row.table_name).trim() : '';
+      if (!venueTableId || !tableName) continue;
+      if (!tableNameByVenueTableId.has(venueTableId)) {
+        tableNameByVenueTableId.set(venueTableId, tableName);
+      }
+    }
+
+    return tableNameByVenueTableId;
+  }
+
   // Hostess tables
   async listHostessTables(params: {
     eventId?: string;
@@ -513,16 +553,33 @@ export class StaffService {
       orderBy: [{ venue_table: { numero: 'asc' } }],
     });
 
-    return tables.map((t) => ({
-      ...t,
-      prenotati: prenotatiByVenueTableId.get(t.venue_table_id) ?? 0,
-      stato:
-        t.entrati >= (prenotatiByVenueTableId.get(t.venue_table_id) ?? 0)
+    const tableNameByVenueTableId = await this.resolveReservationTableNames({
+      eventId,
+      venueId,
+    });
+
+    return tables.map((t) => {
+      const prenotati = prenotatiByVenueTableId.get(t.venue_table_id) ?? 0;
+      const stato =
+        t.entrati >= prenotati
           ? 'completo'
           : t.entrati > 0
             ? 'parziale'
-            : 'attesa',
-    }));
+            : 'attesa';
+
+      return {
+        id: t.id,
+        event_id: t.event_id,
+        venue_table_id: t.venue_table_id,
+        table_name: tableNameByVenueTableId.get(t.venue_table_id) ?? null,
+        prenotati,
+        entrati: t.entrati,
+        pagato_totale: t.pagato_totale,
+        stato,
+        venue_table: t.venue_table,
+        event: t.event,
+      };
+    });
   }
 
   // Cameriere tables
@@ -547,6 +604,7 @@ export class StaffService {
       select: {
         id: true,
         event_id: true,
+        venue_table_id: true,
         venue_table: {
           select: {
             venue_id: true,
@@ -565,6 +623,11 @@ export class StaffService {
       orderBy: [{ venue_table: { numero: 'asc' } }],
     });
 
+    const tableNameByVenueTableId = await this.resolveReservationTableNames({
+      eventId,
+      venueId,
+    });
+
     return rows.map((t) => {
       const is_saldato = (t.stato ?? '').toLowerCase() === 'saldato';
       const pagato_totale = t.pagato_totale;
@@ -574,6 +637,7 @@ export class StaffService {
         event_id: t.event_id,
         venue_id: t.venue_table?.venue_id ?? null,
         nome: t.venue_table?.nome ?? 'Tavolo',
+        table_name: tableNameByVenueTableId.get(t.venue_table_id) ?? null,
         zona: t.venue_table?.zona ?? null,
         per_testa: t.venue_table?.per_testa ?? 0,
         prenotati: t.prenotati ?? 0,

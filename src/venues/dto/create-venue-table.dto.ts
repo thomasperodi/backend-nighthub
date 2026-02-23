@@ -9,10 +9,6 @@ export class CreateVenueTableDto {
   zona?: string;
 
   @IsOptional()
-  @IsInt()
-  numero?: number;
-
-  @IsOptional()
   @IsNumber()
   @Min(0)
   per_testa?: number;

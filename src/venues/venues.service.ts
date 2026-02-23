@@ -226,7 +226,7 @@ export class VenuesService {
 
     return await this.prisma.venue_tables.findMany({
       where: { venue_id: venueId },
-      orderBy: [{ zona: 'asc' }, { numero: 'asc' }, { nome: 'asc' }],
+      orderBy: [{ zona: 'asc' }, { nome: 'asc' }],
     });
   }
 
@@ -252,12 +252,17 @@ export class VenuesService {
           throw new BadRequestException('Each table must have nome');
         }
 
-        const numero =
-          t.numero === null || t.numero === undefined
-            ? undefined
-            : Number(t.numero);
-        if (numero !== undefined && (!Number.isInteger(numero) || numero < 1)) {
-          throw new BadRequestException('numero must be an integer >= 1');
+        const zonaRaw =
+          t.zona === null || t.zona === undefined ? '' : String(t.zona).trim();
+        const nomeRaw = String(t.nome).trim();
+        const zoneMode = zonaRaw.length > 0;
+        const normalizedNome = zoneMode
+          ? (nomeRaw || zonaRaw)
+          : nomeRaw;
+        const normalizedZona = zoneMode ? zonaRaw : undefined;
+
+        if (!normalizedNome) {
+          throw new BadRequestException('nome cannot be empty');
         }
 
         const perTesta =
@@ -293,44 +298,37 @@ export class VenuesService {
           throw new BadRequestException('persone_max must be an integer >= 1');
         }
 
-        // If numero is provided, treat it as an idempotent key within the venue
-        if (numero !== undefined) {
-          const existing = (await tx.venue_tables.findFirst({
-            where: { venue_id: venueId, numero },
-            select: { id: true },
-          })) as { id: string } | null;
+        if (!zoneMode) {
+          throw new BadRequestException('zona is required');
+        }
 
-          if (existing) {
-            await tx.venue_tables.update({
-              where: { id: existing.id },
-              data: {
-                nome: t.nome,
-                zona: t.zona ?? undefined,
-                per_testa: perTesta,
-                costo_minimo: costoMinimo,
-                persone_max: personeMax,
-              },
-            });
-          } else {
-            await tx.venue_tables.create({
-              data: {
-                venue_id: venueId,
-                nome: t.nome,
-                zona: t.zona ?? undefined,
-                numero,
-                per_testa: perTesta,
-                costo_minimo: costoMinimo,
-                persone_max: personeMax,
-              },
-            });
-          }
+        const existingZone = (await tx.venue_tables.findFirst({
+          where: {
+            venue_id: venueId,
+            zona: { equals: zonaRaw, mode: 'insensitive' },
+          },
+          select: { id: true },
+        })) as { id: string } | null;
+
+        if (existingZone) {
+          await tx.venue_tables.update({
+            where: { id: existingZone.id },
+            data: {
+              nome: normalizedNome,
+              zona: normalizedZona,
+              numero: null,
+              per_testa: perTesta,
+              costo_minimo: costoMinimo,
+              persone_max: personeMax,
+            },
+          });
         } else {
           await tx.venue_tables.create({
             data: {
               venue_id: venueId,
-              nome: t.nome,
-              zona: t.zona ?? undefined,
-              numero: undefined,
+              nome: normalizedNome,
+              zona: normalizedZona,
+              numero: null,
               per_testa: perTesta,
               costo_minimo: costoMinimo,
               persone_max: personeMax,
@@ -357,7 +355,49 @@ export class VenuesService {
       throw new NotFoundException('Table not found');
     }
 
-    return await this.prisma.venue_tables.delete({ where: { id: tableId } });
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const salesCount = await tx.table_sales.count({
+          where: {
+            event_table: {
+              venue_table_id: tableId,
+            },
+          },
+        });
+
+        if (salesCount > 0) {
+          throw new BadRequestException(
+            'Cannot delete table: sales are associated with this table',
+          );
+        }
+
+        await tx.reservations.updateMany({
+          where: { venue_table_id: tableId },
+          data: { venue_table_id: null },
+        });
+
+        await tx.event_tables.deleteMany({
+          where: { venue_table_id: tableId },
+        });
+
+        return await tx.venue_tables.delete({ where: { id: tableId } });
+      });
+    } catch (error: unknown) {
+      if (error instanceof BadRequestException) throw error;
+
+      const prismaCode =
+        typeof error === 'object' && error !== null && 'code' in error
+          ? String((error as { code?: unknown }).code)
+          : '';
+
+      if (prismaCode === 'P2003') {
+        throw new BadRequestException(
+          'Cannot delete table: it is still linked to event data',
+        );
+      }
+
+      throw error;
+    }
   }
 
   async updateVenueTable(
@@ -385,29 +425,27 @@ export class VenuesService {
 
     if (body?.zona !== undefined) {
       const trimmed = String(body.zona).trim();
-      data.zona = trimmed.length ? trimmed : null;
-    }
-
-    if (body?.numero !== undefined && body.numero !== null) {
-      const numero = Number(body.numero);
-      if (!Number.isInteger(numero) || numero < 1) {
-        throw new BadRequestException('numero must be an integer >= 1');
+      if (!trimmed.length) {
+        throw new BadRequestException('zona cannot be empty');
       }
 
-      // Unique per venue: prevent collisions with another table
-      const clash = (await this.prisma.venue_tables.findFirst({
+      data.zona = trimmed;
+
+      const clashByZone = (await this.prisma.venue_tables.findFirst({
         where: {
           venue_id: venueId,
-          numero,
           id: { not: tableId },
+          zona: { equals: trimmed, mode: 'insensitive' },
         },
         select: { id: true },
       })) as { id: string } | null;
-      if (clash) {
-        throw new BadRequestException('numero already in use for this venue');
+      if (clashByZone) {
+        throw new BadRequestException('zona already exists for this venue');
       }
 
-      data.numero = numero;
+      if (!body?.nome) {
+        data.nome = trimmed;
+      }
     }
 
     if (body?.per_testa !== undefined && body.per_testa !== null) {
@@ -434,11 +472,10 @@ export class VenuesService {
       data.persone_max = v;
     }
 
-    // If user wants to clear numeric optional fields, allow explicit null
     if (body?.per_testa === null) data.per_testa = null;
     if (body?.costo_minimo === null) data.costo_minimo = null;
     if (body?.persone_max === null) data.persone_max = null;
-    if (body?.numero === null) data.numero = null;
+    data.numero = null;
 
     return await this.prisma.venue_tables.update({
       where: { id: tableId },

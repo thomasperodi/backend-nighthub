@@ -61,6 +61,7 @@ export class ReservationsService {
       user_id: true,
       event_id: true,
       venue_table_id: true,
+      table_name: true,
       type: true,
       status: true,
       guests: true,
@@ -166,6 +167,7 @@ export class ReservationsService {
     type?: 'table' | 'entry';
     guests?: unknown;
     venue_table_id?: string | null;
+    table_name?: unknown;
     status?: 'pending' | 'confirmed' | 'cancelled' | 'completed';
     total_amount?: unknown;
   } {
@@ -179,12 +181,15 @@ export class ReservationsService {
       dto?.seats ??
       dto?.people;
     const venue_table_id =
+      dto?.venue_zone_id ??
+      dto?.venueZoneId ??
       dto?.venue_table_id ??
       dto?.venueTableId ??
       dto?.table_id ??
       dto?.tableId ??
       null;
     const total_amount = dto?.total_amount ?? dto?.totalAmount;
+    const table_name = dto?.table_name ?? dto?.tableName;
 
     let status: any = dto?.status;
     if (status === 'reserved') status = 'confirmed';
@@ -195,9 +200,20 @@ export class ReservationsService {
       type,
       guests,
       venue_table_id,
+      table_name,
       status,
       total_amount,
     };
+  }
+
+  private normalizeTableName(value: unknown): string | null {
+    if (value === null || value === undefined) return null;
+    const tableName = String(value).trim();
+    if (!tableName.length) return null;
+    if (tableName.length > 60) {
+      throw new BadRequestException('table_name must be <= 60 chars');
+    }
+    return tableName;
   }
 
   private normalizeGuests(value: unknown): number {
@@ -313,6 +329,7 @@ if (userRecord?.role !== 'venue') {
 }
 
     const venueTableId: string | null | undefined = normalized.venue_table_id ?? null;
+    const tableName = this.normalizeTableName(normalized.table_name);
 
     let totalAmount: Prisma.Decimal | undefined;
     if (normalized?.total_amount !== null && normalized?.total_amount !== undefined) {
@@ -325,7 +342,7 @@ if (userRecord?.role !== 'venue') {
 
     if (type === 'table') {
       if (!venueTableId) {
-        throw new BadRequestException('venue_table_id required for table reservations');
+        throw new BadRequestException('venue_zone_id required for table reservations');
       }
 
       const table = await this.prisma.venue_tables.findUnique({
@@ -349,10 +366,17 @@ if (userRecord?.role !== 'venue') {
       // Auto compute total_amount if missing and per_testa is available
       if (!totalAmount && table.per_testa) {
         try {
-          totalAmount = table.per_testa.mul(new Prisma.Decimal(guests));
+          const computed = table.per_testa.mul(new Prisma.Decimal(guests));
+          if (table.costo_minimo) {
+            totalAmount = Prisma.Decimal.max(computed, table.costo_minimo);
+          } else {
+            totalAmount = computed;
+          }
         } catch {
           // ignore
         }
+      } else if (!totalAmount && table.costo_minimo) {
+        totalAmount = table.costo_minimo;
       }
     }
 
@@ -376,6 +400,7 @@ if (userRecord?.role !== 'venue') {
           user_id: userId,
           event_id: eventId,
           venue_table_id: type === 'table' ? venueTableId : null,
+          table_name: type === 'table' ? tableName : null,
           type,
           status,
           guests,

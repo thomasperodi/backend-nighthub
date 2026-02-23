@@ -10,11 +10,6 @@ export class UpdateVenueTableDto {
   zona?: string;
 
   @IsOptional()
-  @IsInt()
-  @Min(1)
-  numero?: number;
-
-  @IsOptional()
   @IsNumber()
   @Min(0)
   per_testa?: number;
