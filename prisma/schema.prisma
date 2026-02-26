@@ -329,11 +329,13 @@ model event_tables {
   id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   event_id       String   @db.Uuid
   venue_table_id String   @db.Uuid
+  assigned_number Int?
 
   prenotati     Int      @default(0)
   entrati       Int      @default(0)
   pagato_totale Decimal  @default(0)
   stato         String   @default("libero")
+  confermato    Boolean  @default(false)
 
   event         events       @relation(fields: [event_id], references: [id])
   venue_table   venue_tables @relation(fields: [venue_table_id], references: [id])
@@ -341,6 +343,8 @@ model event_tables {
 
   @@unique([event_id, venue_table_id])
   @@index([event_id])
+  @@index([event_id, confermato])
+  @@index([event_id, assigned_number])
 }
 
 // ===============================

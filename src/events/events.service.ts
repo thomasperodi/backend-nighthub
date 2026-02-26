@@ -21,6 +21,7 @@ import { UpdateEventDto } from './dto/update-event.dto';
 export type EventStats = {
   event_id: string;
   total_entries: number;
+  total_entries_revenue: number;
   total_bar: number;
   total_cloakroom: number;
   total_tables: number;
@@ -1026,9 +1027,30 @@ export class EventsService {
   async recalculateEventStats(eventId: string): Promise<EventStats> {
     await this.getEvent(eventId);
 
-    const [entriesCount, barAgg, cloakAgg, tableAgg] =
+    const [entriesAgg, paidEntryReservationsAgg, directEntriesAgg, barAgg, cloakAgg, tableAgg] =
       await this.prisma.$transaction([
-        this.prisma.entries.count({ where: { event_id: eventId } }),
+        this.prisma.entries.aggregate({
+          where: { event_id: eventId },
+          _count: { id: true },
+        }),
+        this.prisma.reservations.aggregate({
+          where: {
+            event_id: eventId,
+            type: 'entry',
+            status: { in: ['confirmed', 'completed'] },
+            total_amount: { not: null },
+          },
+          _sum: { total_amount: true },
+        }),
+        this.prisma.$queryRaw<Array<{ total: Prisma.Decimal | null }>>(
+          Prisma.sql`
+            SELECT COALESCE(SUM(e.price), 0) AS total
+            FROM "entries" e
+            LEFT JOIN "reservations" r ON r."checkin_entry_id" = e."id"
+            WHERE e."event_id" = ${eventId}::uuid
+              AND (r."id" IS NULL OR r."total_amount" IS NULL)
+          `,
+        ),
         this.prisma.bar_sales.aggregate({
           where: { event_id: eventId },
           _sum: { amount: true },
@@ -1037,18 +1059,26 @@ export class EventsService {
           where: { event_id: eventId },
           _sum: { amount: true },
         }),
-        this.prisma.table_sales.aggregate({
-          where: { event_table: { event_id: eventId } },
-          _sum: { amount: true },
+        this.prisma.event_tables.aggregate({
+          where: { event_id: eventId },
+          _sum: { pagato_totale: true },
         }),
       ]);
 
+    const paidEntryReservationsRevenue = this.decimalToNumber(
+      paidEntryReservationsAgg._sum.total_amount,
+    );
+    const directEntriesRevenue = this.decimalToNumber(
+      directEntriesAgg[0]?.total ?? null,
+    );
+
     return {
       event_id: eventId,
-      total_entries: entriesCount,
+      total_entries: Number(entriesAgg._count.id ?? 0),
+      total_entries_revenue: paidEntryReservationsRevenue + directEntriesRevenue,
       total_bar: this.decimalToNumber(barAgg._sum.amount),
       total_cloakroom: this.decimalToNumber(cloakAgg._sum.amount),
-      total_tables: this.decimalToNumber(tableAgg._sum.amount),
+      total_tables: this.decimalToNumber(tableAgg._sum.pagato_totale),
       last_updated: new Date(),
     };
   }
@@ -1093,12 +1123,19 @@ export class EventsService {
     const totals = stats.reduce(
       (acc, cur) => {
         acc.total_entries += cur.total_entries;
+        acc.total_entries_revenue += cur.total_entries_revenue;
         acc.total_bar += cur.total_bar;
         acc.total_cloakroom += cur.total_cloakroom;
         acc.total_tables += cur.total_tables;
         return acc;
       },
-      { total_entries: 0, total_bar: 0, total_cloakroom: 0, total_tables: 0 },
+      {
+        total_entries: 0,
+        total_entries_revenue: 0,
+        total_bar: 0,
+        total_cloakroom: 0,
+        total_tables: 0,
+      },
     );
 
     return { venue_id: venueId, ...totals, events: stats };

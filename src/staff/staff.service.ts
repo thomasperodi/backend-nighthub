@@ -17,6 +17,7 @@ import { RecordEntryDto } from './dto/record-entry.dto';
 import { RecordSaleDto } from './dto/record-sale.dto';
 import { UpdateTableHostessDto } from './dto/update-table-hostess.dto';
 import { EventsService } from '../events/events.service';
+import { resolveEntryUnitPrice } from '../common/entry-pricing';
 
 @Injectable()
 export class StaffService {
@@ -156,14 +157,6 @@ export class StaffService {
     const venueTableCount = venueTables.length;
     if (!venueTableCount) return;
 
-    // Fast path: if already fully seeded, avoid groupBy + sync work on every request.
-    const existingCount = await this.prisma.event_tables.count({
-      where: { event_id: eventId },
-    });
-    if (existingCount >= venueTableCount && existingCount > 0) {
-      return;
-    }
-
     // Aggregate prenotati from reservations
     const grouped = await this.prisma.reservations.groupBy({
       by: ['venue_table_id'],
@@ -281,6 +274,12 @@ export class StaffService {
 
     const sesso = this.entryTypeToGender(dto.entry_type ?? 'free');
     const method = dto.user_id ? EntryMethod.QR : EntryMethod.RAPIDO;
+    const entryPrice = await resolveEntryUnitPrice({
+      prisma: this.prisma,
+      eventId,
+      gender: sesso,
+      isComplimentary: (dto.entry_type ?? 'free') === 'free',
+    });
     const createData: Prisma.entriesCreateManyInput[] = Array.from(
       { length: quantity },
       () => ({
@@ -288,7 +287,7 @@ export class StaffService {
         staff_id: dto.staff_id ?? null,
         user_id: dto.user_id ?? null,
         sesso,
-        price: new Prisma.Decimal(0),
+        price: entryPrice,
         method,
       }),
     );
@@ -507,8 +506,9 @@ export class StaffService {
     eventId?: string;
     venueId?: string;
     onlyBooked?: boolean;
+    includeConfirmed?: boolean;
   }) {
-    const { eventId, venueId } = params;
+    const { eventId, venueId, includeConfirmed = true } = params;
 
     if (!eventId) {
       return [];
@@ -547,6 +547,7 @@ export class StaffService {
       where: {
         event_id: eventId,
         venue_table_id: { in: bookedVenueTableIds },
+        ...(includeConfirmed ? {} : { confermato: false }),
         ...(venueId ? { venue_table: { venue_id: venueId } } : {}),
       },
       include: { venue_table: true, event: true },
@@ -575,7 +576,9 @@ export class StaffService {
         prenotati,
         entrati: t.entrati,
         pagato_totale: t.pagato_totale,
+        confermato: Boolean((t as any).confermato),
         stato,
+        numero: t.assigned_number ?? t.venue_table?.numero ?? null,
         venue_table: t.venue_table,
         event: t.event,
       };
@@ -605,12 +608,14 @@ export class StaffService {
         id: true,
         event_id: true,
         venue_table_id: true,
+        assigned_number: true,
         venue_table: {
           select: {
             venue_id: true,
             nome: true,
             zona: true,
             per_testa: true,
+            costo_minimo: true,
             numero: true,
           },
         },
@@ -640,9 +645,10 @@ export class StaffService {
         table_name: tableNameByVenueTableId.get(t.venue_table_id) ?? null,
         zona: t.venue_table?.zona ?? null,
         per_testa: t.venue_table?.per_testa ?? 0,
+        costo_minimo: t.venue_table?.costo_minimo ?? null,
         prenotati: t.prenotati ?? 0,
         entrati: t.entrati ?? 0,
-        numero: t.venue_table?.numero ?? null,
+        numero: t.assigned_number ?? t.venue_table?.numero ?? null,
         pagato_iniziale: null,
         pagato_totale,
         stato_pagamento: is_saldato
@@ -669,26 +675,61 @@ export class StaffService {
     if (next < 0) throw new BadRequestException('entrati cannot be negative');
     const updated = await this.prisma.event_tables.update({
       where: { id },
-      data: { entrati: next },
+      data: {
+        entrati: next,
+        ...(next < Number(table.prenotati ?? 0) ? { confermato: false } : {}),
+      },
     });
+    return updated;
+  }
+
+  async setHostessTableConfirmed(id: string, confirmed: boolean) {
+    const table = await this.prisma.event_tables.findUnique({ where: { id } });
+    if (!table) throw new NotFoundException('Table not found');
+
+    const updated = await this.prisma.event_tables.update({
+      where: { id },
+      data: { confermato: confirmed } as any,
+    });
+
     return updated;
   }
 
   async assignHostessTableNumber(id: string, numero: number) {
     if (!Number.isFinite(numero))
       throw new BadRequestException('numero must be a valid number');
+    if (!Number.isInteger(numero) || numero <= 0) {
+      throw new BadRequestException('numero must be a positive integer');
+    }
+
     const table = await this.prisma.event_tables.findUnique({
       where: { id },
       include: { venue_table: true },
     });
     if (!table) throw new NotFoundException('Table not found');
 
-    const updatedVenueTable = await this.prisma.venue_tables.update({
-      where: { id: table.venue_table_id },
-      data: { numero },
+    const alreadyAssigned = await this.prisma.event_tables.findFirst({
+      where: {
+        event_id: table.event_id,
+        assigned_number: numero,
+        NOT: { id },
+      },
+      select: { id: true },
     });
 
-    return { ...table, venue_table: updatedVenueTable };
+    if (alreadyAssigned) {
+      throw new BadRequestException(
+        'Numero tavolo già assegnato a un altro tavolo prenotato',
+      );
+    }
+
+    const updatedEventTable = await this.prisma.event_tables.update({
+      where: { id },
+      data: { assigned_number: numero },
+      include: { venue_table: true },
+    });
+
+    return updatedEventTable;
   }
 
   // Hostess: aggiorna persone entrate e pagamento iniziale

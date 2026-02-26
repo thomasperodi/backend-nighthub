@@ -233,6 +233,7 @@ export class StaffController {
     @Query('venueId') venueId?: string,
     @Query('staffId') staffId?: string,
     @Query('onlyBooked') onlyBooked?: string,
+    @Query('includeConfirmed') includeConfirmed?: string,
   ) {
     const isAdmin = user.role === 'admin';
     const effectiveVenueId: string | undefined = isAdmin
@@ -253,6 +254,10 @@ export class StaffController {
       eventId: resolvedEventId,
       venueId: effectiveVenueId,
       onlyBooked: onlyBooked === 'true' || onlyBooked === '1',
+      includeConfirmed:
+        includeConfirmed === undefined
+          ? true
+          : includeConfirmed === 'true' || includeConfirmed === '1',
     });
   }
 
@@ -292,9 +297,10 @@ export class StaffController {
     @Param('id') id: string,
     @Body()
     body: {
-      action: 'update_entrati' | 'assign_number';
+      action: 'update_entrati' | 'assign_number' | 'set_confirmed';
       delta?: number;
       numero?: number;
+      confirmed?: boolean;
     },
     @CurrentUser() user: RequestUser,
   ) {
@@ -316,6 +322,9 @@ export class StaffController {
         throw new BadRequestException('numero is required');
       }
       return this.staffService.assignHostessTableNumber(id, body.numero);
+    }
+    if (body.action === 'set_confirmed') {
+      return this.staffService.setHostessTableConfirmed(id, Boolean(body.confirmed));
     }
     throw new BadRequestException('unknown action');
   }

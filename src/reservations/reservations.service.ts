@@ -6,6 +6,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { EntryMethod, Gender, Prisma } from '@prisma/client';
 import { randomUUID } from 'crypto';
+import { resolveEntryUnitPrice } from '../common/entry-pricing';
 
 type QrCheckInResult = {
   success: boolean;
@@ -563,6 +564,12 @@ if (userRecord?.role !== 'venue') {
           ? Gender.F
           : Gender.ALTRO;
 
+    const entryPrice = await resolveEntryUnitPrice({
+      prisma: this.prisma,
+      eventId,
+      gender,
+    });
+
     const result = await this.prisma.$transaction(async (tx) => {
       const createdEntry = await tx.entries.create({
         data: {
@@ -570,7 +577,7 @@ if (userRecord?.role !== 'venue') {
           user_id: reservation.user_id,
           staff_id: staffId,
           sesso: gender,
-          price: new Prisma.Decimal(0),
+          price: entryPrice,
           method: EntryMethod.QR,
         },
       });

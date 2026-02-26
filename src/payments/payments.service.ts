@@ -397,7 +397,7 @@ export class PaymentsService {
     const paymentIntent = await stripe.paymentIntents.create({
       amount: grossCents,
       currency,
-      automatic_payment_methods: { enabled: true },
+      payment_method_types: ['card'],
       metadata: {
         app: 'NightHub',
         type: 'entry_presale',
