@@ -8,7 +8,7 @@ import { Public } from '../auth/public.decorator';
 export class PublicPromosController {
   constructor(private readonly promosService: PromosService) {}
 
-  @Get('promos/active')
+  @Get('public/promos/active')
   promosActive(
     @Res({ passthrough: true }) res?: Response,
   ) {

@@ -8,10 +8,100 @@ import { Prisma, venues, events, promos, venue_tables } from '@prisma/client';
 import Stripe from 'stripe';
 import { CreateVenueTablesBulkDto } from './dto/create-venue-tables-bulk.dto';
 import { UpdateVenueTableDto } from './dto/update-venue-table.dto';
+import { UpdateVenuePricingDto } from './dto/update-venue-pricing.dto';
+import {
+  BAR_PRICE_KEYS,
+  DEFAULT_BAR_PRICE_LIST,
+  DEFAULT_CLOAKROOM_UNIT_PRICE,
+  VenueBarPriceKey,
+} from './venue-pricing.constants';
 
 @Injectable()
 export class VenuesService {
   constructor(private readonly prisma: PrismaService) {}
+
+  private decimalToNumber(value: unknown): number {
+    if (value === null || value === undefined) return 0;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+    if (typeof value === 'string') {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    }
+    const maybeDecimal = value as { toNumber?: () => number };
+    if (typeof maybeDecimal?.toNumber === 'function') {
+      try {
+        const n = maybeDecimal.toNumber();
+        return Number.isFinite(n) ? n : 0;
+      } catch {
+        return 0;
+      }
+    }
+    return 0;
+  }
+
+  private normalizeBarPriceList(value: unknown) {
+    const incomingList = Array.isArray(value) ? value : [];
+    const byKey = new Map<string, number>();
+
+    for (const raw of incomingList) {
+      if (!raw || typeof raw !== 'object') continue;
+      const row = raw as { key?: unknown; price?: unknown };
+      const key = typeof row.key === 'string' ? row.key.trim() : '';
+      if (!key || !BAR_PRICE_KEYS.has(key as VenueBarPriceKey)) continue;
+      const price = Number(row.price);
+      if (!Number.isFinite(price) || price < 0) continue;
+      byKey.set(key, Number(price.toFixed(2)));
+    }
+
+    return DEFAULT_BAR_PRICE_LIST.map((item) => ({
+      key: item.key,
+      label: item.label,
+      price: Number((byKey.get(item.key) ?? item.price).toFixed(2)),
+    }));
+  }
+
+  private normalizeBarPriceListInput(value: unknown) {
+    if (!Array.isArray(value)) {
+      throw new BadRequestException('bar_price_list must be an array');
+    }
+
+    const seenKeys = new Set<string>();
+    const list = value.map((raw) => {
+      const row = raw as { key?: unknown; label?: unknown; price?: unknown };
+      const key = typeof row.key === 'string' ? row.key.trim() : '';
+      if (!key || !BAR_PRICE_KEYS.has(key as VenueBarPriceKey)) {
+        throw new BadRequestException(`Unsupported bar price key: ${key || 'unknown'}`);
+      }
+      if (seenKeys.has(key)) {
+        throw new BadRequestException(`Duplicate bar price key: ${key}`);
+      }
+      seenKeys.add(key);
+
+      const price = Number(row.price);
+      if (!Number.isFinite(price) || price < 0) {
+        throw new BadRequestException(`Invalid price for ${key}`);
+      }
+
+      const defaultLabel =
+        DEFAULT_BAR_PRICE_LIST.find((item) => item.key === key)?.label ?? key;
+      const label =
+        typeof row.label === 'string' && row.label.trim().length
+          ? row.label.trim()
+          : defaultLabel;
+
+      return {
+        key,
+        label,
+        price: Number(price.toFixed(2)),
+      };
+    });
+
+    if (list.length === 0) {
+      throw new BadRequestException('bar_price_list cannot be empty');
+    }
+
+    return list;
+  }
 
   private getStripeClient(): Stripe {
     const secret = process.env.STRIPE_SECRET_KEY;
@@ -34,6 +124,80 @@ export class VenuesService {
     const v = await this.prisma.venues.findUnique({ where: { id } });
     if (!v) throw new NotFoundException('Venue not found');
     return v;
+  }
+
+  async getVenuePricing(id: string): Promise<{
+    venue_id: string;
+    cloakroom_unit_price: number;
+    bar_price_list: Array<{ key: string; label: string; price: number }>;
+  }> {
+    const venue = await this.prisma.venues.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        cloakroom_unit_price: true,
+        bar_price_list: true,
+      },
+    });
+
+    if (!venue) throw new NotFoundException('Venue not found');
+
+    const cloakroom = this.decimalToNumber(venue.cloakroom_unit_price);
+    return {
+      venue_id: id,
+      cloakroom_unit_price: Number(
+        (cloakroom > 0 ? cloakroom : DEFAULT_CLOAKROOM_UNIT_PRICE).toFixed(2),
+      ),
+      bar_price_list: this.normalizeBarPriceList(venue.bar_price_list),
+    };
+  }
+
+  async updateVenuePricing(
+    id: string,
+    updates: UpdateVenuePricingDto,
+  ): Promise<{
+    venue_id: string;
+    cloakroom_unit_price: number;
+    bar_price_list: Array<{ key: string; label: string; price: number }>;
+  }> {
+    await this.getVenue(id);
+
+    const data: Prisma.venuesUpdateInput = {};
+
+    if (updates.cloakroom_unit_price !== undefined) {
+      const price = Number(updates.cloakroom_unit_price);
+      if (!Number.isFinite(price) || price < 0) {
+        throw new BadRequestException('cloakroom_unit_price must be >= 0');
+      }
+      data.cloakroom_unit_price = Number(price.toFixed(2));
+    }
+
+    if (updates.bar_price_list !== undefined) {
+      const normalized = this.normalizeBarPriceListInput(updates.bar_price_list);
+      data.bar_price_list = normalized as Prisma.InputJsonValue;
+    }
+
+    if (Object.keys(data).length === 0) {
+      return this.getVenuePricing(id);
+    }
+
+    const updated = await this.prisma.venues.update({
+      where: { id },
+      data,
+      select: {
+        id: true,
+        cloakroom_unit_price: true,
+        bar_price_list: true,
+      },
+    });
+
+    return {
+      venue_id: updated.id,
+      cloakroom_unit_price: Number(
+        this.decimalToNumber(updated.cloakroom_unit_price).toFixed(2),
+      ),
+      bar_price_list: this.normalizeBarPriceList(updated.bar_price_list),
+    };
   }
 
   async createVenue(input: {

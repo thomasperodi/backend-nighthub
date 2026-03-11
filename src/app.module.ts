@@ -10,6 +10,7 @@ import { VenuesModule } from './venues/venues.module';
 import { ReservationsModule } from './reservations/reservations.module';
 import { VenueStaysModule } from './venue-stays/venue-stays.module';
 import { FriendsModule } from './friends/friends.module';
+import { PromosModule } from './promos/promos.module';
 import { StorageModule } from './common/storage/storage.module';
 import { PaymentsModule } from './payments/payments.module';
 import { AdminModule } from './admin/admin.module';
@@ -28,6 +29,7 @@ import { RolesGuard } from './auth/roles.guard';
     PaymentsModule,
     VenueStaysModule,
     FriendsModule,
+    PromosModule,
     AdminModule,
   ],
   controllers: [AppController],

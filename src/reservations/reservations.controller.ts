@@ -93,6 +93,12 @@ export class ReservationsController {
     return this.reservationsService.listBookedTableIdsForEvent(eventId);
   }
 
+  @Get('table-invitations/incoming')
+  @Roles('client')
+  listIncomingTableInvitations(@CurrentUser() user: RequestUser) {
+    return this.reservationsService.listIncomingTableInvitations(user.id);
+  }
+
   @Get(':id')
   @Roles('client', 'venue', 'admin')
   async get(@Param('id') id: string, @CurrentUser() user: RequestUser) {
@@ -209,5 +215,24 @@ export class ReservationsController {
     }
 
     return this.reservationsService.cancelReservation(id);
+  }
+
+  @Post(':id/table-invitations/respond')
+  @Roles('client')
+  respondToTableInvitation(
+    @Param('id') id: string,
+    @Body() body: any,
+    @CurrentUser() user: RequestUser,
+  ) {
+    const response = String(body?.response ?? '').trim().toLowerCase();
+    if (response !== 'accepted' && response !== 'declined') {
+      throw new BadRequestException('response must be accepted|declined');
+    }
+
+    return this.reservationsService.respondToTableInvitation({
+      reservationId: id,
+      userId: user.id,
+      response,
+    });
   }
 }

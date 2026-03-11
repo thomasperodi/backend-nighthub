@@ -4,6 +4,9 @@ import { FriendRequestDto } from './dto/friend-request.dto';
 import { CreateGroupDto } from './dto/create-group.dto';
 import { UpdateGroupDto } from './dto/update-group.dto';
 import { GroupMemberDto } from './dto/group-member.dto';
+import { CreateGroupTableProposalDto } from './dto/create-group-table-proposal.dto';
+import { VoteGroupTableProposalDto } from './dto/vote-group-table-proposal.dto';
+import { BookGroupTableProposalDto } from './dto/book-group-table-proposal.dto';
 import { Roles } from '../auth/roles.decorator';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { RequestUser } from '../auth/types';
@@ -123,5 +126,73 @@ export class FriendsController {
   @Roles('client')
   deleteGroup(@Param('id') id: string, @CurrentUser() user: RequestUser) {
     return this.friendsService.deleteGroup({ group_id: id, owner_id: user.id });
+  }
+
+  @Get('friend-groups/:id/table-proposals')
+  @Roles('client')
+  listGroupTableProposals(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    return this.friendsService.listGroupTableProposals(id, user.id);
+  }
+
+  @Post('friend-groups/:id/table-proposals')
+  @Roles('client')
+  createGroupTableProposal(
+    @Param('id') id: string,
+    @Body() body: CreateGroupTableProposalDto,
+    @CurrentUser() user: RequestUser,
+  ) {
+    return this.friendsService.createGroupTableProposal({
+      group_id: id,
+      user_id: user.id,
+      venue_id: body.venue_id,
+      guests: body.guests,
+      note: body.note,
+    });
+  }
+
+  @Post('friend-groups/:id/table-proposals/:proposalId/vote')
+  @Roles('client')
+  voteGroupTableProposal(
+    @Param('id') id: string,
+    @Param('proposalId') proposalId: string,
+    @Body() body: VoteGroupTableProposalDto,
+    @CurrentUser() user: RequestUser,
+  ) {
+    return this.friendsService.voteGroupTableProposal({
+      group_id: id,
+      proposal_id: proposalId,
+      user_id: user.id,
+      vote: body.vote,
+    });
+  }
+
+  @Post('friend-groups/:id/table-proposals/:proposalId/book')
+  @Roles('client')
+  bookGroupTableProposal(
+    @Param('id') id: string,
+    @Param('proposalId') proposalId: string,
+    @Body() body: BookGroupTableProposalDto,
+    @CurrentUser() user: RequestUser,
+  ) {
+    return this.friendsService.bookGroupTableProposal({
+      group_id: id,
+      proposal_id: proposalId,
+      user_id: user.id,
+      table_name: body.table_name,
+    });
+  }
+
+  @Post('friend-groups/:id/table-proposals/:proposalId/cancel')
+  @Roles('client')
+  cancelGroupTableProposal(
+    @Param('id') id: string,
+    @Param('proposalId') proposalId: string,
+    @CurrentUser() user: RequestUser,
+  ) {
+    return this.friendsService.cancelGroupTableProposal({
+      group_id: id,
+      proposal_id: proposalId,
+      user_id: user.id,
+    });
   }
 }

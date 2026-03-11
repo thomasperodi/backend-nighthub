@@ -15,6 +15,7 @@ import { VenuesService } from './venues.service';
 import { EventsService } from '../events/events.service';
 import { CreateVenueDto } from './dto/create-venue.dto';
 import { UpdateVenueDto } from './dto/update-venue.dto';
+import { UpdateVenuePricingDto } from './dto/update-venue-pricing.dto';
 import { CreateVenueTablesBulkDto } from './dto/create-venue-tables-bulk.dto';
 import { UpdateVenueTableDto } from './dto/update-venue-table.dto';
 import { Public } from '../auth/public.decorator';
@@ -90,6 +91,37 @@ export class VenuesController {
       if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
     }
     return this.venuesService.getStripeConnectStatus(id);
+  }
+
+  @Get(':id/pricing')
+  @Roles('staff', 'venue', 'admin')
+  getPricing(
+    @Param('id') id: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() !== 'admin') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+
+    return this.venuesService.getVenuePricing(id);
+  }
+
+  @Patch(':id/pricing')
+  @Roles('venue', 'admin')
+  updatePricing(
+    @Param('id') id: string,
+    @Body() body: UpdateVenuePricingDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+
+    return this.venuesService.updateVenuePricing(id, body);
   }
 
   @Delete(':id')

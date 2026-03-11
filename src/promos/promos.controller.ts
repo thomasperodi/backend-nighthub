@@ -8,6 +8,7 @@ import {
   Body,
   Query,
   ForbiddenException,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { PromosService } from './promos.service';
 import { Roles } from '../auth/roles.decorator';
@@ -18,6 +19,17 @@ import type { RequestUser } from '../auth/types';
 @Roles('venue', 'admin')
 export class PromosController {
   constructor(private readonly promosService: PromosService) {}
+
+  @Get('active')
+  @Roles('client', 'venue', 'admin')
+  active(@CurrentUser() user: RequestUser) {
+    if (user.role === 'admin') return this.promosService.listActivePromos();
+    if (user.role === 'venue') {
+      if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
+      return this.promosService.listActiveByVenue(user.venue_id);
+    }
+    return this.promosService.listActivePromosForUser(user.id);
+  }
 
   @Get()
   list(
@@ -34,7 +46,7 @@ export class PromosController {
   }
 
   @Get(':id')
-  async get(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+  async get(@Param('id', new ParseUUIDPipe({ version: '4' })) id: string, @CurrentUser() user: RequestUser) {
     const promo = await this.promosService.getPromo(id);
     if (user.role === 'admin') return promo;
     if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
@@ -75,7 +87,7 @@ export class PromosController {
 
   @Patch(':id')
   async update(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
     @Body() body: any,
     @CurrentUser() user: RequestUser,
   ) {
@@ -100,7 +112,7 @@ export class PromosController {
   }
 
   @Delete(':id')
-  async delete(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+  async delete(@Param('id', new ParseUUIDPipe({ version: '4' })) id: string, @CurrentUser() user: RequestUser) {
     if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       const existing = await this.promosService.getPromo(id);
