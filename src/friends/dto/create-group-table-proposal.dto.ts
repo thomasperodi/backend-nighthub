@@ -4,6 +4,10 @@ export class CreateGroupTableProposalDto {
   @IsString()
   venue_id!: string;
 
+  @IsOptional()
+  @IsString()
+  event_id?: string;
+
   @IsInt()
   @Min(2)
   guests!: number;

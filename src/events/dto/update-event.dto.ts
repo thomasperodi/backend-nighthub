@@ -1,6 +1,7 @@
 export class UpdateEventDto {
   venue_id?: string;
   name?: string;
+  is_featured?: boolean;
   date?: string;
   start_time?: string;
   end_time?: string;
@@ -19,6 +20,13 @@ export class UpdateEventDto {
     start_time?: string;
     end_time?: string;
     price: number | string;
+  }>;
+
+  table_pricing?: Array<{
+    venue_table_id: string;
+    per_testa?: number | string;
+    costo_minimo?: number | string;
+    persone_max?: number;
   }>;
 
   promos?: Array<{

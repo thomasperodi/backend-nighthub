@@ -17,11 +17,125 @@ export class FriendsService {
   ) {}
   private readonly logger = new Logger(FriendsService.name);
   private readonly pushDebug = process.env.PUSH_DEBUG === '1';
+  private readonly onlineActivityMinutes = 2;
+  private readonly staleLocationMinutes = 30;
+  private readonly hideLocationAfterHours = 24;
+  private readonly hotspotMinFriends = 2;
+  private readonly nearbyVenueMultiplier = 1.5;
 
   private maskToken(token: string) {
     if (!token) return 'empty';
     if (token.length <= 14) return token;
     return `${token.slice(0, 10)}...${token.slice(-4)}`;
+  }
+
+  private decimalToNumber(value: Prisma.Decimal | number | string | null | undefined) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value === 'string') {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : null;
+    }
+    if (typeof (value as Prisma.Decimal).toNumber === 'function') {
+      const numeric = (value as Prisma.Decimal).toNumber();
+      return Number.isFinite(numeric) ? numeric : null;
+    }
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+
+  private calculateDistanceMeters(
+    lat1: number,
+    lon1: number,
+    lat2: number,
+    lon2: number,
+  ) {
+    const earthRadiusKm = 6371;
+    const deltaLat = ((lat2 - lat1) * Math.PI) / 180;
+    const deltaLon = ((lon2 - lon1) * Math.PI) / 180;
+    const a =
+      Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2) +
+      Math.cos((lat1 * Math.PI) / 180) *
+        Math.cos((lat2 * Math.PI) / 180) *
+        Math.sin(deltaLon / 2) *
+        Math.sin(deltaLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return earthRadiusKm * c * 1000;
+  }
+
+  private getUserDisplayName(user: { name?: string | null; username?: string | null }) {
+    return user.name || user.username || 'Amico';
+  }
+
+  private inferVenuePresence(params: {
+    latitude: number;
+    longitude: number;
+    openStay?: any;
+    venues: Array<{
+      id: string;
+      name: string;
+      latitude: number;
+      longitude: number;
+      radius_geofence: number;
+    }>;
+  }) {
+    if (params.openStay?.venue) {
+      const venueLatitude = this.decimalToNumber(params.openStay.venue.latitude);
+      const venueLongitude = this.decimalToNumber(params.openStay.venue.longitude);
+      const radiusMeters = Number(params.openStay.venue.radius_geofence ?? 100);
+      const distanceMeters =
+        venueLatitude !== null && venueLongitude !== null
+          ? this.calculateDistanceMeters(
+              params.latitude,
+              params.longitude,
+              venueLatitude,
+              venueLongitude,
+            )
+          : null;
+
+      return {
+        type: 'inside' as const,
+        venue_id: params.openStay.venue.id,
+        venue_name: params.openStay.venue.name,
+        radius_meters: radiusMeters,
+        distance_meters: distanceMeters === null ? null : Math.round(distanceMeters),
+        entered_at: params.openStay.entered_at,
+      };
+    }
+
+    let nearestVenue: (typeof params.venues)[number] | null = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (const venue of params.venues) {
+      const distance = this.calculateDistanceMeters(
+        params.latitude,
+        params.longitude,
+        venue.latitude,
+        venue.longitude,
+      );
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestVenue = venue;
+      }
+    }
+
+    if (!nearestVenue) return null;
+
+    const radiusMeters = Number(nearestVenue.radius_geofence ?? 100);
+    const maxNearbyDistance = Math.max(radiusMeters * this.nearbyVenueMultiplier, 140);
+
+    if (nearestDistance > maxNearbyDistance) {
+      return null;
+    }
+
+    return {
+      type: nearestDistance <= radiusMeters ? ('inside' as const) : ('nearby' as const),
+      venue_id: nearestVenue.id,
+      venue_name: nearestVenue.name,
+      radius_meters: radiusMeters,
+      distance_meters: Math.round(nearestDistance),
+      entered_at: null,
+    };
   }
 
   private async sendExpoPush(params: {
@@ -141,21 +255,102 @@ export class FriendsService {
     const q = String(query || '').trim().toLowerCase();
     if (!q) return [];
 
-    return this.prisma.users.findMany({
+    const [currentUserFriendLinks, candidates] = await this.prisma.$transaction([
+      this.prisma.friendships.findMany({
+        where: { user_id: currentUserId },
+        select: { friend_id: true },
+      }),
+      this.prisma.users.findMany({
+        where: {
+          id: { not: currentUserId },
+          OR: [
+            { username: { contains: q, mode: 'insensitive' } },
+            { name: { contains: q, mode: 'insensitive' } },
+          ],
+        },
+        select: {
+          id: true,
+          username: true,
+          name: true,
+          avatar: true,
+        },
+        take: 20,
+      }),
+    ]);
+
+    if (candidates.length === 0) return [];
+
+    const currentUserFriendIds = Array.from(
+      new Set(currentUserFriendLinks.map((link) => String(link.friend_id)).filter(Boolean)),
+    );
+
+    if (currentUserFriendIds.length === 0) {
+      return candidates.map((candidate) => ({
+        ...candidate,
+        mutual_friends_count: 0,
+        mutual_friends_ids: [] as string[],
+        mutual_friends: [] as Array<{
+          id: string;
+          username: string | null;
+          name: string | null;
+          avatar: string | null;
+        }>,
+      }));
+    }
+
+    const candidateIds = candidates.map((candidate) => candidate.id);
+    const candidateMutualLinks = await this.prisma.friendships.findMany({
       where: {
-        id: { not: currentUserId },
-        OR: [
-          { username: { contains: q, mode: 'insensitive' } },
-          { name: { contains: q, mode: 'insensitive' } },
-        ],
+        user_id: { in: candidateIds },
+        friend_id: { in: currentUserFriendIds },
       },
       select: {
-        id: true,
-        username: true,
-        name: true,
-        avatar: true,
+        user_id: true,
+        friend_id: true,
       },
-      take: 20,
+    });
+
+    const mutualIdsByCandidate = new Map<string, string[]>();
+    for (const link of candidateMutualLinks) {
+      const candidateId = String(link.user_id);
+      const friendId = String(link.friend_id);
+      const existing = mutualIdsByCandidate.get(candidateId) ?? [];
+      existing.push(friendId);
+      mutualIdsByCandidate.set(candidateId, existing);
+    }
+
+    const allMutualIds = Array.from(
+      new Set(candidateMutualLinks.map((link) => String(link.friend_id)).filter(Boolean)),
+    );
+
+    const mutualProfiles = allMutualIds.length
+      ? await this.prisma.users.findMany({
+          where: { id: { in: allMutualIds } },
+          select: {
+            id: true,
+            username: true,
+            name: true,
+            avatar: true,
+          },
+          orderBy: { name: 'asc' },
+        })
+      : [];
+
+    const profileById = new Map(mutualProfiles.map((profile) => [profile.id, profile] as const));
+
+    return candidates.map((candidate) => {
+      const mutualIdsRaw = mutualIdsByCandidate.get(candidate.id) ?? [];
+      const mutualIds = Array.from(new Set(mutualIdsRaw));
+      const mutualFriendProfiles = mutualIds
+        .map((id) => profileById.get(id))
+        .filter((profile): profile is (typeof mutualProfiles)[number] => Boolean(profile));
+
+      return {
+        ...candidate,
+        mutual_friends_count: mutualIds.length,
+        mutual_friends_ids: mutualIds,
+        mutual_friends: mutualFriendProfiles,
+      };
     });
   }
 
@@ -167,16 +362,525 @@ export class FriendsService {
     const friendIds = links.map((l) => l.friend_id);
     if (friendIds.length === 0) return [];
 
-    return this.prisma.users.findMany({
-      where: { id: { in: friendIds } },
+    const prismaAny = this.prisma as any;
+    const [friends, openStays, allVenuesRaw] = await Promise.all([
+      prismaAny.users.findMany({
+        where: { id: { in: friendIds } },
+        select: {
+          id: true,
+          username: true,
+          name: true,
+          avatar: true,
+          location_sharing_enabled: true,
+          last_latitude: true,
+          last_longitude: true,
+          last_location_accuracy_meters: true,
+          last_location_updated_at: true,
+          last_active_at: true,
+        },
+      }),
+      prismaAny.venue_stays.findMany({
+        where: {
+          user_id: { in: friendIds },
+          exited_at: null,
+        },
+        orderBy: { entered_at: 'desc' },
+        select: {
+          user_id: true,
+          entered_at: true,
+          venue: {
+            select: {
+              id: true,
+              name: true,
+              latitude: true,
+              longitude: true,
+              radius_geofence: true,
+            },
+          },
+        },
+      }),
+      prismaAny.venues.findMany({
+        where: {
+          latitude: { not: null },
+          longitude: { not: null },
+        },
+        select: {
+          id: true,
+          name: true,
+          latitude: true,
+          longitude: true,
+          radius_geofence: true,
+        },
+      }),
+    ]);
+
+    const allVenues = allVenuesRaw
+      .map((venue: any) => ({
+        ...venue,
+        latitude: this.decimalToNumber(venue.latitude),
+        longitude: this.decimalToNumber(venue.longitude),
+        radius_geofence: Number(venue.radius_geofence ?? 100),
+      }))
+      .filter(
+        (venue: any): venue is {
+          id: string;
+          name: string;
+          latitude: number;
+          longitude: number;
+          radius_geofence: number;
+        } => venue.latitude !== null && venue.longitude !== null,
+      );
+
+    const openStayByUserId = new Map<string, any>();
+    for (const stay of openStays) {
+      if (!openStayByUserId.has(stay.user_id)) {
+        openStayByUserId.set(stay.user_id, stay);
+      }
+    }
+
+    const now = Date.now();
+    const staleMs = this.staleLocationMinutes * 60 * 1000;
+    const hiddenAfterMs = this.hideLocationAfterHours * 60 * 60 * 1000;
+    const onlineMs = this.onlineActivityMinutes * 60 * 1000;
+
+    return friends
+      .map((friend: any) => {
+        const latitude = this.decimalToNumber(friend.last_latitude);
+        const longitude = this.decimalToNumber(friend.last_longitude);
+        const locationUpdatedAt = friend.last_location_updated_at
+          ? new Date(friend.last_location_updated_at)
+          : null;
+        const locationUpdatedAtMs = locationUpdatedAt?.getTime() ?? null;
+        const locationAgeMs =
+          locationUpdatedAtMs === null ? null : Math.max(0, now - locationUpdatedAtMs);
+        const locationLastSeenMinutes =
+          locationAgeMs === null ? null : Math.round(locationAgeMs / 60000);
+        const isLocationExpired =
+          locationAgeMs !== null && locationAgeMs > hiddenAfterMs;
+        const hasShareableLocation =
+          Boolean(friend.location_sharing_enabled) &&
+          latitude !== null &&
+          longitude !== null &&
+          !isLocationExpired;
+
+        const venuePresence = hasShareableLocation
+          ? this.inferVenuePresence({
+              latitude,
+              longitude,
+              openStay: openStayByUserId.get(friend.id),
+              venues: allVenues,
+            })
+          : null;
+
+        const lastActiveAt = friend.last_active_at
+          ? new Date(friend.last_active_at)
+          : null;
+        const lastActiveMs = lastActiveAt?.getTime() ?? null;
+        const activityAgeMs = lastActiveMs === null ? null : Math.max(0, now - lastActiveMs);
+        const lastActiveMinutes =
+          activityAgeMs === null ? null : Math.round(activityAgeMs / 60000);
+        const isOnline = activityAgeMs !== null && activityAgeMs <= onlineMs;
+
+        return {
+          id: friend.id,
+          username: friend.username,
+          name: friend.name,
+          avatar: friend.avatar,
+          online: isOnline,
+          current_venue: venuePresence?.venue_name ?? null,
+          presence_type: venuePresence?.type ?? null,
+          status: venuePresence
+            ? venuePresence.type === 'nearby'
+              ? 'Vicino al locale'
+              : 'Nel locale'
+            : isOnline
+              ? 'Attivo ora'
+              : null,
+          last_active_at: lastActiveAt?.toISOString() ?? null,
+          last_seen_at: (lastActiveAt ?? locationUpdatedAt)?.toISOString() ?? null,
+          last_seen_minutes_ago: isOnline
+            ? 0
+            : lastActiveMinutes ?? locationLastSeenMinutes,
+          sharing_enabled: Boolean(friend.location_sharing_enabled),
+          is_stale: locationAgeMs === null ? true : locationAgeMs > staleMs,
+        };
+      })
+      .sort((left, right) => {
+        if (left.online !== right.online) {
+          return left.online ? -1 : 1;
+        }
+
+        const leftName = String(left.name || left.username || '').toLocaleLowerCase();
+        const rightName = String(right.name || right.username || '').toLocaleLowerCase();
+        return leftName.localeCompare(rightName, 'it');
+      });
+  }
+
+  async updateLocationSharing(userId: string, enabled: boolean) {
+    const prismaAny = this.prisma as any;
+
+    const updated = await prismaAny.users.update({
+      where: { id: userId },
+      data: enabled
+        ? { location_sharing_enabled: true }
+        : {
+            location_sharing_enabled: false,
+            last_latitude: null,
+            last_longitude: null,
+            last_location_accuracy_meters: null,
+            last_location_updated_at: null,
+          },
       select: {
         id: true,
-        username: true,
-        name: true,
-        avatar: true,
+        location_sharing_enabled: true,
+        last_location_updated_at: true,
       },
-      orderBy: { name: 'asc' },
     });
+
+    return {
+      user_id: updated.id,
+      sharing_enabled: Boolean(updated.location_sharing_enabled),
+      last_location_updated_at: updated.last_location_updated_at,
+    };
+  }
+
+  async updateLocation(
+    userId: string,
+    params: {
+      latitude: number;
+      longitude: number;
+      accuracy?: number;
+      timestamp?: string;
+    },
+  ) {
+    const prismaAny = this.prisma as any;
+    const user = await prismaAny.users.findUnique({
+      where: { id: userId },
+      select: { id: true, location_sharing_enabled: true },
+    });
+
+    if (!user) throw new NotFoundException('User not found');
+
+    if (!user.location_sharing_enabled) {
+      return {
+        user_id: userId,
+        sharing_enabled: false,
+        location_updated_at: null,
+      };
+    }
+
+    const observedAt = params.timestamp ? new Date(params.timestamp) : new Date();
+    if (Number.isNaN(observedAt.getTime())) {
+      throw new BadRequestException('timestamp must be ISO8601');
+    }
+
+    const updated = await prismaAny.users.update({
+      where: { id: userId },
+      data: {
+        last_latitude: new Prisma.Decimal(params.latitude.toFixed(6)),
+        last_longitude: new Prisma.Decimal(params.longitude.toFixed(6)),
+        last_location_accuracy_meters:
+          params.accuracy === undefined ? null : Math.round(params.accuracy),
+        last_location_updated_at: observedAt,
+      },
+      select: {
+        id: true,
+        location_sharing_enabled: true,
+        last_location_updated_at: true,
+      },
+    });
+
+    return {
+      user_id: updated.id,
+      sharing_enabled: Boolean(updated.location_sharing_enabled),
+      location_updated_at: updated.last_location_updated_at,
+    };
+  }
+
+  async getMapPresence(userId: string) {
+    const prismaAny = this.prisma as any;
+    type MapVenue = {
+      id: string;
+      name: string;
+      latitude: number;
+      longitude: number;
+      radius_geofence: number;
+    };
+    type PresenceFriendSummary = {
+      id: string;
+      name: string;
+      avatar?: string | null;
+    };
+    type VenuePresenceAggregate = {
+      venue_id: string;
+      venue_name: string;
+      friend_count: number;
+      friends: PresenceFriendSummary[];
+    };
+    type HotspotSummary = {
+      venue_id: string;
+      venue_name: string;
+      latitude: number;
+      longitude: number;
+      radius_meters: number;
+      friend_count: number;
+      active_event_count: number;
+      upcoming_event_count: number;
+      vibe: 'hot' | 'warm';
+      friends: PresenceFriendSummary[];
+    };
+
+    const [me, links] = await Promise.all([
+      prismaAny.users.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          location_sharing_enabled: true,
+          last_location_updated_at: true,
+        },
+      }),
+      this.prisma.friendships.findMany({
+        where: { user_id: userId },
+        select: { friend_id: true },
+      }),
+    ]);
+
+    const friendIds = links.map((link) => link.friend_id).filter(Boolean);
+    if (friendIds.length === 0) {
+      return {
+        sharing_enabled: Boolean(me?.location_sharing_enabled),
+        my_last_location_updated_at: me?.last_location_updated_at ?? null,
+        friends: [],
+        hotspots: [],
+      };
+    }
+
+    const [friends, openStays, allVenuesRaw] = await Promise.all([
+      prismaAny.users.findMany({
+        where: { id: { in: friendIds } },
+        select: {
+          id: true,
+          username: true,
+          name: true,
+          avatar: true,
+          location_sharing_enabled: true,
+          last_latitude: true,
+          last_longitude: true,
+          last_location_accuracy_meters: true,
+          last_location_updated_at: true,
+        },
+        orderBy: [{ name: 'asc' }, { username: 'asc' }],
+      }),
+      prismaAny.venue_stays.findMany({
+        where: {
+          user_id: { in: friendIds },
+          exited_at: null,
+        },
+        orderBy: { entered_at: 'desc' },
+        select: {
+          user_id: true,
+          entered_at: true,
+          venue: {
+            select: {
+              id: true,
+              name: true,
+              latitude: true,
+              longitude: true,
+              radius_geofence: true,
+            },
+          },
+        },
+      }),
+      prismaAny.venues.findMany({
+        where: {
+          latitude: { not: null },
+          longitude: { not: null },
+        },
+        select: {
+          id: true,
+          name: true,
+          latitude: true,
+          longitude: true,
+          radius_geofence: true,
+        },
+      }),
+    ]);
+
+    const allVenues: MapVenue[] = allVenuesRaw
+      .map((venue: any) => ({
+        ...venue,
+        latitude: this.decimalToNumber(venue.latitude),
+        longitude: this.decimalToNumber(venue.longitude),
+        radius_geofence: Number(venue.radius_geofence ?? 100),
+      }))
+      .filter(
+        (venue: any): venue is MapVenue =>
+          venue.latitude !== null && venue.longitude !== null,
+      );
+
+    const openStayByUserId = new Map<string, any>();
+    for (const stay of openStays) {
+      if (!openStayByUserId.has(stay.user_id)) {
+        openStayByUserId.set(stay.user_id, stay);
+      }
+    }
+
+    const now = Date.now();
+    const staleMs = this.staleLocationMinutes * 60 * 1000;
+    const hiddenAfterMs = this.hideLocationAfterHours * 60 * 60 * 1000;
+
+    const friendPresenceMap = new Map<string, VenuePresenceAggregate>();
+
+    const mappedFriends = friends.map((friend: any) => {
+      const latitude = this.decimalToNumber(friend.last_latitude);
+      const longitude = this.decimalToNumber(friend.last_longitude);
+      const updatedAt = friend.last_location_updated_at
+        ? new Date(friend.last_location_updated_at)
+        : null;
+      const updatedAtMs = updatedAt?.getTime() ?? null;
+      const ageMs = updatedAtMs === null ? null : Math.max(0, now - updatedAtMs);
+      const lastSeenMinutes = ageMs === null ? null : Math.round(ageMs / 60000);
+      const isExpired = ageMs !== null && ageMs > hiddenAfterMs;
+      const hasShareableLocation =
+        Boolean(friend.location_sharing_enabled) &&
+        latitude !== null &&
+        longitude !== null &&
+        !isExpired;
+
+      const venuePresence = hasShareableLocation
+        ? this.inferVenuePresence({
+            latitude,
+            longitude,
+            openStay: openStayByUserId.get(friend.id),
+            venues: allVenues,
+          })
+        : null;
+
+      if (venuePresence) {
+        const existing: VenuePresenceAggregate = friendPresenceMap.get(venuePresence.venue_id) ?? {
+          venue_id: venuePresence.venue_id,
+          venue_name: venuePresence.venue_name,
+          friend_count: 0,
+          friends: [],
+        };
+        existing.friend_count += 1;
+        existing.friends.push({
+          id: friend.id,
+          name: this.getUserDisplayName(friend),
+          avatar: friend.avatar,
+        });
+        friendPresenceMap.set(venuePresence.venue_id, existing);
+      }
+
+      return {
+        id: friend.id,
+        username: friend.username,
+        name: friend.name,
+        avatar: friend.avatar,
+        sharing_enabled: Boolean(friend.location_sharing_enabled),
+        last_seen_at: updatedAt?.toISOString() ?? null,
+        last_seen_minutes_ago: lastSeenMinutes,
+        is_stale: ageMs === null ? true : ageMs > staleMs,
+        position: hasShareableLocation
+          ? {
+              latitude,
+              longitude,
+              accuracy_meters:
+                friend.last_location_accuracy_meters === null ||
+                friend.last_location_accuracy_meters === undefined
+                  ? null
+                  : Number(friend.last_location_accuracy_meters),
+            }
+          : null,
+        venue_presence: venuePresence,
+      };
+    });
+
+    const hotspotVenueIds = Array.from(friendPresenceMap.keys());
+    const hotspotEvents = hotspotVenueIds.length
+      ? await prismaAny.events.findMany({
+          where: {
+            venue_id: { in: hotspotVenueIds },
+            status: { in: ['LIVE', 'DRAFT'] },
+          },
+          select: {
+            venue_id: true,
+            status: true,
+            date: true,
+          },
+        })
+      : [];
+
+    const eventCountsByVenueId = new Map<
+      string,
+      { active_event_count: number; upcoming_event_count: number }
+    >();
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    for (const event of hotspotEvents) {
+      const current = eventCountsByVenueId.get(event.venue_id) ?? {
+        active_event_count: 0,
+        upcoming_event_count: 0,
+      };
+      if (String(event.status).toUpperCase() === 'LIVE') {
+        current.active_event_count += 1;
+      } else if (event.date && new Date(event.date).getTime() >= startOfToday.getTime()) {
+        current.upcoming_event_count += 1;
+      }
+      eventCountsByVenueId.set(event.venue_id, current);
+    }
+
+    const venueById = new Map<string, MapVenue>(
+      allVenues.map((venue) => [venue.id, venue] as const),
+    );
+    const hotspots = Array.from(friendPresenceMap.values())
+      .map<HotspotSummary | null>((presence) => {
+        const venue = venueById.get(presence.venue_id);
+        if (!venue) return null;
+        const eventCounts = eventCountsByVenueId.get(presence.venue_id) ?? {
+          active_event_count: 0,
+          upcoming_event_count: 0,
+        };
+
+        return {
+          venue_id: presence.venue_id,
+          venue_name: presence.venue_name,
+          latitude: venue.latitude,
+          longitude: venue.longitude,
+          radius_meters: venue.radius_geofence,
+          friend_count: presence.friend_count,
+          active_event_count: eventCounts.active_event_count,
+          upcoming_event_count: eventCounts.upcoming_event_count,
+          vibe:
+            presence.friend_count >= 4 || eventCounts.active_event_count > 0
+              ? 'hot'
+              : 'warm',
+          friends: presence.friends,
+        };
+      })
+      .filter((hotspot): hotspot is HotspotSummary => {
+        if (!hotspot) {
+          return false;
+        }
+
+        return (
+          hotspot.friend_count >= this.hotspotMinFriends &&
+          hotspot.active_event_count + hotspot.upcoming_event_count > 0
+        );
+      })
+      .sort((a, b) => {
+        const scoreA = a.friend_count * 10 + a.active_event_count * 5 + a.upcoming_event_count;
+        const scoreB = b.friend_count * 10 + b.active_event_count * 5 + b.upcoming_event_count;
+        return scoreB - scoreA;
+      });
+
+    return {
+      sharing_enabled: Boolean(me?.location_sharing_enabled),
+      my_last_location_updated_at: me?.last_location_updated_at ?? null,
+      friends: mappedFriends,
+      hotspots,
+    };
   }
 
   async listRequests(userId: string) {
@@ -644,6 +1348,7 @@ export class FriendsService {
     group_id: string;
     user_id: string;
     venue_id: string;
+    event_id?: string;
     guests: number;
     note?: string;
   }) {
@@ -659,7 +1364,19 @@ export class FriendsService {
     });
     if (!venue) throw new NotFoundException('Venue not found');
 
-    const event = await this.resolveBookableEventForVenue(params.venue_id);
+    let event: Awaited<ReturnType<FriendsService['resolveBookableEventForVenue']>>;
+    if (params.event_id) {
+      const found = await (this.prisma as any).events.findUnique({
+        where: { id: params.event_id },
+        select: { id: true, venue_id: true, name: true, date: true, status: true },
+      });
+      if (!found || found.venue_id !== params.venue_id) {
+        throw new BadRequestException('Evento non valido per questo locale');
+      }
+      event = found;
+    } else {
+      event = await this.resolveBookableEventForVenue(params.venue_id);
+    }
     const voterIds = Array.from(new Set([group.owner_id, ...group.members.map((member) => member.user_id)]));
 
     const proposal = await this.prisma.$transaction(async (tx) => {

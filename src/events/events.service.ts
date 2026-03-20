@@ -36,6 +36,13 @@ type EventStatusSyncCandidate = {
   status: EventStatus | null;
 };
 
+type TablePricingOverrideInput = {
+  venue_table_id: string;
+  per_testa?: number | string;
+  costo_minimo?: number | string;
+  persone_max?: number;
+};
+
 @Injectable()
 export class EventsService {
   constructor(
@@ -344,6 +351,7 @@ export class EventsService {
 
     return {
       ...e,
+      is_featured: Boolean(e.is_featured),
       status: effectiveStatus,
       date: e.date ? this.formatDateOnly(e.date) : e.date,
       start_time: this.formatTimeOnly(e.start_time),
@@ -362,6 +370,29 @@ export class EventsService {
             discount_value: this.decimalToNumber(p.discount_value),
           }))
         : e.promos,
+      venue: e.venue
+        ? {
+            ...e.venue,
+            latitude:
+              e.venue.latitude === null || e.venue.latitude === undefined
+                ? null
+                : this.decimalToNumber(e.venue.latitude),
+            longitude:
+              e.venue.longitude === null || e.venue.longitude === undefined
+                ? null
+                : this.decimalToNumber(e.venue.longitude),
+            cloakroom_unit_price:
+              e.venue.cloakroom_unit_price === null ||
+              e.venue.cloakroom_unit_price === undefined
+                ? null
+                : this.decimalToNumber(e.venue.cloakroom_unit_price),
+            contract_monthly_fee:
+              e.venue.contract_monthly_fee === null ||
+              e.venue.contract_monthly_fee === undefined
+                ? null
+                : this.decimalToNumber(e.venue.contract_monthly_fee),
+          }
+        : e.venue,
       presale_price:
         e.presale_price === null || e.presale_price === undefined
           ? null
@@ -369,6 +400,118 @@ export class EventsService {
     };
   }
   /* eslint-enable @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-argument */
+
+  private hasTablePricingOverride(row: {
+    per_testa_override?: Prisma.Decimal | null;
+    costo_minimo_override?: Prisma.Decimal | null;
+    persone_max_override?: number | null;
+  }) {
+    return (
+      row.per_testa_override !== null && row.per_testa_override !== undefined
+    ) || (
+      row.costo_minimo_override !== null &&
+      row.costo_minimo_override !== undefined
+    ) || (
+      row.persone_max_override !== null && row.persone_max_override !== undefined
+    );
+  }
+
+  private async buildResolvedTablePricing(eventId: string, venueId: string) {
+    const [venueTables, eventTableOverrides] = await this.prisma.$transaction([
+      this.prisma.venue_tables.findMany({
+        where: { venue_id: venueId },
+        orderBy: [{ zona: 'asc' }, { nome: 'asc' }],
+        select: {
+          id: true,
+          nome: true,
+          zona: true,
+          per_testa: true,
+          costo_minimo: true,
+          persone_max: true,
+        },
+      }),
+      this.prisma.event_tables.findMany({
+        where: { event_id: eventId },
+        select: {
+          id: true,
+          venue_table_id: true,
+          per_testa_override: true,
+          costo_minimo_override: true,
+          persone_max_override: true,
+        },
+      }),
+    ]);
+
+    const overrideByVenueTableId = new Map(
+      eventTableOverrides.map((row) => [row.venue_table_id, row]),
+    );
+    const hasExplicitSelection = eventTableOverrides.length > 0;
+    const selectedVenueTables = hasExplicitSelection
+      ? venueTables.filter((table) => overrideByVenueTableId.has(table.id))
+      : venueTables;
+
+    return selectedVenueTables.map((table) => {
+      const override = overrideByVenueTableId.get(table.id);
+      const basePerTesta =
+        table.per_testa === null || table.per_testa === undefined
+          ? null
+          : this.decimalToNumber(table.per_testa);
+      const baseCostoMinimo =
+        table.costo_minimo === null || table.costo_minimo === undefined
+          ? null
+          : this.decimalToNumber(table.costo_minimo);
+      const overridePerTesta =
+        override?.per_testa_override === null ||
+        override?.per_testa_override === undefined
+          ? null
+          : this.decimalToNumber(override.per_testa_override);
+      const overrideCostoMinimo =
+        override?.costo_minimo_override === null ||
+        override?.costo_minimo_override === undefined
+          ? null
+          : this.decimalToNumber(override.costo_minimo_override);
+      const overridePersoneMax =
+        override?.persone_max_override === null ||
+        override?.persone_max_override === undefined
+          ? null
+          : Number(override.persone_max_override);
+      const hasOverride = override ? this.hasTablePricingOverride(override) : false;
+      const label = String(table.zona ?? '').trim() || String(table.nome ?? '').trim() || 'Senza zona';
+
+      return {
+        event_table_id: override?.id,
+        venue_table_id: table.id,
+        nome: table.nome,
+        zona: table.zona ?? null,
+        label,
+        per_testa: hasOverride ? overridePerTesta : basePerTesta,
+        costo_minimo: hasOverride ? overrideCostoMinimo : baseCostoMinimo,
+        persone_max: hasOverride ? overridePersoneMax : (table.persone_max ?? null),
+        base_per_testa: basePerTesta,
+        base_costo_minimo: baseCostoMinimo,
+        base_persone_max:
+          table.persone_max === null || table.persone_max === undefined
+            ? null
+            : Number(table.persone_max),
+        override_per_testa: overridePerTesta,
+        override_costo_minimo: overrideCostoMinimo,
+        override_persone_max: overridePersoneMax,
+        has_override: hasOverride,
+      };
+    });
+  }
+
+  private async serializeEventWithTablePricing(e: any) {
+    const serialized = this.serializeEvent(e);
+    if (!e?.id || !e?.venue_id) {
+      return { ...serialized, table_pricing: [] };
+    }
+
+    return {
+      ...serialized,
+      table_pricing: await this.buildResolvedTablePricing(e.id, e.venue_id),
+    };
+  }
 
   private normalizeGender(gender?: string): Gender | undefined {
     if (!gender) return undefined;
@@ -447,6 +590,160 @@ export class EventsService {
     return new Prisma.Decimal(asNumber);
   }
 
+  private parseOptionalPrice(
+    value: number | string | null | undefined,
+  ): Prisma.Decimal | undefined {
+    if (value === undefined || value === null || value === '') return undefined;
+    return this.parsePrice(value);
+  }
+
+  private normalizeTablePricingInput(
+    tablePricing: TablePricingOverrideInput[] | undefined,
+  ) {
+    return (tablePricing ?? [])
+      .map((row) => {
+        const venue_table_id = String(row?.venue_table_id ?? '').trim();
+        if (!venue_table_id) {
+          throw new BadRequestException('table_pricing.venue_table_id is required');
+        }
+
+        const per_testa = this.parseOptionalPrice(row.per_testa);
+        const costo_minimo = this.parseOptionalPrice(row.costo_minimo);
+        const persone_max = this.parsePositiveInt(
+          row.persone_max,
+          'table_pricing.persone_max',
+        );
+
+        return {
+          venue_table_id,
+          per_testa,
+          costo_minimo,
+          persone_max,
+        };
+      });
+  }
+
+  private async applyTablePricingOverrides(
+    tx: Prisma.TransactionClient,
+    params: {
+      eventId: string;
+      venueId: string;
+      tablePricing: TablePricingOverrideInput[] | undefined;
+      replaceExisting: boolean;
+    },
+  ) {
+    const normalizedRows = this.normalizeTablePricingInput(params.tablePricing);
+    const uniqueIds = Array.from(
+      new Set(normalizedRows.map((row) => row.venue_table_id)),
+    );
+    const uniqueIdSet = new Set(uniqueIds);
+
+    if (uniqueIds.length !== normalizedRows.length) {
+      throw new BadRequestException(
+        'table_pricing contains duplicate venue_table_id values',
+      );
+    }
+
+    if (uniqueIds.length > 0) {
+      const venueTables = await tx.venue_tables.findMany({
+        where: {
+          venue_id: params.venueId,
+          id: { in: uniqueIds },
+        },
+        select: { id: true },
+      });
+
+      if (venueTables.length !== uniqueIds.length) {
+        throw new BadRequestException(
+          'One or more table_pricing rows do not belong to the selected venue',
+        );
+      }
+    }
+
+    const existingRows = await tx.event_tables.findMany({
+      where: {
+        event_id: params.eventId,
+      },
+      select: {
+        id: true,
+        venue_table_id: true,
+        prenotati: true,
+        entrati: true,
+        confermato: true,
+        _count: {
+          select: {
+            table_sales: true,
+          },
+        },
+      },
+    });
+
+    if (params.replaceExisting) {
+      const rowsToRemove = existingRows.filter(
+        (row) => !uniqueIdSet.has(row.venue_table_id),
+      );
+
+      const blockedRow = rowsToRemove.find(
+        (row) =>
+          Number(row.prenotati ?? 0) > 0 ||
+          Number(row.entrati ?? 0) > 0 ||
+          Boolean(row.confermato) ||
+          Number(row._count.table_sales ?? 0) > 0,
+      );
+
+      if (blockedRow) {
+        throw new BadRequestException(
+          'Cannot remove a table zone that already has bookings, check-ins, confirmations, or sales',
+        );
+      }
+
+      if (rowsToRemove.length) {
+        await tx.event_tables.deleteMany({
+          where: {
+            id: { in: rowsToRemove.map((row) => row.id) },
+          },
+        });
+      }
+    }
+
+    if (!normalizedRows.length) return;
+
+    const existingByVenueTableId = new Map(
+      existingRows
+        .filter((row) => uniqueIdSet.has(row.venue_table_id))
+        .map((row) => [row.venue_table_id, row]),
+    );
+
+    for (const row of normalizedRows) {
+      const data = {
+        per_testa_override: row.per_testa ?? null,
+        costo_minimo_override: row.costo_minimo ?? null,
+        persone_max_override: row.persone_max ?? null,
+      };
+      const existing = existingByVenueTableId.get(row.venue_table_id);
+
+      if (existing) {
+        await tx.event_tables.update({
+          where: { id: existing.id },
+          data,
+        });
+        continue;
+      }
+
+      await tx.event_tables.create({
+        data: {
+          event_id: params.eventId,
+          venue_table_id: row.venue_table_id,
+          stato: 'libero',
+          prenotati: 0,
+          entrati: 0,
+          pagato_totale: new Prisma.Decimal(0),
+          ...data,
+        },
+      });
+    }
+  }
+
   private decimalToNumber(value?: Prisma.Decimal | null): number {
     return value ? Number(value) : 0;
   }
@@ -485,6 +782,7 @@ export class EventsService {
           name: true,
           description: true,
           image: true,
+          is_featured: true,
           date: true,
           start_time: true,
           end_time: true,
@@ -530,6 +828,7 @@ export class EventsService {
         name: true,
         description: true,
         image: true,
+        is_featured: true,
         date: true,
         start_time: true,
         end_time: true,
@@ -639,6 +938,7 @@ export class EventsService {
           name: true,
           description: true,
           image: true,
+          is_featured: true,
           date: true,
           start_time: true,
           end_time: true,
@@ -701,6 +1001,7 @@ export class EventsService {
           name: true,
           description: true,
           image: true,
+          is_featured: true,
           date: true,
           start_time: true,
           end_time: true,
@@ -749,14 +1050,14 @@ export class EventsService {
     const event = await this.prisma.events.findUnique({
       where: { id },
       include: {
+        venue: true,
         promos: true,
         entry_prices: { orderBy: { created_at: 'asc' } },
       },
     });
     if (!event) throw new NotFoundException('Event not found');
     await this.syncEventStatusIfNeeded(event as EventStatusSyncCandidate);
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-    return this.serializeEvent(event);
+    return this.serializeEventWithTablePricing(event);
   }
 
   async assertEventBelongsToVenue(eventId: string, venueId: string) {
@@ -848,6 +1149,7 @@ export class EventsService {
         name: dto.name,
         description: dto.description,
         image: imagePath,
+        is_featured: dto.is_featured ?? false,
         date,
         start_time,
         end_time,
@@ -865,14 +1167,18 @@ export class EventsService {
           : undefined,
         promos: promosCreate.length ? { create: promosCreate } : undefined,
       },
-      include: {
-        promos: true,
-        entry_prices: { orderBy: { created_at: 'asc' } },
-      },
     });
 
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-    return this.serializeEvent(event);
+    if (dto.table_pricing) {
+      await this.applyTablePricingOverrides(this.prisma, {
+        eventId: event.id,
+        venueId: dto.venue_id,
+        tablePricing: dto.table_pricing,
+        replaceExisting: false,
+      });
+    }
+
+    return this.getEvent(event.id);
   }
 
   async updateEvent(id: string, dto: UpdateEventDto) {
@@ -926,6 +1232,8 @@ export class EventsService {
           name: dto.name,
           description: dto.description,
           image: imagePath,
+          is_featured:
+            dto.is_featured === undefined ? undefined : Boolean(dto.is_featured),
           date,
           start_time,
           end_time,
@@ -992,6 +1300,15 @@ export class EventsService {
             }),
           });
         }
+      }
+
+      if (dto.table_pricing !== undefined) {
+        await this.applyTablePricingOverrides(tx, {
+          eventId: id,
+          venueId,
+          tablePricing: dto.table_pricing,
+          replaceExisting: true,
+        });
       }
     });
 

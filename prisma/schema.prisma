@@ -108,6 +108,12 @@ model users {
   avatar        String?
   push_token    String?
   push_token_updated_at DateTime?
+  location_sharing_enabled Boolean @default(false)
+  last_latitude Decimal? @db.Decimal(9,6)
+  last_longitude Decimal? @db.Decimal(9,6)
+  last_location_accuracy_meters Int?
+  last_location_updated_at DateTime?
+  last_active_at DateTime?
 
   sesso         Gender?
   birth_date    DateTime?
@@ -137,6 +143,8 @@ model users {
 
   @@index([venue_id])
   @@index([username])
+  @@index([location_sharing_enabled, last_location_updated_at])
+  @@index([last_active_at])
 }
 
 
@@ -312,6 +320,7 @@ model events {
   name        String
   description String?
   image       String?
+  is_featured Boolean     @default(false)
   date        DateTime    @db.Date
   start_time  DateTime?   @db.Time(6)
   end_time    DateTime?   @db.Time(6)
@@ -339,6 +348,7 @@ model events {
   @@index([venue_id, date])
   @@index([date, start_time])
   @@index([status])
+  @@index([is_featured, date])
 }
 
 // ===============================
@@ -391,6 +401,9 @@ model event_tables {
   event_id       String   @db.Uuid
   venue_table_id String   @db.Uuid
   assigned_number Int?
+  per_testa_override    Decimal?
+  costo_minimo_override Decimal?
+  persone_max_override  Int?
 
   prenotati     Int      @default(0)
   entrati       Int      @default(0)

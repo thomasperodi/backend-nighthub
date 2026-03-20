@@ -153,6 +153,10 @@ export class StaffService {
       where: { venue_id: event.venue_id },
       select: { id: true },
     });
+    const existingEventTables = await this.prisma.event_tables.findMany({
+      where: { event_id: eventId },
+      select: { id: true, venue_table_id: true, prenotati: true },
+    });
 
     const venueTableCount = venueTables.length;
     if (!venueTableCount) return;
@@ -176,18 +180,24 @@ export class StaffService {
       prenotatiByVenueTableId.set(venueTableId, Number(g._sum.guests ?? 0));
     }
 
-    // Ensure event_tables rows exist for every venue table
-    await this.prisma.event_tables.createMany({
-      data: venueTables.map((vt) => ({
-        event_id: eventId,
-        venue_table_id: vt.id,
-        prenotati: prenotatiByVenueTableId.get(vt.id) ?? 0,
-        entrati: 0,
-        pagato_totale: 0,
-        stato: 'libero',
-      })),
-      skipDuplicates: true,
-    });
+    const selectedVenueTableIds =
+      existingEventTables.length > 0
+        ? existingEventTables.map((row) => row.venue_table_id)
+        : venueTables.map((vt) => vt.id);
+
+    if (existingEventTables.length === 0) {
+      await this.prisma.event_tables.createMany({
+        data: selectedVenueTableIds.map((venueTableId) => ({
+          event_id: eventId,
+          venue_table_id: venueTableId,
+          prenotati: prenotatiByVenueTableId.get(venueTableId) ?? 0,
+          entrati: 0,
+          pagato_totale: 0,
+          stato: 'libero',
+        })),
+        skipDuplicates: true,
+      });
+    }
 
     // Sync prenotati for existing rows (idempotent)
     const current = await this.prisma.event_tables.findMany({

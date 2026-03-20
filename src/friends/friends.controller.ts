@@ -7,6 +7,8 @@ import { GroupMemberDto } from './dto/group-member.dto';
 import { CreateGroupTableProposalDto } from './dto/create-group-table-proposal.dto';
 import { VoteGroupTableProposalDto } from './dto/vote-group-table-proposal.dto';
 import { BookGroupTableProposalDto } from './dto/book-group-table-proposal.dto';
+import { FriendLocationUpdateDto } from './dto/friend-location-update.dto';
+import { FriendLocationSharingDto } from './dto/friend-location-sharing.dto';
 import { Roles } from '../auth/roles.decorator';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { RequestUser } from '../auth/types';
@@ -25,6 +27,24 @@ export class FriendsController {
   @Roles('client')
   list(@CurrentUser() user: RequestUser) {
     return this.friendsService.listFriends(user.id);
+  }
+
+  @Get('friends/map')
+  @Roles('client')
+  map(@CurrentUser() user: RequestUser) {
+    return this.friendsService.getMapPresence(user.id);
+  }
+
+  @Post('friends/location')
+  @Roles('client')
+  updateLocation(@Body() body: FriendLocationUpdateDto, @CurrentUser() user: RequestUser) {
+    return this.friendsService.updateLocation(user.id, body);
+  }
+
+  @Post('friends/location-sharing')
+  @Roles('client')
+  updateLocationSharing(@Body() body: FriendLocationSharingDto, @CurrentUser() user: RequestUser) {
+    return this.friendsService.updateLocationSharing(user.id, body.enabled);
   }
 
   @Get('friends/requests')
@@ -145,6 +165,7 @@ export class FriendsController {
       group_id: id,
       user_id: user.id,
       venue_id: body.venue_id,
+      event_id: body.event_id,
       guests: body.guests,
       note: body.note,
     });

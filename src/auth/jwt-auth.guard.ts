@@ -72,6 +72,7 @@ export class JwtAuthGuard implements CanActivate {
 
     const user: RequestUser = { id, role, venue_id: resolvedVenueId };
     req.user = user;
+    await this.authService.touchUserActivity(id);
 
     return true;
   }

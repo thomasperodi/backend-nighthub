@@ -37,6 +37,12 @@ export class AuthController {
     return { success: true };
   }
 
+  @Post('activity')
+  async touchActivity(@CurrentUser() user: RequestUser) {
+    await this.authService.touchUserActivity(user.id);
+    return { success: true };
+  }
+
   @Delete('me')
   async deleteMe(
     @CurrentUser() user: RequestUser,

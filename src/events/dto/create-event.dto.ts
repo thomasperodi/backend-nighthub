@@ -1,6 +1,7 @@
 export class CreateEventDto {
   venue_id?: string;
   name!: string;
+  is_featured?: boolean;
   date!: string; // ISO date string (yyyy-mm-dd)
   start_time?: string; // HH:MM or full ISO time
   end_time?: string; // HH:MM or full ISO time
@@ -20,6 +21,14 @@ export class CreateEventDto {
     start_time?: string; // HH:MM or HH:MM:SS
     end_time?: string; // HH:MM or HH:MM:SS
     price: number | string;
+  }>;
+
+  // Optional: per-event table pricing overrides
+  table_pricing?: Array<{
+    venue_table_id: string;
+    per_testa?: number | string;
+    costo_minimo?: number | string;
+    persone_max?: number;
   }>;
 
   // Optional: promos to create and link to the event

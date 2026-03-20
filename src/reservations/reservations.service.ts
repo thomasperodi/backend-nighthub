@@ -431,6 +431,16 @@ export class ReservationsService {
           date: true,
           start_time: true,
           end_time: true,
+          venue: {
+            select: {
+              id: true,
+              name: true,
+              city: true,
+              address: true,
+              latitude: true,
+              longitude: true,
+            },
+          },
         },
       },
       venue_table: {
@@ -725,40 +735,85 @@ export class ReservationsService {
         );
       }
 
-      const table = await this.prisma.venue_tables.findUnique({
-        where: { id: venueTableId },
-        select: {
-          id: true,
-          venue_id: true,
-          per_testa: true,
-          costo_minimo: true,
-          persone_max: true,
-        },
-      });
+      const [table, eventTableCount, eventTableRows] = await Promise.all([
+        this.prisma.venue_tables.findUnique({
+          where: { id: venueTableId },
+          select: {
+            id: true,
+            venue_id: true,
+            per_testa: true,
+            costo_minimo: true,
+            persone_max: true,
+          },
+        }),
+        this.prisma.event_tables.count({
+          where: { event_id: eventId },
+        }),
+        this.prisma.event_tables.findMany({
+          where: {
+            event_id: eventId,
+            venue_table_id: venueTableId,
+          },
+          select: {
+            per_testa_override: true,
+            costo_minimo_override: true,
+            persone_max_override: true,
+          },
+          take: 1,
+        }),
+      ]);
+      const eventTable = eventTableRows[0] ?? null;
       if (!table) throw new NotFoundException('Table not found');
       if (table.venue_id !== event.venue_id) {
         throw new BadRequestException(
           'Selected table does not belong to this event venue',
         );
       }
-      if (table.persone_max && guests > table.persone_max) {
+
+      if (eventTableCount > 0 && !eventTable) {
+        throw new BadRequestException(
+          'Selected table is not enabled for this event',
+        );
+      }
+
+      const eventOverridePerTesta: unknown = eventTable?.per_testa_override;
+      const eventOverrideCostoMinimo: unknown =
+        eventTable?.costo_minimo_override;
+      const eventOverridePersoneMax: unknown = eventTable?.persone_max_override;
+
+      const effectivePerTesta: Prisma.Decimal | null =
+        eventOverridePerTesta === null || eventOverridePerTesta === undefined
+          ? (table.per_testa ?? null)
+          : (eventOverridePerTesta as Prisma.Decimal);
+      const effectiveCostoMinimo: Prisma.Decimal | null =
+        eventOverrideCostoMinimo === null ||
+        eventOverrideCostoMinimo === undefined
+          ? (table.costo_minimo ?? null)
+          : (eventOverrideCostoMinimo as Prisma.Decimal);
+      const effectivePersoneMax: number | null =
+        eventOverridePersoneMax === null ||
+        eventOverridePersoneMax === undefined
+          ? (table.persone_max ?? null)
+          : Number(eventOverridePersoneMax);
+
+      if (effectivePersoneMax && guests > effectivePersoneMax) {
         throw new BadRequestException('guests exceeds table persone_max');
       }
 
       // Auto compute total_amount if missing and per_testa is available
-      if (!totalAmount && table.per_testa) {
+      if (!totalAmount && effectivePerTesta) {
         try {
-          const computed = table.per_testa.mul(new Prisma.Decimal(guests));
-          if (table.costo_minimo) {
-            totalAmount = Prisma.Decimal.max(computed, table.costo_minimo);
+          const computed = effectivePerTesta.mul(new Prisma.Decimal(guests));
+          if (effectiveCostoMinimo) {
+            totalAmount = Prisma.Decimal.max(computed, effectiveCostoMinimo);
           } else {
             totalAmount = computed;
           }
         } catch {
           // ignore
         }
-      } else if (!totalAmount && table.costo_minimo) {
-        totalAmount = table.costo_minimo;
+      } else if (!totalAmount && effectiveCostoMinimo) {
+        totalAmount = effectiveCostoMinimo;
       }
     }
 

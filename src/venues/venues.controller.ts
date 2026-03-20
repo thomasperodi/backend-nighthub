@@ -163,6 +163,27 @@ export class VenuesController {
     return this.venuesService.getStats(id);
   }
 
+  @Get(':id/analytics')
+  @Roles('venue', 'admin')
+  analytics(
+    @Param('id') id: string,
+    @CurrentUser() user?: RequestUser,
+    @Res({ passthrough: true }) res?: Response,
+  ) {
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=10, stale-while-revalidate=60',
+    );
+
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+
+    return this.venuesService.getAnalytics(id);
+  }
+
   @Get(':id/promos')
   @Public()
   promos(@Param('id') id: string, @Res({ passthrough: true }) res?: Response) {

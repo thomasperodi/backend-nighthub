@@ -28,10 +28,42 @@ const revokedTokens = new Set<string>();
 
 @Injectable()
 export class AuthService {
+  private readonly activityThrottleMs = 60 * 1000;
+
   constructor(
     private prisma: PrismaService,
     private jwtService: JwtService,
   ) {}
+
+  async touchUserActivity(userId: string, observedAt: Date = new Date()) {
+    if (!userId) {
+      throw new BadRequestException('userId required');
+    }
+
+    if (Number.isNaN(observedAt.getTime())) {
+      throw new BadRequestException('observedAt invalid');
+    }
+
+    const throttleBefore = new Date(observedAt.getTime() - this.activityThrottleMs);
+
+    await (this.prisma as any).users.updateMany({
+      where: {
+        id: userId,
+        OR: [
+          { last_active_at: null },
+          { last_active_at: { lt: throttleBefore } },
+        ],
+      },
+      data: {
+        last_active_at: observedAt,
+      },
+    });
+
+    return {
+      user_id: userId,
+      last_active_at: observedAt,
+    };
+  }
 
   async register(dto: RegisterDto): Promise<PublicUser> {
     const allowedRoles = new Set<string>(Object.values(UserRole));
@@ -122,6 +154,8 @@ export class AuthService {
     const bcryptCompare = compare as (a: string, b: string) => Promise<boolean>;
     const valid = await bcryptCompare(dto.password, user.password_hash);
     if (!valid) return null;
+
+    await this.touchUserActivity(user.id, new Date());
 
     // Include venue_id in the token payload to enable efficient venue-scoped authorization.
     // Fallback DB lookup is still possible for older tokens.
