@@ -51,6 +51,7 @@ export class AuthController {
     await this.authService.deleteUser(user.id);
 
     // revoke current token too (best-effort)
+    // if the token is missing or invalid, the user will be effectively logged out anyway
     const token = authorization?.replace(/^Bearer\s+/i, '') || undefined;
     this.authService.logout(token);
 
