@@ -55,5 +55,6 @@ export class AuthController {
     this.authService.logout(token);
 
     return { success: true };
+    //test
   }
 }
