@@ -2,22 +2,30 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import type { RequestUser } from '../auth/types';
 import {
+  EntryMethod,
   EventStatus,
   Gender,
   Prisma,
   ReservationStatus,
   ReservationType,
+  VenueStationType,
   events,
   promos,
   venue_tables,
+  venue_stations,
   venues,
 } from '@prisma/client';
 import Stripe from 'stripe';
+import { resolveEntryUnitPrice } from '../common/entry-pricing';
 import { CreateVenueTablesBulkDto } from './dto/create-venue-tables-bulk.dto';
+import { CreateVenueStationsBulkDto } from './dto/create-venue-stations-bulk.dto';
 import { UpdateVenueTableDto } from './dto/update-venue-table.dto';
+import { UpdateVenueStationDto } from './dto/update-venue-station.dto';
 import { UpdateVenuePricingDto } from './dto/update-venue-pricing.dto';
 import {
   BAR_PRICE_KEYS,
@@ -53,6 +61,75 @@ type AnalyticsEventSummary = {
   men: number;
   other: number;
   unknown: number;
+};
+
+type PrNetworkRoleDb = 'responsabile' | 'capo_squadra' | 'pr';
+type PrNetworkRoleApi = 'RESPONSABILE' | 'CAPO_SQUADRA' | 'PR';
+
+type PrMembershipRow = {
+  id: string;
+  venue_id: string;
+  user_id: string;
+  role: PrNetworkRoleDb;
+  parent_membership_id: string | null;
+  ref_code: string;
+  is_active: boolean;
+  created_by_user_id: string | null;
+  created_at: Date;
+  updated_at: Date;
+};
+
+type PrMemberListRow = PrMembershipRow & {
+  user_name: string | null;
+  user_username: string | null;
+  user_email: string;
+  user_role: string;
+};
+
+type PrEventAssignmentRow = {
+  id: string;
+  venue_id: string;
+  event_id: string;
+  pr_membership_id: string;
+  is_active: boolean;
+  assigned_by_user_id: string | null;
+  created_at: Date;
+  updated_at: Date;
+  role: PrNetworkRoleDb;
+  ref_code: string;
+  parent_membership_id: string | null;
+  user_name: string | null;
+  user_username: string | null;
+  user_email: string;
+};
+
+type PrScanRow = {
+  id: string;
+  venue_id: string;
+  event_id: string;
+  pr_membership_id: string;
+  scanned_by_user_id: string | null;
+  guest_user_id: string | null;
+  referral_code: string;
+  scanned_at: Date;
+  entry_id: string | null;
+  entered_at: Date | null;
+  metadata: unknown;
+  created_at: Date;
+  updated_at: Date;
+};
+
+type PrMembershipVenueRow = {
+  membership_id: string;
+  venue_id: string;
+  venue_name: string;
+  venue_city: string | null;
+  role: PrNetworkRoleDb;
+  parent_membership_id: string | null;
+  ref_code: string;
+  is_active: boolean;
+  created_at: Date;
+  updated_at: Date;
 };
 
 @Injectable()
@@ -246,6 +323,407 @@ export class VenuesService {
         count,
         share: resolvedTotal > 0 ? this.round((count / resolvedTotal) * 100, 1) : 0,
       }));
+  }
+
+  private async ensureEventBelongsToVenue(eventId: string, venueId: string) {
+    const event = await this.prisma.events.findUnique({
+      where: { id: eventId },
+      select: { id: true, venue_id: true },
+    });
+    if (!event) throw new NotFoundException('Event not found');
+    if (event.venue_id !== venueId) {
+      throw new BadRequestException('eventId does not belong to the venue');
+    }
+  }
+
+  private stationTypeLabel(type: VenueStationType): string {
+    if (type === VenueStationType.entry) return 'Ingresso';
+    if (type === VenueStationType.cloakroom) return 'Guardaroba';
+    if (type === VenueStationType.bar) return 'Bar';
+    return 'Tavoli';
+  }
+
+  private normalizeAppRole(role: unknown): 'client' | 'staff' | 'venue' | 'admin' | '' {
+    const normalized = String(role ?? '').trim().toLowerCase();
+    if (
+      normalized === 'client' ||
+      normalized === 'staff' ||
+      normalized === 'venue' ||
+      normalized === 'admin'
+    ) {
+      return normalized;
+    }
+    return '';
+  }
+
+  private toPrRoleApi(role: PrNetworkRoleDb): PrNetworkRoleApi {
+    if (role === 'responsabile') return 'RESPONSABILE';
+    if (role === 'capo_squadra') return 'CAPO_SQUADRA';
+    return 'PR';
+  }
+
+  private toPrRoleDb(role: string): PrNetworkRoleDb {
+    const normalized = String(role || '').trim().toLowerCase();
+    if (normalized === 'responsabile') return 'responsabile';
+    if (normalized === 'capo_squadra') return 'capo_squadra';
+    if (normalized === 'pr') return 'pr';
+    throw new BadRequestException('Unsupported PR role');
+  }
+
+  private canManagePrTeam(role: PrNetworkRoleDb): boolean {
+    return role === 'responsabile' || role === 'capo_squadra';
+  }
+
+  private canManagerCreatePrRole(
+    managerRole: PrNetworkRoleDb,
+    targetRole: PrNetworkRoleDb,
+  ): boolean {
+    if (managerRole === 'responsabile') {
+      return targetRole === 'capo_squadra' || targetRole === 'pr';
+    }
+    if (managerRole === 'capo_squadra') {
+      return targetRole === 'pr';
+    }
+    return false;
+  }
+
+  private entryTypeToGender(entryType: 'male' | 'female' | 'free'): Gender {
+    if (entryType === 'male') return Gender.M;
+    if (entryType === 'female') return Gender.F;
+    return Gender.ALTRO;
+  }
+
+  private sanitizePrRefCode(seed: string): string {
+    return seed
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 24);
+  }
+
+  private toIsoString(value: Date | string | null | undefined): string {
+    if (value instanceof Date) return value.toISOString();
+    if (!value) return new Date().toISOString();
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return new Date().toISOString();
+    return parsed.toISOString();
+  }
+
+  private mapPrMember(row: PrMemberListRow) {
+    return {
+      id: row.id,
+      venue_id: row.venue_id,
+      user_id: row.user_id,
+      role: this.toPrRoleApi(row.role),
+      parent_membership_id: row.parent_membership_id,
+      ref_code: row.ref_code,
+      is_active: Boolean(row.is_active),
+      created_by_user_id: row.created_by_user_id,
+      created_at: this.toIsoString(row.created_at),
+      updated_at: this.toIsoString(row.updated_at),
+      user: {
+        id: row.user_id,
+        name: row.user_name,
+        username: row.user_username,
+        email: row.user_email,
+        role: String(row.user_role || '').toLowerCase(),
+      },
+      display_name: row.user_name || row.user_username || row.user_email,
+    };
+  }
+
+  private mapPrEventAssignment(row: PrEventAssignmentRow) {
+    return {
+      id: row.id,
+      venue_id: row.venue_id,
+      event_id: row.event_id,
+      pr_membership_id: row.pr_membership_id,
+      is_active: Boolean(row.is_active),
+      assigned_by_user_id: row.assigned_by_user_id,
+      created_at: this.toIsoString(row.created_at),
+      updated_at: this.toIsoString(row.updated_at),
+      membership: {
+        id: row.pr_membership_id,
+        role: this.toPrRoleApi(row.role),
+        ref_code: row.ref_code,
+        parent_membership_id: row.parent_membership_id,
+        display_name: row.user_name || row.user_username || row.user_email,
+        user: {
+          name: row.user_name,
+          username: row.user_username,
+          email: row.user_email,
+        },
+      },
+    };
+  }
+
+  private mapPrScan(row: PrScanRow) {
+    return {
+      id: row.id,
+      venue_id: row.venue_id,
+      event_id: row.event_id,
+      pr_membership_id: row.pr_membership_id,
+      scanned_by_user_id: row.scanned_by_user_id,
+      guest_user_id: row.guest_user_id,
+      referral_code: row.referral_code,
+      scanned_at: this.toIsoString(row.scanned_at),
+      entry_id: row.entry_id,
+      entered_at: row.entered_at ? this.toIsoString(row.entered_at) : null,
+      metadata: row.metadata ?? null,
+      created_at: this.toIsoString(row.created_at),
+      updated_at: this.toIsoString(row.updated_at),
+    };
+  }
+
+  private async loadPrMemberRows(venueId: string): Promise<PrMemberListRow[]> {
+    return this.prisma.$queryRaw<PrMemberListRow[]>(Prisma.sql`
+      SELECT
+        m.id,
+        m.venue_id,
+        m.user_id,
+        m.role::text AS role,
+        m.parent_membership_id,
+        m.ref_code,
+        m.is_active,
+        m.created_by_user_id,
+        m.created_at,
+        m.updated_at,
+        u.name AS user_name,
+        u.username AS user_username,
+        u.email AS user_email,
+        u.role::text AS user_role
+      FROM venue_pr_memberships m
+      JOIN users u ON u.id = m.user_id
+      WHERE m.venue_id = ${venueId}::uuid
+      ORDER BY
+        CASE m.role
+          WHEN 'responsabile' THEN 0
+          WHEN 'capo_squadra' THEN 1
+          ELSE 2
+        END,
+        COALESCE(u.name, u.username, u.email) ASC
+    `);
+  }
+
+  private async loadPrMemberRowById(
+    venueId: string,
+    memberId: string,
+  ): Promise<PrMemberListRow | null> {
+    const rows = await this.prisma.$queryRaw<PrMemberListRow[]>(Prisma.sql`
+      SELECT
+        m.id,
+        m.venue_id,
+        m.user_id,
+        m.role::text AS role,
+        m.parent_membership_id,
+        m.ref_code,
+        m.is_active,
+        m.created_by_user_id,
+        m.created_at,
+        m.updated_at,
+        u.name AS user_name,
+        u.username AS user_username,
+        u.email AS user_email,
+        u.role::text AS user_role
+      FROM venue_pr_memberships m
+      JOIN users u ON u.id = m.user_id
+      WHERE m.venue_id = ${venueId}::uuid
+        AND m.id = ${memberId}::uuid
+      LIMIT 1
+    `);
+    return rows[0] ?? null;
+  }
+
+  private async loadPrMembershipByUser(
+    venueId: string,
+    userId: string,
+  ): Promise<PrMembershipRow | null> {
+    const rows = await this.prisma.$queryRaw<PrMembershipRow[]>(Prisma.sql`
+      SELECT
+        id,
+        venue_id,
+        user_id,
+        role::text AS role,
+        parent_membership_id,
+        ref_code,
+        is_active,
+        created_by_user_id,
+        created_at,
+        updated_at
+      FROM venue_pr_memberships
+      WHERE venue_id = ${venueId}::uuid
+        AND user_id = ${userId}::uuid
+      LIMIT 1
+    `);
+    return rows[0] ?? null;
+  }
+
+  private async loadPrMembershipById(
+    venueId: string,
+    memberId: string,
+  ): Promise<PrMembershipRow | null> {
+    const rows = await this.prisma.$queryRaw<PrMembershipRow[]>(Prisma.sql`
+      SELECT
+        id,
+        venue_id,
+        user_id,
+        role::text AS role,
+        parent_membership_id,
+        ref_code,
+        is_active,
+        created_by_user_id,
+        created_at,
+        updated_at
+      FROM venue_pr_memberships
+      WHERE venue_id = ${venueId}::uuid
+        AND id = ${memberId}::uuid
+      LIMIT 1
+    `);
+    return rows[0] ?? null;
+  }
+
+  private async loadPrMembershipByRefCode(
+    venueId: string,
+    refCode: string,
+  ): Promise<PrMembershipRow | null> {
+    const rows = await this.prisma.$queryRaw<PrMembershipRow[]>(Prisma.sql`
+      SELECT
+        id,
+        venue_id,
+        user_id,
+        role::text AS role,
+        parent_membership_id,
+        ref_code,
+        is_active,
+        created_by_user_id,
+        created_at,
+        updated_at
+      FROM venue_pr_memberships
+      WHERE venue_id = ${venueId}::uuid
+        AND upper(ref_code) = upper(${refCode})
+      LIMIT 1
+    `);
+    return rows[0] ?? null;
+  }
+
+  private collectPrSubtree(
+    rootId: string,
+    rows: Array<{ id: string; parent_membership_id: string | null }>,
+  ): Set<string> {
+    const childrenMap = new Map<string, string[]>();
+    for (const row of rows) {
+      if (!row.parent_membership_id) continue;
+      const siblings = childrenMap.get(row.parent_membership_id) ?? [];
+      siblings.push(row.id);
+      childrenMap.set(row.parent_membership_id, siblings);
+    }
+
+    const visited = new Set<string>();
+    const queue: string[] = [rootId];
+
+    while (queue.length) {
+      const current = queue.shift();
+      if (!current || visited.has(current)) continue;
+      visited.add(current);
+
+      const children = childrenMap.get(current) ?? [];
+      for (const child of children) {
+        if (!visited.has(child)) queue.push(child);
+      }
+    }
+
+    return visited;
+  }
+
+  private validatePrHierarchy(
+    role: PrNetworkRoleDb,
+    parent: PrMembershipRow | null,
+  ) {
+    if (role === 'responsabile') {
+      if (parent) {
+        throw new BadRequestException('Il ruolo RESPONSABILE non puo avere un superiore');
+      }
+      return;
+    }
+
+    if (!parent) {
+      throw new BadRequestException('Questo ruolo richiede un superiore');
+    }
+
+    if (role === 'capo_squadra' && parent.role !== 'responsabile') {
+      throw new BadRequestException('CAPO_SQUADRA deve avere un RESPONSABILE sopra di lui');
+    }
+
+    if (role === 'pr' && parent.role === 'pr') {
+      throw new BadRequestException('PR deve essere assegnato sotto un RESPONSABILE o CAPO_SQUADRA');
+    }
+  }
+
+  private async buildUniquePrRefCode(
+    venueId: string,
+    seed: string,
+    excludeMemberId?: string,
+  ): Promise<string> {
+    const base = this.sanitizePrRefCode(seed) || 'PR';
+    let candidate = base;
+    let index = 1;
+
+    while (index < 200) {
+      const rows = excludeMemberId
+        ? await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+            SELECT id
+            FROM venue_pr_memberships
+            WHERE venue_id = ${venueId}::uuid
+              AND upper(ref_code) = upper(${candidate})
+              AND id <> ${excludeMemberId}::uuid
+            LIMIT 1
+          `)
+        : await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+            SELECT id
+            FROM venue_pr_memberships
+            WHERE venue_id = ${venueId}::uuid
+              AND upper(ref_code) = upper(${candidate})
+            LIMIT 1
+          `);
+
+      if (!rows.length) return candidate;
+      candidate = `${base}-${index}`;
+      index += 1;
+    }
+
+    throw new BadRequestException('Impossibile generare un ref_code univoco');
+  }
+
+  private async resolvePrActorContext(
+    venueId: string,
+    user?: RequestUser,
+    requireManagePermission = false,
+  ): Promise<{ owner: boolean; membership: PrMembershipRow | null }> {
+    if (!user?.id) throw new ForbiddenException('Forbidden');
+
+    const appRole = this.normalizeAppRole(user.role);
+    if (appRole === 'admin') {
+      return { owner: true, membership: null };
+    }
+
+    if (appRole === 'venue') {
+      if (!user.venue_id || user.venue_id !== venueId) {
+        throw new ForbiddenException('Forbidden');
+      }
+      return { owner: true, membership: null };
+    }
+
+    const membership = await this.loadPrMembershipByUser(venueId, user.id);
+    if (!membership || !membership.is_active) {
+      throw new ForbiddenException('Forbidden');
+    }
+
+    if (requireManagePermission && !this.canManagePrTeam(membership.role)) {
+      throw new ForbiddenException('Forbidden');
+    }
+
+    return { owner: false, membership };
   }
 
   async listVenues(): Promise<venues[]> {
@@ -526,6 +1004,1180 @@ export class VenuesService {
       where: { venue_id: venueId },
       orderBy: [{ zona: 'asc' }, { nome: 'asc' }],
     });
+  }
+
+  async listVenueStations(venueId: string): Promise<venue_stations[]> {
+    await this.getVenue(venueId);
+
+    return this.prisma.venue_stations.findMany({
+      where: { venue_id: venueId },
+      orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+    });
+  }
+
+  async listAssignableUsersForPr(
+    venueId: string,
+    searchRaw: string | undefined,
+    user?: RequestUser,
+  ) {
+    await this.getVenue(venueId);
+    await this.resolvePrActorContext(venueId, user, true);
+
+    const search = String(searchRaw ?? '').trim();
+    const normalizedSearch = search.slice(0, 80);
+    const pattern = `%${normalizedSearch}%`;
+    const limit = normalizedSearch.length >= 2 ? 30 : 100;
+
+    type AssignableUserRow = {
+      id: string;
+      name: string | null;
+      username: string | null;
+      email: string;
+      role: string;
+      venue_id: string | null;
+      is_associated_to_venue: boolean;
+      already_assigned: boolean;
+    };
+
+    const rows = normalizedSearch.length >= 2
+      ? await this.prisma.$queryRaw<AssignableUserRow[]>(Prisma.sql`
+          SELECT
+            u.id,
+            u.name,
+            u.username,
+            u.email,
+            u.role::text AS role,
+            u.venue_id,
+            CASE WHEN u.venue_id = ${venueId}::uuid THEN true ELSE false END AS is_associated_to_venue,
+            CASE WHEN m.id IS NULL THEN false ELSE true END AS already_assigned
+          FROM users u
+          LEFT JOIN venue_pr_memberships m
+            ON m.venue_id = ${venueId}::uuid
+           AND m.user_id = u.id
+          WHERE u.role <> 'admin'::"UserRole"
+            AND (
+              u.venue_id = ${venueId}::uuid
+              OR COALESCE(u.name, '') ILIKE ${pattern}
+              OR COALESCE(u.username, '') ILIKE ${pattern}
+              OR COALESCE(u.email, '') ILIKE ${pattern}
+            )
+          ORDER BY
+            CASE WHEN u.venue_id = ${venueId}::uuid THEN 0 ELSE 1 END,
+            CASE WHEN m.id IS NULL THEN 0 ELSE 1 END,
+            COALESCE(u.last_active_at, u.updated_at, u.created_at) DESC
+          LIMIT ${limit}
+        `)
+      : await this.prisma.$queryRaw<AssignableUserRow[]>(Prisma.sql`
+          SELECT
+            u.id,
+            u.name,
+            u.username,
+            u.email,
+            u.role::text AS role,
+            u.venue_id,
+            true AS is_associated_to_venue,
+            CASE WHEN m.id IS NULL THEN false ELSE true END AS already_assigned
+          FROM users u
+          LEFT JOIN venue_pr_memberships m
+            ON m.venue_id = ${venueId}::uuid
+           AND m.user_id = u.id
+          WHERE u.role <> 'admin'::"UserRole"
+            AND u.venue_id = ${venueId}::uuid
+          ORDER BY
+            CASE WHEN m.id IS NULL THEN 0 ELSE 1 END,
+            COALESCE(u.last_active_at, u.updated_at, u.created_at) DESC
+          LIMIT ${limit}
+        `);
+
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      username: row.username,
+      email: row.email,
+      role: String(row.role || '').toLowerCase(),
+      venue_id: row.venue_id,
+      is_associated_to_venue: Boolean(row.is_associated_to_venue),
+      already_assigned: Boolean(row.already_assigned),
+      display_name: row.name || row.username || row.email,
+    }));
+  }
+
+  async getMyPrNetworkMembership(venueId: string, user?: RequestUser) {
+    await this.getVenue(venueId);
+    if (!user?.id) throw new ForbiddenException('Forbidden');
+
+    const appRole = this.normalizeAppRole(user.role);
+    if (appRole === 'venue' && (!user.venue_id || user.venue_id !== venueId)) {
+      throw new ForbiddenException('Forbidden');
+    }
+
+    const membership = await this.loadPrMembershipByUser(venueId, user.id);
+    const isOwner = appRole === 'admin' || (appRole === 'venue' && user.venue_id === venueId);
+
+    return {
+      venue_id: venueId,
+      can_access_dashboard: isOwner || Boolean(membership?.is_active),
+      can_manage_team:
+        isOwner ||
+        Boolean(membership?.is_active && this.canManagePrTeam(membership.role)),
+      membership: membership
+        ? {
+            id: membership.id,
+            user_id: membership.user_id,
+            role: this.toPrRoleApi(membership.role),
+            parent_membership_id: membership.parent_membership_id,
+            ref_code: membership.ref_code,
+            is_active: Boolean(membership.is_active),
+            created_at: this.toIsoString(membership.created_at),
+            updated_at: this.toIsoString(membership.updated_at),
+          }
+        : null,
+    };
+  }
+
+  async listVenuePrNetworkMembers(venueId: string, user?: RequestUser) {
+    await this.getVenue(venueId);
+    const actorContext = await this.resolvePrActorContext(venueId, user, false);
+
+    const rows = await this.loadPrMemberRows(venueId);
+    const visibleRows = !actorContext.owner && actorContext.membership
+      ? (() => {
+          const allowed = this.collectPrSubtree(actorContext.membership.id, rows);
+          return rows.filter((row) => allowed.has(row.id));
+        })()
+      : rows;
+
+    return visibleRows.map((row) => this.mapPrMember(row));
+  }
+
+  async createVenuePrNetworkMember(
+    venueId: string,
+    payload: {
+      user_id: string;
+      role: string;
+      parent_membership_id?: string | null;
+      ref_code?: string | null;
+    },
+    user?: RequestUser,
+  ) {
+    await this.getVenue(venueId);
+
+    if (!payload?.user_id) {
+      throw new BadRequestException('user_id is required');
+    }
+
+    const actorContext = await this.resolvePrActorContext(venueId, user, true);
+    const targetRole = this.toPrRoleDb(payload.role);
+
+    const targetUser = await this.prisma.users.findUnique({
+      where: { id: payload.user_id },
+      select: {
+        id: true,
+        email: true,
+        username: true,
+        name: true,
+      },
+    });
+    if (!targetUser) throw new NotFoundException('User not found');
+
+    const existingMembership = await this.loadPrMembershipByUser(venueId, payload.user_id);
+    if (existingMembership) {
+      throw new BadRequestException('User already assigned to this venue PR network');
+    }
+
+    let resolvedParentId: string | null = payload.parent_membership_id ?? null;
+
+    if (!actorContext.owner) {
+      const actorMembership = actorContext.membership;
+      if (!actorMembership) throw new ForbiddenException('Forbidden');
+
+      if (!this.canManagerCreatePrRole(actorMembership.role, targetRole)) {
+        throw new ForbiddenException('Forbidden');
+      }
+
+      if (resolvedParentId && resolvedParentId !== actorMembership.id) {
+        throw new ForbiddenException('Puoi assegnare solo membri nel tuo team diretto');
+      }
+
+      resolvedParentId = actorMembership.id;
+    }
+
+    const parent = resolvedParentId
+      ? await this.loadPrMembershipById(venueId, resolvedParentId)
+      : null;
+
+    if (resolvedParentId && !parent) {
+      throw new BadRequestException('Parent membership not found');
+    }
+
+    this.validatePrHierarchy(targetRole, parent);
+
+    const refSeed =
+      payload.ref_code?.trim() ||
+      targetUser.username ||
+      targetUser.name ||
+      targetUser.email;
+    const refCode = await this.buildUniquePrRefCode(venueId, refSeed);
+
+    const inserted = await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      INSERT INTO venue_pr_memberships (
+        venue_id,
+        user_id,
+        role,
+        parent_membership_id,
+        ref_code,
+        is_active,
+        created_by_user_id,
+        updated_at
+      )
+      VALUES (
+        ${venueId}::uuid,
+        ${payload.user_id}::uuid,
+        ${targetRole}::"VenuePrRole",
+        ${resolvedParentId}::uuid,
+        ${refCode},
+        true,
+        ${user?.id ?? null}::uuid,
+        NOW()
+      )
+      RETURNING id
+    `);
+
+    const createdId = inserted[0]?.id;
+    if (!createdId) {
+      throw new BadRequestException('Unable to create PR membership');
+    }
+
+    const row = await this.loadPrMemberRowById(venueId, createdId);
+    if (!row) throw new NotFoundException('Created PR membership not found');
+
+    return this.mapPrMember(row);
+  }
+
+  async updateVenuePrNetworkMember(
+    venueId: string,
+    memberId: string,
+    payload: {
+      role?: string;
+      parent_membership_id?: string | null;
+      is_active?: boolean;
+      ref_code?: string;
+    },
+    user?: RequestUser,
+  ) {
+    await this.getVenue(venueId);
+
+    const existing = await this.loadPrMembershipById(venueId, memberId);
+    if (!existing) throw new NotFoundException('PR membership not found');
+
+    const actorContext = await this.resolvePrActorContext(venueId, user, true);
+
+    if (!actorContext.owner) {
+      const actorMembership = actorContext.membership;
+      if (!actorMembership) throw new ForbiddenException('Forbidden');
+
+      if (existing.parent_membership_id !== actorMembership.id || existing.role !== 'pr') {
+        throw new ForbiddenException('Puoi gestire solo PR diretti del tuo team');
+      }
+
+      const onlyToggleActive =
+        payload.is_active !== undefined &&
+        payload.role === undefined &&
+        payload.parent_membership_id === undefined &&
+        payload.ref_code === undefined;
+
+      if (!onlyToggleActive) {
+        throw new ForbiddenException('Non hai permessi per modificare questi campi');
+      }
+    }
+
+    let nextRole = existing.role;
+    let nextParentId = existing.parent_membership_id;
+    let nextIsActive = Boolean(existing.is_active);
+    let nextRefCode = existing.ref_code;
+
+    if (actorContext.owner) {
+      if (payload.role !== undefined) {
+        nextRole = this.toPrRoleDb(payload.role);
+      }
+
+      if (payload.parent_membership_id !== undefined) {
+        nextParentId = payload.parent_membership_id ?? null;
+      }
+
+      if (payload.ref_code !== undefined) {
+        nextRefCode = await this.buildUniquePrRefCode(
+          venueId,
+          payload.ref_code || existing.ref_code,
+          existing.id,
+        );
+      }
+    }
+
+    if (payload.is_active !== undefined) {
+      nextIsActive = Boolean(payload.is_active);
+    }
+
+    if (nextParentId && nextParentId === existing.id) {
+      throw new BadRequestException('Un membro non puo essere il proprio superiore');
+    }
+
+    const parent = nextParentId
+      ? await this.loadPrMembershipById(venueId, nextParentId)
+      : null;
+
+    if (nextParentId && !parent) {
+      throw new BadRequestException('Parent membership not found');
+    }
+
+    if (actorContext.owner && nextParentId) {
+      const treeRows = await this.prisma.$queryRaw<
+        Array<{ id: string; parent_membership_id: string | null }>
+      >(Prisma.sql`
+        SELECT id, parent_membership_id
+        FROM venue_pr_memberships
+        WHERE venue_id = ${venueId}::uuid
+      `);
+      const selfAndDescendants = this.collectPrSubtree(existing.id, treeRows);
+      if (selfAndDescendants.has(nextParentId)) {
+        throw new BadRequestException('Ciclo gerarchico non consentito');
+      }
+    }
+
+    this.validatePrHierarchy(nextRole, parent);
+
+    const updates: Prisma.Sql[] = [];
+
+    if (nextRole !== existing.role) {
+      updates.push(Prisma.sql`role = ${nextRole}::"VenuePrRole"`);
+    }
+
+    if ((nextParentId ?? null) !== (existing.parent_membership_id ?? null)) {
+      updates.push(Prisma.sql`parent_membership_id = ${nextParentId}::uuid`);
+    }
+
+    if (nextRefCode !== existing.ref_code) {
+      updates.push(Prisma.sql`ref_code = ${nextRefCode}`);
+    }
+
+    if (nextIsActive !== Boolean(existing.is_active)) {
+      updates.push(Prisma.sql`is_active = ${nextIsActive}`);
+    }
+
+    if (!updates.length) {
+      const row = await this.loadPrMemberRowById(venueId, memberId);
+      if (!row) throw new NotFoundException('PR membership not found');
+      return this.mapPrMember(row);
+    }
+
+    updates.push(Prisma.sql`updated_at = NOW()`);
+
+    await this.prisma.$executeRaw(Prisma.sql`
+      UPDATE venue_pr_memberships
+      SET ${Prisma.join(updates, ', ')}
+      WHERE venue_id = ${venueId}::uuid
+        AND id = ${memberId}::uuid
+    `);
+
+    const row = await this.loadPrMemberRowById(venueId, memberId);
+    if (!row) throw new NotFoundException('PR membership not found');
+
+    return this.mapPrMember(row);
+  }
+
+  async deleteVenuePrNetworkMember(
+    venueId: string,
+    memberId: string,
+    user?: RequestUser,
+  ) {
+    await this.getVenue(venueId);
+
+    const existing = await this.loadPrMembershipById(venueId, memberId);
+    if (!existing) throw new NotFoundException('PR membership not found');
+
+    const actorContext = await this.resolvePrActorContext(venueId, user, true);
+    if (!actorContext.owner) {
+      const actorMembership = actorContext.membership;
+      if (!actorMembership) throw new ForbiddenException('Forbidden');
+
+      if (existing.parent_membership_id !== actorMembership.id || existing.role !== 'pr') {
+        throw new ForbiddenException('Puoi eliminare solo PR diretti del tuo team');
+      }
+    }
+
+    const children = await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT id
+      FROM venue_pr_memberships
+      WHERE venue_id = ${venueId}::uuid
+        AND parent_membership_id = ${memberId}::uuid
+      LIMIT 1
+    `);
+
+    if (children.length > 0) {
+      throw new BadRequestException(
+        'Impossibile eliminare: riassegna prima i membri del team collegati',
+      );
+    }
+
+    await this.prisma.$executeRaw(Prisma.sql`
+      DELETE FROM venue_pr_memberships
+      WHERE venue_id = ${venueId}::uuid
+        AND id = ${memberId}::uuid
+    `);
+
+    return { deleted: true, id: memberId };
+  }
+
+  async listMyPrVenueMemberships(user?: RequestUser) {
+    if (!user?.id) throw new ForbiddenException('Forbidden');
+
+    const rows = await this.prisma.$queryRaw<PrMembershipVenueRow[]>(Prisma.sql`
+      SELECT
+        m.id AS membership_id,
+        m.venue_id,
+        v.name AS venue_name,
+        v.city AS venue_city,
+        m.role::text AS role,
+        m.parent_membership_id,
+        m.ref_code,
+        m.is_active,
+        m.created_at,
+        m.updated_at
+      FROM venue_pr_memberships m
+      JOIN venues v ON v.id = m.venue_id
+      WHERE m.user_id = ${user.id}::uuid
+        AND m.is_active = true
+      ORDER BY m.updated_at DESC
+    `);
+
+    return rows.map((row) => ({
+      membership_id: row.membership_id,
+      venue_id: row.venue_id,
+      venue_name: row.venue_name,
+      venue_city: row.venue_city,
+      role: this.toPrRoleApi(row.role),
+      parent_membership_id: row.parent_membership_id,
+      ref_code: row.ref_code,
+      is_active: Boolean(row.is_active),
+      can_manage_team: this.canManagePrTeam(row.role),
+      created_at: this.toIsoString(row.created_at),
+      updated_at: this.toIsoString(row.updated_at),
+    }));
+  }
+
+  async assignPrMemberToEvent(
+    venueId: string,
+    payload: {
+      event_id: string;
+      pr_membership_id: string;
+      is_active?: boolean;
+    },
+    user?: RequestUser,
+  ) {
+    await this.getVenue(venueId);
+    await this.ensureEventBelongsToVenue(payload.event_id, venueId);
+
+    const actorContext = await this.resolvePrActorContext(venueId, user, true);
+    const membership = await this.loadPrMembershipById(
+      venueId,
+      payload.pr_membership_id,
+    );
+    if (!membership) {
+      throw new NotFoundException('PR membership not found');
+    }
+    if (!membership.is_active) {
+      throw new BadRequestException('PR membership is not active');
+    }
+
+    if (!actorContext.owner && actorContext.membership) {
+      const treeRows = await this.prisma.$queryRaw<
+        Array<{ id: string; parent_membership_id: string | null }>
+      >(Prisma.sql`
+        SELECT id, parent_membership_id
+        FROM venue_pr_memberships
+        WHERE venue_id = ${venueId}::uuid
+      `);
+      const allowed = this.collectPrSubtree(actorContext.membership.id, treeRows);
+      if (!allowed.has(membership.id)) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+
+    const nextActive = payload.is_active ?? true;
+
+    await this.prisma.$executeRaw(Prisma.sql`
+      INSERT INTO venue_pr_event_assignments (
+        venue_id,
+        event_id,
+        pr_membership_id,
+        is_active,
+        assigned_by_user_id,
+        updated_at
+      )
+      VALUES (
+        ${venueId}::uuid,
+        ${payload.event_id}::uuid,
+        ${payload.pr_membership_id}::uuid,
+        ${nextActive},
+        ${user?.id ?? null}::uuid,
+        NOW()
+      )
+      ON CONFLICT (event_id, pr_membership_id)
+      DO UPDATE
+      SET
+        is_active = EXCLUDED.is_active,
+        assigned_by_user_id = EXCLUDED.assigned_by_user_id,
+        updated_at = NOW()
+    `);
+
+    const rows = await this.prisma.$queryRaw<PrEventAssignmentRow[]>(Prisma.sql`
+      SELECT
+        a.id,
+        a.venue_id,
+        a.event_id,
+        a.pr_membership_id,
+        a.is_active,
+        a.assigned_by_user_id,
+        a.created_at,
+        a.updated_at,
+        m.role::text AS role,
+        m.ref_code,
+        m.parent_membership_id,
+        u.name AS user_name,
+        u.username AS user_username,
+        u.email AS user_email
+      FROM venue_pr_event_assignments a
+      JOIN venue_pr_memberships m ON m.id = a.pr_membership_id
+      JOIN users u ON u.id = m.user_id
+      WHERE a.venue_id = ${venueId}::uuid
+        AND a.event_id = ${payload.event_id}::uuid
+        AND a.pr_membership_id = ${payload.pr_membership_id}::uuid
+      LIMIT 1
+    `);
+
+    const row = rows[0];
+    if (!row) throw new NotFoundException('PR event assignment not found');
+    return this.mapPrEventAssignment(row);
+  }
+
+  async listPrEventAssignments(
+    venueId: string,
+    eventId: string,
+    user?: RequestUser,
+  ) {
+    await this.getVenue(venueId);
+    await this.ensureEventBelongsToVenue(eventId, venueId);
+
+    const actorContext = await this.resolvePrActorContext(venueId, user, false);
+    const rows = await this.prisma.$queryRaw<PrEventAssignmentRow[]>(Prisma.sql`
+      SELECT
+        a.id,
+        a.venue_id,
+        a.event_id,
+        a.pr_membership_id,
+        a.is_active,
+        a.assigned_by_user_id,
+        a.created_at,
+        a.updated_at,
+        m.role::text AS role,
+        m.ref_code,
+        m.parent_membership_id,
+        u.name AS user_name,
+        u.username AS user_username,
+        u.email AS user_email
+      FROM venue_pr_event_assignments a
+      JOIN venue_pr_memberships m ON m.id = a.pr_membership_id
+      JOIN users u ON u.id = m.user_id
+      WHERE a.venue_id = ${venueId}::uuid
+        AND a.event_id = ${eventId}::uuid
+      ORDER BY
+        CASE m.role
+          WHEN 'responsabile' THEN 0
+          WHEN 'capo_squadra' THEN 1
+          ELSE 2
+        END,
+        COALESCE(u.name, u.username, u.email) ASC
+    `);
+
+    if (actorContext.owner) {
+      return rows.map((row) => this.mapPrEventAssignment(row));
+    }
+
+    const actorMembership = actorContext.membership;
+    if (!actorMembership) return [];
+
+    const allMembers = await this.loadPrMemberRows(venueId);
+    const allowed = this.collectPrSubtree(actorMembership.id, allMembers);
+    return rows
+      .filter((row) => allowed.has(row.pr_membership_id))
+      .map((row) => this.mapPrEventAssignment(row));
+  }
+
+  async registerPrQrScan(
+    venueId: string,
+    payload: {
+      event_id: string;
+      pr_membership_id?: string;
+      ref_code?: string;
+      guest_user_id?: string;
+      metadata?: Record<string, unknown>;
+    },
+    user?: RequestUser,
+  ) {
+    await this.getVenue(venueId);
+    await this.ensureEventBelongsToVenue(payload.event_id, venueId);
+
+    const actorContext = await this.resolvePrActorContext(venueId, user, false);
+
+    let targetMembership: PrMembershipRow | null = null;
+    if (payload.pr_membership_id) {
+      targetMembership = await this.loadPrMembershipById(
+        venueId,
+        payload.pr_membership_id,
+      );
+    } else if (payload.ref_code?.trim()) {
+      targetMembership = await this.loadPrMembershipByRefCode(
+        venueId,
+        payload.ref_code.trim(),
+      );
+    } else if (actorContext.membership) {
+      targetMembership = actorContext.membership;
+    }
+
+    if (!targetMembership) {
+      throw new BadRequestException('pr_membership_id or ref_code is required');
+    }
+    if (!targetMembership.is_active) {
+      throw new BadRequestException('PR membership is not active');
+    }
+
+    if (!actorContext.owner && actorContext.membership) {
+      const allMembers = await this.loadPrMemberRows(venueId);
+      const allowed = this.collectPrSubtree(actorContext.membership.id, allMembers);
+      if (!allowed.has(targetMembership.id)) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+
+    const assignmentRows = await this.prisma.$queryRaw<Array<{ is_active: boolean }>>(
+      Prisma.sql`
+        SELECT is_active
+        FROM venue_pr_event_assignments
+        WHERE venue_id = ${venueId}::uuid
+          AND event_id = ${payload.event_id}::uuid
+          AND pr_membership_id = ${targetMembership.id}::uuid
+        LIMIT 1
+      `,
+    );
+
+    if (!assignmentRows[0]) {
+      throw new BadRequestException('PR is not assigned to this event');
+    }
+
+    if (!assignmentRows[0].is_active) {
+      throw new BadRequestException('PR is not active for this event');
+    }
+
+    const metadataJson = payload.metadata ? JSON.stringify(payload.metadata) : null;
+    const rows = await this.prisma.$queryRaw<PrScanRow[]>(Prisma.sql`
+      INSERT INTO venue_pr_qr_scans (
+        venue_id,
+        event_id,
+        pr_membership_id,
+        scanned_by_user_id,
+        guest_user_id,
+        referral_code,
+        metadata,
+        updated_at
+      )
+      VALUES (
+        ${venueId}::uuid,
+        ${payload.event_id}::uuid,
+        ${targetMembership.id}::uuid,
+        ${user?.id ?? null}::uuid,
+        ${payload.guest_user_id ?? null}::uuid,
+        ${targetMembership.ref_code},
+        ${metadataJson}::jsonb,
+        NOW()
+      )
+      RETURNING
+        id,
+        venue_id,
+        event_id,
+        pr_membership_id,
+        scanned_by_user_id,
+        guest_user_id,
+        referral_code,
+        scanned_at,
+        entry_id,
+        entered_at,
+        metadata,
+        created_at,
+        updated_at
+    `);
+
+    const scan = rows[0];
+    if (!scan) throw new BadRequestException('Unable to register PR scan');
+    return this.mapPrScan(scan);
+  }
+
+  async registerPrEntryFromScan(
+    venueId: string,
+    scanId: string,
+    payload: {
+      guest_user_id?: string;
+      station_id?: string;
+      entry_type?: 'male' | 'female' | 'free';
+    },
+    user?: RequestUser,
+  ) {
+    await this.getVenue(venueId);
+    const actorContext = await this.resolvePrActorContext(venueId, user, false);
+
+    const scanRows = await this.prisma.$queryRaw<PrScanRow[]>(Prisma.sql`
+      SELECT
+        id,
+        venue_id,
+        event_id,
+        pr_membership_id,
+        scanned_by_user_id,
+        guest_user_id,
+        referral_code,
+        scanned_at,
+        entry_id,
+        entered_at,
+        metadata,
+        created_at,
+        updated_at
+      FROM venue_pr_qr_scans
+      WHERE venue_id = ${venueId}::uuid
+        AND id = ${scanId}::uuid
+      LIMIT 1
+    `);
+
+    const scan = scanRows[0];
+    if (!scan) throw new NotFoundException('PR scan not found');
+
+    if (!actorContext.owner && actorContext.membership) {
+      const allMembers = await this.loadPrMemberRows(venueId);
+      const allowed = this.collectPrSubtree(actorContext.membership.id, allMembers);
+      if (!allowed.has(scan.pr_membership_id)) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+
+    if (scan.entry_id) {
+      const existingEntry = await this.prisma.entries.findUnique({
+        where: { id: scan.entry_id },
+        select: {
+          id: true,
+          event_id: true,
+          user_id: true,
+          staff_id: true,
+          station_id: true,
+          pr_membership_id: true,
+          method: true,
+          sesso: true,
+          price: true,
+          created_at: true,
+        },
+      });
+
+      return {
+        already_registered: true,
+        scan: this.mapPrScan(scan),
+        entry: existingEntry
+          ? {
+              ...existingEntry,
+              price: this.decimalToNumber(existingEntry.price),
+              created_at: this.toIsoString(existingEntry.created_at),
+            }
+          : null,
+      };
+    }
+
+    const entryType = payload.entry_type ?? 'free';
+    const gender = this.entryTypeToGender(entryType);
+
+    let resolvedStationId: string | null = null;
+    if (payload.station_id) {
+      const station = await this.prisma.venue_stations.findUnique({
+        where: { id: payload.station_id },
+        select: {
+          id: true,
+          venue_id: true,
+          station_type: true,
+          is_active: true,
+        },
+      });
+      if (!station) throw new NotFoundException('Station not found');
+      if (station.venue_id !== venueId) {
+        throw new BadRequestException('station_id does not belong to venue');
+      }
+      if (station.station_type !== VenueStationType.entry) {
+        throw new BadRequestException('station_id must be an entry station');
+      }
+      if (!station.is_active) {
+        throw new BadRequestException('station_id is not active');
+      }
+      resolvedStationId = station.id;
+    } else {
+      const fallbackStation = await this.prisma.venue_stations.findFirst({
+        where: {
+          venue_id: venueId,
+          station_type: VenueStationType.entry,
+          is_active: true,
+        },
+        orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+        select: { id: true },
+      });
+      resolvedStationId = fallbackStation?.id ?? null;
+    }
+
+    const guestUserId = payload.guest_user_id ?? scan.guest_user_id ?? null;
+    const entryPrice = await resolveEntryUnitPrice({
+      prisma: this.prisma,
+      eventId: scan.event_id,
+      gender,
+      isComplimentary: entryType === 'free',
+    });
+
+    const createdEntry = await this.prisma.entries.create({
+      data: {
+        event_id: scan.event_id,
+        user_id: guestUserId,
+        staff_id: user?.id ?? null,
+        station_id: resolvedStationId,
+        pr_membership_id: scan.pr_membership_id,
+        sesso: gender,
+        price: entryPrice,
+        method: EntryMethod.QR,
+      },
+      select: {
+        id: true,
+        event_id: true,
+        user_id: true,
+        staff_id: true,
+        station_id: true,
+        pr_membership_id: true,
+        method: true,
+        sesso: true,
+        price: true,
+        created_at: true,
+      },
+    });
+
+    const updatedRows = await this.prisma.$queryRaw<PrScanRow[]>(Prisma.sql`
+      UPDATE venue_pr_qr_scans
+      SET
+        entry_id = ${createdEntry.id}::uuid,
+        entered_at = NOW(),
+        guest_user_id = COALESCE(${guestUserId}::uuid, guest_user_id),
+        updated_at = NOW()
+      WHERE id = ${scan.id}::uuid
+      RETURNING
+        id,
+        venue_id,
+        event_id,
+        pr_membership_id,
+        scanned_by_user_id,
+        guest_user_id,
+        referral_code,
+        scanned_at,
+        entry_id,
+        entered_at,
+        metadata,
+        created_at,
+        updated_at
+    `);
+
+    return {
+      already_registered: false,
+      scan: this.mapPrScan(updatedRows[0] ?? scan),
+      entry: {
+        ...createdEntry,
+        price: this.decimalToNumber(createdEntry.price),
+        created_at: this.toIsoString(createdEntry.created_at),
+      },
+    };
+  }
+
+  async getPrDashboardStats(
+    venueId: string,
+    user?: RequestUser,
+    filters?: {
+      event_id?: string;
+      membership_id?: string;
+    },
+  ) {
+    await this.getVenue(venueId);
+
+    const eventId = filters?.event_id ?? undefined;
+    if (eventId) {
+      await this.ensureEventBelongsToVenue(eventId, venueId);
+    }
+
+    const actorContext = await this.resolvePrActorContext(venueId, user, false);
+    const memberRows = await this.loadPrMemberRows(venueId);
+
+    let visibleRows = memberRows;
+    if (!actorContext.owner && actorContext.membership) {
+      const allowed = this.collectPrSubtree(actorContext.membership.id, memberRows);
+      visibleRows = memberRows.filter((row) => allowed.has(row.id));
+    }
+
+    if (filters?.membership_id) {
+      const target = visibleRows.find((row) => row.id === filters.membership_id);
+      if (!target) throw new ForbiddenException('Forbidden');
+      visibleRows = [target];
+    }
+
+    const visibleIds = new Set(visibleRows.map((row) => row.id));
+
+    const scanRows = await this.prisma.$queryRaw<
+      Array<{ pr_membership_id: string; scans_count: number; entries_count: number }>
+    >(Prisma.sql`
+      SELECT
+        pr_membership_id,
+        COUNT(*)::int AS scans_count,
+        COUNT(entry_id)::int AS entries_count
+      FROM venue_pr_qr_scans
+      WHERE venue_id = ${venueId}::uuid
+        ${eventId ? Prisma.sql`AND event_id = ${eventId}::uuid` : Prisma.empty}
+      GROUP BY pr_membership_id
+    `);
+
+    const statsByMember = new Map<string, { scans: number; entries: number }>();
+    for (const row of scanRows) {
+      if (!visibleIds.has(row.pr_membership_id)) continue;
+      statsByMember.set(row.pr_membership_id, {
+        scans: Number(row.scans_count ?? 0),
+        entries: Number(row.entries_count ?? 0),
+      });
+    }
+
+    const childrenMap = new Map<string, string[]>();
+    for (const row of visibleRows) {
+      if (!row.parent_membership_id || !visibleIds.has(row.parent_membership_id)) {
+        continue;
+      }
+      const siblings = childrenMap.get(row.parent_membership_id) ?? [];
+      siblings.push(row.id);
+      childrenMap.set(row.parent_membership_id, siblings);
+    }
+
+    const rollupCache = new Map<string, { scans: number; entries: number }>();
+    const rollup = (membershipId: string): { scans: number; entries: number } => {
+      const cached = rollupCache.get(membershipId);
+      if (cached) return cached;
+
+      const own = statsByMember.get(membershipId) ?? { scans: 0, entries: 0 };
+      const children = childrenMap.get(membershipId) ?? [];
+
+      const totals = { scans: own.scans, entries: own.entries };
+      for (const childId of children) {
+        const childTotals = rollup(childId);
+        totals.scans += childTotals.scans;
+        totals.entries += childTotals.entries;
+      }
+
+      rollupCache.set(membershipId, totals);
+      return totals;
+    };
+
+    const members = visibleRows.map((row) => {
+      const own = statsByMember.get(row.id) ?? { scans: 0, entries: 0 };
+      const team = rollup(row.id);
+      return {
+        id: row.id,
+        user_id: row.user_id,
+        role: this.toPrRoleApi(row.role),
+        parent_membership_id: row.parent_membership_id,
+        ref_code: row.ref_code,
+        is_active: Boolean(row.is_active),
+        created_at: this.toIsoString(row.created_at),
+        updated_at: this.toIsoString(row.updated_at),
+        display_name: row.user_name || row.user_username || row.user_email,
+        user: {
+          id: row.user_id,
+          name: row.user_name,
+          username: row.user_username,
+          email: row.user_email,
+          role: String(row.user_role || '').toLowerCase(),
+        },
+        stats: {
+          scans: own.scans,
+          entries: own.entries,
+        },
+        team_stats: {
+          scans: team.scans,
+          entries: team.entries,
+        },
+      };
+    });
+
+    const totals = members.reduce(
+      (acc, member) => {
+        acc.scans += member.stats.scans;
+        acc.entries += member.stats.entries;
+        return acc;
+      },
+      { scans: 0, entries: 0 },
+    );
+
+    return {
+      venue_id: venueId,
+      event_id: eventId ?? null,
+      scope: actorContext.owner
+        ? 'OWNER'
+        : actorContext.membership
+          ? this.toPrRoleApi(actorContext.membership.role)
+          : 'PR',
+      can_manage_team: actorContext.owner
+        ? true
+        : actorContext.membership
+          ? this.canManagePrTeam(actorContext.membership.role)
+          : false,
+      totals,
+      members,
+      generated_at: new Date().toISOString(),
+    };
+  }
+
+  async createVenueStationsBulk(
+    venueId: string,
+    body: CreateVenueStationsBulkDto,
+  ): Promise<venue_stations[]> {
+    await this.getVenue(venueId);
+
+    const stations = body?.stations;
+    if (!Array.isArray(stations) || stations.length === 0) {
+      throw new BadRequestException('stations[] is required');
+    }
+    if (stations.length > 50) {
+      throw new BadRequestException('Too many stations (max 50 per request)');
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      for (const station of stations) {
+        const name = String(station.name || '').trim();
+        if (!name) {
+          throw new BadRequestException('station name cannot be empty');
+        }
+
+        const existing = await tx.venue_stations.findFirst({
+          where: {
+            venue_id: venueId,
+            name: { equals: name, mode: 'insensitive' },
+          },
+          select: { id: true },
+        });
+
+        const payload = {
+          name,
+          station_type: station.station_type as VenueStationType,
+          is_active: station.is_active ?? true,
+          sort_order: station.sort_order ?? 0,
+        };
+
+        if (existing) {
+          await tx.venue_stations.update({
+            where: { id: existing.id },
+            data: payload,
+          });
+        } else {
+          await tx.venue_stations.create({
+            data: {
+              venue_id: venueId,
+              ...payload,
+            },
+          });
+        }
+      }
+    });
+
+    return this.listVenueStations(venueId);
+  }
+
+  async updateVenueStation(
+    venueId: string,
+    stationId: string,
+    body: UpdateVenueStationDto,
+  ): Promise<venue_stations> {
+    await this.getVenue(venueId);
+
+    const existing = await this.prisma.venue_stations.findUnique({
+      where: { id: stationId },
+      select: { id: true, venue_id: true },
+    });
+    if (!existing || existing.venue_id !== venueId) {
+      throw new NotFoundException('Station not found');
+    }
+
+    const data: Prisma.venue_stationsUpdateInput = {};
+
+    if (body.name !== undefined) {
+      const name = String(body.name).trim();
+      if (!name) throw new BadRequestException('name cannot be empty');
+
+      const clash = await this.prisma.venue_stations.findFirst({
+        where: {
+          venue_id: venueId,
+          id: { not: stationId },
+          name: { equals: name, mode: 'insensitive' },
+        },
+        select: { id: true },
+      });
+      if (clash) {
+        throw new BadRequestException('name already exists for this venue');
+      }
+      data.name = name;
+    }
+
+    if (body.station_type !== undefined) {
+      data.station_type = body.station_type as VenueStationType;
+    }
+    if (body.is_active !== undefined) {
+      data.is_active = Boolean(body.is_active);
+    }
+    if (body.sort_order !== undefined) {
+      data.sort_order = body.sort_order;
+    }
+
+    return this.prisma.venue_stations.update({
+      where: { id: stationId },
+      data,
+    });
+  }
+
+  async deleteVenueStation(
+    venueId: string,
+    stationId: string,
+  ): Promise<venue_stations> {
+    await this.getVenue(venueId);
+
+    const existing = await this.prisma.venue_stations.findUnique({
+      where: { id: stationId },
+    });
+    if (!existing || existing.venue_id !== venueId) {
+      throw new NotFoundException('Station not found');
+    }
+
+    const [entriesCount, barSalesCount, cloakroomSalesCount, tableSalesCount] =
+      await this.prisma.$transaction([
+        this.prisma.entries.count({ where: { station_id: stationId } }),
+        this.prisma.bar_sales.count({ where: { station_id: stationId } }),
+        this.prisma.cloakroom_sales.count({ where: { station_id: stationId } }),
+        this.prisma.table_sales.count({ where: { station_id: stationId } }),
+      ]);
+
+    if (entriesCount + barSalesCount + cloakroomSalesCount + tableSalesCount > 0) {
+      throw new BadRequestException(
+        'Cannot delete station: operational records are already linked to it',
+      );
+    }
+
+    return this.prisma.venue_stations.delete({ where: { id: stationId } });
   }
 
   async createVenueTablesBulk(
@@ -823,6 +2475,280 @@ export class VenuesService {
       promosCount,
       reservationsCount,
       totalReservationAmount,
+    };
+  }
+
+  async getAnalyticsOverview(venueId: string, eventId?: string) {
+    await this.getVenue(venueId);
+    if (eventId) {
+      await this.ensureEventBelongsToVenue(eventId, venueId);
+    }
+
+    const eventFilter = eventId ? { id: eventId } : { venue_id: venueId };
+    const reservationFilter = eventId
+      ? { event_id: eventId }
+      : { event: { venue_id: venueId } };
+    const stayFilter = eventId
+      ? { venue_id: venueId, event_id: eventId, duration_ms: { not: null } }
+      : { venue_id: venueId, duration_ms: { not: null } };
+
+    const [eventsCount, reservationsCount, entriesCount, ticketOrdersCount, stayAgg, revenue] =
+      await Promise.all([
+        this.prisma.events.count({ where: eventFilter }),
+        this.prisma.reservations.count({ where: reservationFilter }),
+        this.prisma.entries.count({
+          where: eventId ? { event_id: eventId } : { event: { venue_id: venueId } },
+        }),
+        this.prisma.ticket_orders.count({
+          where: eventId ? { event_id: eventId } : { event: { venue_id: venueId } },
+        }),
+        this.prisma.venue_stays.aggregate({
+          where: stayFilter,
+          _avg: { duration_ms: true },
+        }),
+        this.getRevenueBreakdown(venueId, eventId),
+      ]);
+
+    return {
+      venue_id: venueId,
+      event_id: eventId ?? null,
+      generated_at: new Date().toISOString(),
+      overview: {
+        eventsCount,
+        reservationsCount,
+        entriesCount,
+        ticketOrdersCount,
+        avgStayMinutes: this.round(
+          this.decimalToNumber(stayAgg._avg.duration_ms) / 60000,
+          1,
+        ),
+        totalRevenue: revenue.totals.totalRevenue,
+        entryRevenue: revenue.totals.entryRevenue,
+        barRevenue: revenue.totals.barRevenue,
+        cloakroomRevenue: revenue.totals.cloakroomRevenue,
+        tableRevenue: revenue.totals.tableRevenue,
+      },
+    };
+  }
+
+  async getAnalyticsDemographics(venueId: string, eventId?: string) {
+    await this.getVenue(venueId);
+    if (eventId) {
+      await this.ensureEventBelongsToVenue(eventId, venueId);
+    }
+
+    const analytics = await this.getAnalytics(venueId);
+    if (!eventId) {
+      return {
+        venue_id: venueId,
+        generated_at: analytics.generated_at,
+        audience: analytics.audience,
+        avgStayMinutes: analytics.overview.avgStayMinutes,
+      };
+    }
+
+    const eventSummary = (analytics.events as AnalyticsEventSummary[]).find(
+      (event) => event.event_id === eventId,
+    );
+    return {
+      venue_id: venueId,
+      event_id: eventId,
+      generated_at: analytics.generated_at,
+      audience: {
+        averageAge: eventSummary?.averageAge ?? null,
+        genderSplit: [
+          { label: 'Donna', count: eventSummary?.women ?? 0 },
+          { label: 'Uomo', count: eventSummary?.men ?? 0 },
+          { label: 'Altro', count: eventSummary?.other ?? 0 },
+          { label: 'Non dichiarato', count: eventSummary?.unknown ?? 0 },
+        ],
+        ageBuckets: analytics.audience.ageBuckets,
+      },
+      note:
+        'Le fasce eta sono aggregate a livello venue finche venue_stays/event_presence_events non vengono materializzati per singolo evento.',
+    };
+  }
+
+  async getRevenueBreakdown(venueId: string, eventId?: string) {
+    await this.getVenue(venueId);
+    if (eventId) {
+      await this.ensureEventBelongsToVenue(eventId, venueId);
+    }
+
+    const eventIdSql = eventId ?? null;
+
+    const [paidEntryReservationsAgg, directEntriesAgg, barAgg, cloakAgg, tableAgg, stationRows] =
+      await Promise.all([
+        this.prisma.reservations.aggregate({
+          where: {
+            ...(eventId
+              ? { event_id: eventId }
+              : { event: { venue_id: venueId } }),
+            type: ReservationType.entry,
+            status: { in: [ReservationStatus.confirmed, ReservationStatus.completed] },
+            total_amount: { not: null },
+          },
+          _sum: { total_amount: true },
+        }),
+        this.prisma.$queryRaw<Array<{ total: Prisma.Decimal | null }>>(
+          Prisma.sql`
+            SELECT COALESCE(SUM(e."price"), 0) AS total
+            FROM "entries" e
+            JOIN "events" ev ON ev."id" = e."event_id"
+            LEFT JOIN "reservations" r ON r."checkin_entry_id" = e."id"
+            WHERE ev."venue_id" = ${venueId}::uuid
+              AND (${eventIdSql}::uuid IS NULL OR e."event_id" = ${eventIdSql}::uuid)
+              AND (r."id" IS NULL OR r."total_amount" IS NULL)
+          `,
+        ),
+        this.prisma.bar_sales.aggregate({
+          where: eventId
+            ? { event_id: eventId }
+            : { event: { venue_id: venueId } },
+          _sum: { amount: true },
+        }),
+        this.prisma.cloakroom_sales.aggregate({
+          where: eventId
+            ? { event_id: eventId }
+            : { event: { venue_id: venueId } },
+          _sum: { amount: true },
+        }),
+        this.prisma.event_tables.aggregate({
+          where: eventId
+            ? { event_id: eventId }
+            : { event: { venue_id: venueId } },
+          _sum: { pagato_totale: true },
+        }),
+        this.prisma.$queryRaw<
+          Array<{
+            channel: string;
+            station_id: string | null;
+            station_name: string;
+            station_type: string;
+            total_amount: Prisma.Decimal | null;
+            transaction_count: bigint | number;
+            last_activity_at: Date | null;
+          }>
+        >(Prisma.sql`
+          SELECT
+            rows.channel,
+            rows.station_id,
+            rows.station_name,
+            rows.station_type,
+            SUM(rows.total_amount) AS total_amount,
+            SUM(rows.transaction_count) AS transaction_count,
+            MAX(rows.last_activity_at) AS last_activity_at
+          FROM (
+            SELECT
+              'entry' AS channel,
+              e."station_id" AS station_id,
+              COALESCE(vs."name", 'Ingresso non assegnato') AS station_name,
+              COALESCE(vs."station_type"::text, 'entry') AS station_type,
+              COALESCE(SUM(e."price"), 0) AS total_amount,
+              COUNT(*)::bigint AS transaction_count,
+              MAX(e."created_at") AS last_activity_at
+            FROM "entries" e
+            JOIN "events" ev ON ev."id" = e."event_id"
+            LEFT JOIN "venue_stations" vs ON vs."id" = e."station_id"
+            WHERE ev."venue_id" = ${venueId}::uuid
+              AND (${eventIdSql}::uuid IS NULL OR e."event_id" = ${eventIdSql}::uuid)
+            GROUP BY e."station_id", vs."name", vs."station_type"
+
+            UNION ALL
+
+            SELECT
+              'bar' AS channel,
+              s."station_id" AS station_id,
+              COALESCE(vs."name", 'Bar non assegnato') AS station_name,
+              COALESCE(vs."station_type"::text, 'bar') AS station_type,
+              COALESCE(SUM(s."amount"), 0) AS total_amount,
+              COUNT(*)::bigint AS transaction_count,
+              MAX(s."created_at") AS last_activity_at
+            FROM "bar_sales" s
+            JOIN "events" ev ON ev."id" = s."event_id"
+            LEFT JOIN "venue_stations" vs ON vs."id" = s."station_id"
+            WHERE ev."venue_id" = ${venueId}::uuid
+              AND (${eventIdSql}::uuid IS NULL OR s."event_id" = ${eventIdSql}::uuid)
+            GROUP BY s."station_id", vs."name", vs."station_type"
+
+            UNION ALL
+
+            SELECT
+              'cloakroom' AS channel,
+              s."station_id" AS station_id,
+              COALESCE(vs."name", 'Guardaroba non assegnato') AS station_name,
+              COALESCE(vs."station_type"::text, 'cloakroom') AS station_type,
+              COALESCE(SUM(s."amount"), 0) AS total_amount,
+              COUNT(*)::bigint AS transaction_count,
+              MAX(s."created_at") AS last_activity_at
+            FROM "cloakroom_sales" s
+            JOIN "events" ev ON ev."id" = s."event_id"
+            LEFT JOIN "venue_stations" vs ON vs."id" = s."station_id"
+            WHERE ev."venue_id" = ${venueId}::uuid
+              AND (${eventIdSql}::uuid IS NULL OR s."event_id" = ${eventIdSql}::uuid)
+            GROUP BY s."station_id", vs."name", vs."station_type"
+
+            UNION ALL
+
+            SELECT
+              'table' AS channel,
+              s."station_id" AS station_id,
+              COALESCE(vs."name", 'Tavoli non assegnati') AS station_name,
+              COALESCE(vs."station_type"::text, 'table') AS station_type,
+              COALESCE(SUM(s."amount"), 0) AS total_amount,
+              COUNT(*)::bigint AS transaction_count,
+              MAX(s."created_at") AS last_activity_at
+            FROM "table_sales" s
+            LEFT JOIN "event_tables" et ON et."id" = s."event_table_id"
+            JOIN "events" ev ON ev."id" = COALESCE(s."event_id", et."event_id")
+            LEFT JOIN "venue_stations" vs ON vs."id" = s."station_id"
+            WHERE ev."venue_id" = ${venueId}::uuid
+              AND (${eventIdSql}::uuid IS NULL OR COALESCE(s."event_id", et."event_id") = ${eventIdSql}::uuid)
+            GROUP BY s."station_id", vs."name", vs."station_type"
+          ) AS rows
+          GROUP BY rows.channel, rows.station_id, rows.station_name, rows.station_type
+          ORDER BY SUM(rows.total_amount) DESC, SUM(rows.transaction_count) DESC
+        `),
+      ]);
+
+    const reservationEntryRevenue = this.decimalToNumber(
+      paidEntryReservationsAgg._sum.total_amount,
+    );
+    const directEntryRevenue = this.decimalToNumber(directEntriesAgg[0]?.total ?? null);
+    const entryRevenue = reservationEntryRevenue + directEntryRevenue;
+    const barRevenue = this.decimalToNumber(barAgg._sum.amount);
+    const cloakroomRevenue = this.decimalToNumber(cloakAgg._sum.amount);
+    const tableRevenue = this.decimalToNumber(tableAgg._sum.pagato_totale);
+    const totalRevenue = entryRevenue + barRevenue + cloakroomRevenue + tableRevenue;
+
+    const stations = stationRows.map((row) => ({
+      channel: row.channel,
+      station_id: row.station_id,
+      station_name: row.station_name,
+      station_type: row.station_type,
+      total_amount: this.round(this.decimalToNumber(row.total_amount), 2),
+      transaction_count: Number(row.transaction_count ?? 0),
+      last_activity_at: row.last_activity_at?.toISOString() ?? null,
+    }));
+
+    return {
+      venue_id: venueId,
+      event_id: eventId ?? null,
+      generated_at: new Date().toISOString(),
+      totals: {
+        reservationEntryRevenue: this.round(reservationEntryRevenue, 2),
+        directEntryRevenue: this.round(directEntryRevenue, 2),
+        entryRevenue: this.round(entryRevenue, 2),
+        barRevenue: this.round(barRevenue, 2),
+        cloakroomRevenue: this.round(cloakroomRevenue, 2),
+        tableRevenue: this.round(tableRevenue, 2),
+        totalRevenue: this.round(totalRevenue, 2),
+      },
+      stations,
+      stationTypeCatalog: Object.values(VenueStationType).map((type) => ({
+        key: type,
+        label: this.stationTypeLabel(type),
+      })),
     };
   }
 

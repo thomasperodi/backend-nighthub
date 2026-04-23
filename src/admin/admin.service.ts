@@ -638,6 +638,7 @@ export class AdminService {
     const [
       allVenues,
       openStaysByVenue,
+      monthStaysByVenue,
       tableCapacityByVenue,
       monthPaidOrders,
       monthTableReservations,
@@ -676,6 +677,11 @@ export class AdminService {
       this.prisma.venue_stays.groupBy({
         by: ['venue_id'],
         where: { exited_at: null },
+        _count: { _all: true },
+      }),
+      this.prisma.venue_stays.groupBy({
+        by: ['venue_id'],
+        where: { entered_at: { gte: monthStart, lt: nextMonthStart } },
         _count: { _all: true },
       }),
       this.prisma.venue_tables.groupBy({
@@ -737,6 +743,11 @@ export class AdminService {
     const openStaysMap = new Map<string, number>();
     for (const row of openStaysByVenue) {
       openStaysMap.set(row.venue_id, row._count._all);
+    }
+
+    const monthStaysMap = new Map<string, number>();
+    for (const row of monthStaysByVenue) {
+      monthStaysMap.set(row.venue_id, row._count._all);
     }
 
     const capacityMap = new Map<string, number>();
@@ -823,6 +834,7 @@ export class AdminService {
         venue.stripe_charges_enabled && venue.stripe_payouts_enabled;
       const eventsActive = eventsActiveMap.get(venue.id) ?? 0;
       const eventsCompletedMonth = eventsCompletedMap.get(venue.id) ?? 0;
+      const analyzedPeopleMonth = monthStaysMap.get(venue.id) ?? 0;
       const contract = this.estimateContract({
         id: venue.id,
         name: venue.name,
@@ -848,6 +860,7 @@ export class AdminService {
         revenue: Math.round((revenueMap.get(venue.id) ?? 0) * 100) / 100,
         eventsActive,
         eventsCompletedMonth,
+        analyzedPeopleMonth,
         contractExpiresAt: contract.expiresAt.toISOString(),
         contractDaysLeft: contract.daysLeft,
         contractEstimated: contract.estimated,

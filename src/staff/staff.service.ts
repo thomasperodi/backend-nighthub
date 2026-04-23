@@ -8,6 +8,7 @@ import {
   EntryMethod,
   Gender,
   Prisma,
+  VenueStationType,
   bar_sales,
   cloakroom_sales,
   table_sales,
@@ -58,6 +59,89 @@ export class StaffService {
     const venueId = u?.venue_id ?? null;
     if (!venueId) throw new BadRequestException('staff user has no venue_id');
     return venueId;
+  }
+
+  private async resolveVenueIdFromEventId(eventId: string): Promise<string> {
+    const event = await this.prisma.events.findUnique({
+      where: { id: eventId },
+      select: { venue_id: true },
+    });
+    if (!event) throw new NotFoundException('Event not found');
+    return event.venue_id;
+  }
+
+  private async resolveEventContextFromEventTableId(eventTableId: string) {
+    const eventTable = await this.prisma.event_tables.findUnique({
+      where: { id: eventTableId },
+      select: {
+        event_id: true,
+        event: { select: { venue_id: true } },
+      },
+    });
+    if (!eventTable) throw new NotFoundException('Table not found');
+    return {
+      eventId: eventTable.event_id,
+      venueId: eventTable.event.venue_id,
+    };
+  }
+
+  private async resolveStationId(params: {
+    stationId?: string | null;
+    eventId?: string | null;
+    venueId?: string | null;
+    eventTableId?: string | null;
+    stationType: VenueStationType;
+  }): Promise<string | null> {
+    let resolvedVenueId = params.venueId ?? null;
+
+    if (!resolvedVenueId && params.eventId) {
+      resolvedVenueId = await this.resolveVenueIdFromEventId(params.eventId);
+    }
+
+    if (!resolvedVenueId && params.eventTableId) {
+      const eventContext = await this.resolveEventContextFromEventTableId(
+        params.eventTableId,
+      );
+      resolvedVenueId = eventContext.venueId;
+    }
+
+    if (params.stationId) {
+      const station = await this.prisma.venue_stations.findUnique({
+        where: { id: params.stationId },
+        select: {
+          id: true,
+          venue_id: true,
+          station_type: true,
+          is_active: true,
+        },
+      });
+
+      if (!station) throw new NotFoundException('Station not found');
+      if (resolvedVenueId && station.venue_id !== resolvedVenueId) {
+        throw new BadRequestException('station_id does not belong to the event venue');
+      }
+      if (station.station_type !== params.stationType) {
+        throw new BadRequestException('station_id does not match the sale type');
+      }
+      if (!station.is_active) {
+        throw new BadRequestException('station_id is not active');
+      }
+      return station.id;
+    }
+
+    if (!resolvedVenueId) return null;
+
+    const fallbackStation = await this.prisma.venue_stations.findFirst({
+      where: {
+        venue_id: resolvedVenueId,
+        station_type: params.stationType,
+        is_active: true,
+      },
+      orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+      select: { id: true },
+    });
+
+    return fallbackStation?.id ?? null;
   }
 
   private async resolveActiveLiveEventIdForVenue(
@@ -281,6 +365,11 @@ export class StaffService {
       staffId: staffIdInput,
     });
     await this.ensureEvent(eventId);
+    const stationId = await this.resolveStationId({
+      stationId: dto.station_id ?? null,
+      eventId,
+      stationType: VenueStationType.entry,
+    });
 
     const sesso = this.entryTypeToGender(dto.entry_type ?? 'free');
     const method = dto.user_id ? EntryMethod.QR : EntryMethod.RAPIDO;
@@ -295,6 +384,7 @@ export class StaffService {
       () => ({
         event_id: eventId,
         staff_id: dto.staff_id ?? null,
+        station_id: stationId,
         user_id: dto.user_id ?? null,
         sesso,
         price: entryPrice,
@@ -384,11 +474,20 @@ export class StaffService {
         staffId: staffIdInput,
       });
       await this.ensureEvent(eventId);
+      const stationType =
+        kind === 'bar' ? VenueStationType.bar : VenueStationType.cloakroom;
+      const stationId = await this.resolveStationId({
+        stationId: dto.station_id ?? null,
+        eventId,
+        stationType,
+      });
 
       if (kind === 'bar') {
         sale = await this.prisma.bar_sales.create({
           data: {
             event_id: eventId,
+            staff_id: dto.staff_id ?? null,
+            station_id: stationId,
             amount: dto.amount,
           },
         });
@@ -396,6 +495,8 @@ export class StaffService {
         sale = await this.prisma.cloakroom_sales.create({
           data: {
             event_id: eventId,
+            staff_id: dto.staff_id ?? null,
+            station_id: stationId,
             amount: dto.amount,
           },
         });
@@ -407,9 +508,21 @@ export class StaffService {
         );
       }
 
+      const eventContext = await this.resolveEventContextFromEventTableId(
+        dto.event_table_id,
+      );
+      const stationId = await this.resolveStationId({
+        stationId: dto.station_id ?? null,
+        eventTableId: dto.event_table_id,
+        stationType: VenueStationType.table,
+      });
+
       sale = await this.prisma.table_sales.create({
         data: {
+          event_id: eventContext.eventId,
           event_table_id: dto.event_table_id,
+          staff_id: dto.staff_id ?? null,
+          station_id: stationId,
           amount: dto.amount,
         },
       });
@@ -772,9 +885,18 @@ export class StaffService {
   }
 
   // Cameriere: aggiunge pagamento al tavolo
-  async addTablePayment(tableId: string, amount: number) {
+  async addTablePayment(
+    tableId: string,
+    amount: number,
+    options?: { staffId?: string; stationId?: string },
+  ) {
     const table = await this.prisma.event_tables.findUnique({
       where: { id: tableId },
+      select: {
+        id: true,
+        event_id: true,
+        event: { select: { venue_id: true } },
+      },
     });
     if (!table) throw new NotFoundException('Table not found');
 
@@ -782,10 +904,19 @@ export class StaffService {
       throw new BadRequestException('amount must be positive');
     }
 
+    const stationId = await this.resolveStationId({
+      stationId: options?.stationId ?? null,
+      venueId: table.event.venue_id,
+      stationType: VenueStationType.table,
+    });
+
     // Crea record in table_sales
     const sale = await this.prisma.table_sales.create({
       data: {
+        event_id: table.event_id,
         event_table_id: tableId,
+        staff_id: options?.staffId ?? null,
+        station_id: stationId,
         amount,
       },
     });
