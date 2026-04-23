@@ -634,6 +634,8 @@ export class PaymentsService {
     userId: string;
     eventId: string;
     quantity?: number;
+    trackingCode?: string;
+    inviterUserId?: string;
   }) {
     const quantity = this.parseQuantity(params.quantity);
 
@@ -809,6 +811,8 @@ export class PaymentsService {
     userId: string;
     eventId: string;
     quantity?: number;
+    trackingCode?: string;
+    inviterUserId?: string;
   }) {
     const quantity = this.parseQuantity(params.quantity);
 

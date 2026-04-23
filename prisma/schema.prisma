@@ -21,6 +21,12 @@ enum UserRole {
   admin
 }
 
+enum VenuePrRole {
+  responsabile
+  capo_squadra
+  pr
+}
+
 enum EventStatus {
   DRAFT
   LIVE
@@ -93,6 +99,42 @@ enum GroupTableProposalVote {
   pending
 }
 
+enum VenueStationType {
+  entry
+  cloakroom
+  bar
+  table
+}
+
+enum PresenceEventType {
+  enter_venue
+  exit_venue
+  checkin
+  sale
+  reservation_created
+  reservation_checked_in
+}
+
+enum PresenceEventSource {
+  qr_checkin
+  manual_checkin
+  geofence
+  bar_sale
+  cloakroom_sale
+  table_sale
+  reservation
+}
+
+enum ForecastType {
+  attendance
+  list_conversion
+  revenue_total
+  revenue_entry
+  revenue_bar
+  revenue_cloakroom
+  revenue_table
+}
+
 // ===============================
 // USERS
 // ===============================
@@ -127,6 +169,8 @@ model users {
   // 🔥 QUESTI DUE DEVONO ESISTERE ENTRAMBI
   entries        entries[] @relation("UserEntries")
   staff_entries  entries[] @relation("StaffEntries")
+  pr_memberships venue_pr_memberships[] @relation("VenuePrMembershipUser")
+  created_pr_memberships venue_pr_memberships[] @relation("VenuePrMembershipCreator")
 
   reservations  reservations[]
   ticket_orders ticket_orders[]
@@ -181,8 +225,100 @@ model venues {
   tables      venue_tables[]
   promos      promos[]
   users       users[]
+  pr_memberships venue_pr_memberships[]
+  pr_event_assignments venue_pr_event_assignments[]
+  pr_qr_scans venue_pr_qr_scans[]
   venue_stays venue_stays[]
+  stations    venue_stations[]
   group_table_proposals group_table_proposals[]
+}
+
+model venue_pr_memberships {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id             String   @db.Uuid
+  user_id              String   @db.Uuid
+  role                 VenuePrRole
+  parent_membership_id String?  @db.Uuid
+  ref_code             String
+  is_active            Boolean  @default(true)
+  created_by_user_id   String?  @db.Uuid
+  created_at           DateTime @default(now())
+  updated_at           DateTime @updatedAt
+
+  venue               venues                @relation(fields: [venue_id], references: [id], onDelete: Cascade)
+  user                users                 @relation("VenuePrMembershipUser", fields: [user_id], references: [id], onDelete: Cascade)
+  parent_membership   venue_pr_memberships? @relation("VenuePrMembershipHierarchy", fields: [parent_membership_id], references: [id], onDelete: SetNull)
+  child_memberships   venue_pr_memberships[] @relation("VenuePrMembershipHierarchy")
+  created_by_user     users?                @relation("VenuePrMembershipCreator", fields: [created_by_user_id], references: [id], onDelete: SetNull)
+  event_assignments   venue_pr_event_assignments[]
+  qr_scans            venue_pr_qr_scans[]
+  tracked_entries     entries[]             @relation("PrMembershipEntries")
+
+  @@unique([venue_id, user_id])
+  @@unique([venue_id, ref_code])
+  @@index([venue_id, role, is_active])
+  @@index([parent_membership_id])
+}
+
+model venue_pr_event_assignments {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id            String   @db.Uuid
+  event_id            String   @db.Uuid
+  pr_membership_id    String   @db.Uuid
+  is_active           Boolean  @default(true)
+  assigned_by_user_id String?  @db.Uuid
+  created_at          DateTime @default(now())
+  updated_at          DateTime @updatedAt
+
+  venue         venues               @relation(fields: [venue_id], references: [id], onDelete: Cascade)
+  event         events               @relation(fields: [event_id], references: [id], onDelete: Cascade)
+  pr_membership venue_pr_memberships @relation(fields: [pr_membership_id], references: [id], onDelete: Cascade)
+
+  @@unique([event_id, pr_membership_id])
+  @@index([venue_id, event_id, is_active])
+  @@index([pr_membership_id, is_active])
+}
+
+model venue_pr_qr_scans {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id           String   @db.Uuid
+  event_id           String   @db.Uuid
+  pr_membership_id   String   @db.Uuid
+  scanned_by_user_id String?  @db.Uuid
+  guest_user_id      String?  @db.Uuid
+  referral_code      String
+  scanned_at         DateTime @default(now())
+  entry_id           String?  @db.Uuid
+  entered_at         DateTime?
+  metadata           Json?
+  created_at         DateTime @default(now())
+  updated_at         DateTime @updatedAt
+
+  venue         venues               @relation(fields: [venue_id], references: [id], onDelete: Cascade)
+  event         events               @relation(fields: [event_id], references: [id], onDelete: Cascade)
+  pr_membership venue_pr_memberships @relation(fields: [pr_membership_id], references: [id], onDelete: Cascade)
+
+  @@index([venue_id, event_id, scanned_at])
+  @@index([pr_membership_id, scanned_at])
+  @@index([entry_id])
+  @@index([guest_user_id, scanned_at])
+}
+
+model venue_stations {
+  id           String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id     String           @db.Uuid
+  name         String
+  station_type VenueStationType
+  is_active    Boolean          @default(true)
+  sort_order   Int              @default(0)
+  created_at   DateTime         @default(now())
+  updated_at   DateTime         @updatedAt
+
+  venue        venues           @relation(fields: [venue_id], references: [id])
+
+  @@unique([venue_id, name])
+  @@index([venue_id, station_type, is_active])
+  @@index([venue_id, sort_order])
 }
 
 // ===============================
@@ -297,6 +433,7 @@ model venue_stays {
   id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   user_id     String   @db.Uuid
   venue_id    String   @db.Uuid
+  event_id    String?  @db.Uuid
   entered_at  DateTime
   exited_at   DateTime?
   duration_ms Int?
@@ -309,6 +446,7 @@ model venue_stays {
   @@index([user_id, entered_at])
   @@index([venue_id, entered_at])
   @@index([venue_id, exited_at])
+  @@index([event_id, entered_at])
 }
 
 // ===============================
@@ -343,6 +481,8 @@ model events {
   promos      promos[]
   bar_sales   bar_sales[]
   cloakroom_sales cloakroom_sales[]
+  pr_event_assignments venue_pr_event_assignments[]
+  pr_qr_scans venue_pr_qr_scans[]
   group_table_proposals group_table_proposals[]
 
   @@index([venue_id, date])
@@ -430,6 +570,8 @@ model entries {
   event_id   String      @db.Uuid
   user_id    String?     @db.Uuid
   staff_id   String?     @db.Uuid
+  station_id String?     @db.Uuid
+  pr_membership_id String? @db.Uuid
 
   sesso      Gender
   price      Decimal     @default(0)
@@ -441,10 +583,14 @@ model entries {
 
   user       users?      @relation("UserEntries", fields: [user_id], references: [id])
   staff      users?      @relation("StaffEntries", fields: [staff_id], references: [id])
+  pr_membership venue_pr_memberships? @relation("PrMembershipEntries", fields: [pr_membership_id], references: [id], onDelete: SetNull)
 
   @@index([event_id, created_at])
+  @@index([event_id, station_id, created_at])
   @@index([user_id])
   @@index([staff_id])
+  @@index([station_id])
+  @@index([pr_membership_id, created_at])
 }
 
 
@@ -456,12 +602,17 @@ model entries {
 model bar_sales {
   id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   event_id   String   @db.Uuid
+  station_id String?  @db.Uuid
+  staff_id   String?  @db.Uuid
   amount     Decimal
+  metadata   Json?
   created_at DateTime @default(now())
 
   event events @relation(fields: [event_id], references: [id])
 
   @@index([event_id, created_at])
+  @@index([event_id, station_id, created_at])
+  @@index([staff_id, created_at])
 }
 
 // ===============================
@@ -470,12 +621,17 @@ model bar_sales {
 model cloakroom_sales {
   id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   event_id   String   @db.Uuid
+  station_id String?  @db.Uuid
+  staff_id   String?  @db.Uuid
   amount     Decimal
+  metadata   Json?
   created_at DateTime @default(now())
 
   event events @relation(fields: [event_id], references: [id])
 
   @@index([event_id, created_at])
+  @@index([event_id, station_id, created_at])
+  @@index([staff_id, created_at])
 }
 
 // ===============================
@@ -483,13 +639,109 @@ model cloakroom_sales {
 // ===============================
 model table_sales {
   id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_id        String?  @db.Uuid
   event_table_id String   @db.Uuid
+  station_id      String?  @db.Uuid
+  staff_id        String?  @db.Uuid
   amount         Decimal
+  metadata       Json?
   created_at     DateTime @default(now())
 
   event_table event_tables @relation(fields: [event_table_id], references: [id])
 
+  @@index([event_id, created_at])
   @@index([event_table_id, created_at])
+  @@index([event_id, station_id, created_at])
+  @@index([staff_id, created_at])
+}
+
+model event_presence_events {
+  id             String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_id       String              @db.Uuid
+  venue_id       String              @db.Uuid
+  user_id        String?             @db.Uuid
+  reservation_id String?             @db.Uuid
+  entry_id       String?             @db.Uuid
+  station_id     String?             @db.Uuid
+  event_type     PresenceEventType
+  source         PresenceEventSource
+  amount         Decimal?            @db.Decimal(10,2)
+  occurred_at    DateTime
+  metadata       Json?
+  created_at     DateTime            @default(now())
+
+  @@index([event_id, occurred_at])
+  @@index([venue_id, occurred_at])
+  @@index([station_id, occurred_at])
+  @@index([user_id, occurred_at])
+}
+
+model event_analytics_snapshots {
+  id                     String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_id               String   @db.Uuid
+  venue_id               String   @db.Uuid
+  snapshot_date          DateTime @db.Date
+  entries_count          Int      @default(0)
+  unique_attendees       Int      @default(0)
+  reservations_count     Int      @default(0)
+  ticket_orders_count    Int      @default(0)
+  avg_stay_minutes       Decimal? @db.Decimal(10,2)
+  male_count             Int      @default(0)
+  female_count           Int      @default(0)
+  other_gender_count     Int      @default(0)
+  unknown_gender_count   Int      @default(0)
+  age_18_20              Int      @default(0)
+  age_21_24              Int      @default(0)
+  age_25_29              Int      @default(0)
+  age_30_34              Int      @default(0)
+  age_35_plus            Int      @default(0)
+  entry_revenue          Decimal  @default(0) @db.Decimal(12,2)
+  bar_revenue            Decimal  @default(0) @db.Decimal(12,2)
+  cloakroom_revenue      Decimal  @default(0) @db.Decimal(12,2)
+  table_revenue          Decimal  @default(0) @db.Decimal(12,2)
+  total_revenue          Decimal  @default(0) @db.Decimal(12,2)
+  generated_at           DateTime @default(now())
+  updated_at             DateTime @updatedAt
+
+  @@unique([event_id, snapshot_date])
+  @@index([venue_id, snapshot_date])
+}
+
+model event_forecasts {
+  id               String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_id         String       @db.Uuid
+  venue_id         String       @db.Uuid
+  forecast_type    ForecastType
+  model_version    String
+  predicted_value  Decimal      @db.Decimal(12,2)
+  lower_bound      Decimal?     @db.Decimal(12,2)
+  upper_bound      Decimal?     @db.Decimal(12,2)
+  confidence_score Decimal?     @db.Decimal(5,2)
+  features_snapshot Json?
+  generated_at     DateTime     @default(now())
+
+  @@index([event_id, forecast_type, generated_at])
+  @@index([venue_id, forecast_type, generated_at])
+}
+
+model user_copresence_edges {
+  id                      String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id                String?  @db.Uuid
+  user_a_id               String   @db.Uuid
+  user_b_id               String   @db.Uuid
+  first_seen_at           DateTime?
+  last_seen_at            DateTime?
+  same_event_count        Int      @default(0)
+  same_arrival_count      Int      @default(0)
+  same_table_count        Int      @default(0)
+  avg_arrival_gap_seconds Int?
+  strength_score          Decimal? @db.Decimal(8,2)
+  updated_at              DateTime @updatedAt
+
+  @@unique([user_a_id, user_b_id, venue_id])
+  @@index([venue_id, strength_score])
+  @@index([user_a_id, strength_score])
+  @@index([user_b_id, strength_score])
 }
 
 // ===============================

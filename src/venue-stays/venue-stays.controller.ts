@@ -15,6 +15,7 @@ export class VenueStaysController {
     return this.venueStaysService.checkpoint({
       user_id: user.id,
       venue_id: body.venue_id,
+      event_id: body.event_id,
       event_type: body.event_type,
       timestamp: body.timestamp,
     });
@@ -26,6 +27,7 @@ export class VenueStaysController {
     @CurrentUser() user: RequestUser,
     @Query('user_id') userId?: string,
     @Query('venue_id') venueId?: string,
+    @Query('event_id') eventId?: string,
     @Query('limit') limit?: string,
   ) {
     const take = limit ? parseInt(limit, 10) : undefined;
@@ -39,6 +41,7 @@ export class VenueStaysController {
       if (!scopedVenueId) throw new BadRequestException('Missing venue_id for this user');
       return this.venueStaysService.list({
         venue_id: scopedVenueId,
+        event_id: eventId,
         user_id: userId,
         limit: take,
       });
@@ -46,6 +49,7 @@ export class VenueStaysController {
 
     return this.venueStaysService.list({
       venue_id: venueId,
+      event_id: eventId,
       user_id: userId,
       limit: take,
     });

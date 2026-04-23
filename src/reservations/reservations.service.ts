@@ -36,6 +36,18 @@ type TableReservationMeta = {
   table_invites: TableInviteMetaItem[];
 };
 
+type ReservationReferralMeta = {
+  inviter_user_id?: string;
+  tracking_code?: string;
+  pr_code?: string;
+  ref_code?: string;
+  promo_code?: string;
+  pr_membership_id?: string;
+  pr_role?: string;
+  pr_omaggio_default?: boolean;
+  wallet_pass_eligible?: boolean;
+};
+
 const incomingTableInvitationReservationSelect =
   Prisma.validator<Prisma.reservationsSelect>()({
     id: true,
@@ -156,6 +168,126 @@ export class ReservationsService {
     if (typeof value === 'string') return value.trim();
     if (typeof value === 'number') return String(value);
     return '';
+  }
+
+  private asObjectRecord(value: unknown): Record<string, unknown> | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    return value as Record<string, unknown>;
+  }
+
+  private readMetaString(
+    meta: Record<string, unknown> | null,
+    key: string,
+  ): string | undefined {
+    if (!meta) return undefined;
+    const value = meta[key];
+    if (typeof value === 'string') {
+      const normalized = value.trim();
+      return normalized.length ? normalized : undefined;
+    }
+    if (typeof value === 'number') {
+      const normalized = String(value).trim();
+      return normalized.length ? normalized : undefined;
+    }
+    return undefined;
+  }
+
+  private readMetaBoolean(
+    meta: Record<string, unknown> | null,
+    key: string,
+  ): boolean | undefined {
+    if (!meta) return undefined;
+    const value = meta[key];
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value > 0;
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === 'true' || normalized === '1' || normalized === 'yes') {
+        return true;
+      }
+      if (normalized === 'false' || normalized === '0' || normalized === 'no') {
+        return false;
+      }
+    }
+    return undefined;
+  }
+
+  private parseTrackingCodeFromMeta(
+    meta: Record<string, unknown> | null,
+  ): string | undefined {
+    return (
+      this.readMetaString(meta, 'tracking_code') ||
+      this.readMetaString(meta, 'pr_code') ||
+      this.readMetaString(meta, 'ref_code') ||
+      this.readMetaString(meta, 'promo_code')
+    );
+  }
+
+  private roleHasDefaultPrComplimentary(role: unknown): boolean {
+    const normalized = String(role ?? '').trim().toLowerCase();
+    return (
+      normalized === 'responsabile' ||
+      normalized === 'capo_squadra' ||
+      normalized === 'pr'
+    );
+  }
+
+  private isReservationComplimentary(
+    meta: unknown,
+    totalAmount?: Prisma.Decimal | number | string | null,
+  ): boolean {
+    const record = this.asObjectRecord(meta);
+    const fromFlags =
+      this.readMetaBoolean(record, 'pr_omaggio_default') ||
+      this.readMetaBoolean(record, 'entry_omaggio') ||
+      this.readMetaBoolean(record, 'is_complimentary') ||
+      false;
+
+    if (fromFlags) return true;
+    if (totalAmount === null || totalAmount === undefined) return false;
+    const amount = Number(totalAmount);
+    return Number.isFinite(amount) && amount <= 0;
+  }
+
+  private mergeReferralMeta(
+    baseMeta: Record<string, unknown> | null,
+    referral: ReservationReferralMeta,
+  ): Prisma.InputJsonValue | undefined {
+    const merged: Record<string, unknown> = {
+      ...(baseMeta ?? {}),
+    };
+
+    if (referral.inviter_user_id) {
+      merged.inviter_user_id = referral.inviter_user_id;
+    }
+
+    if (referral.tracking_code) {
+      merged.tracking_code = referral.tracking_code;
+      merged.pr_code = referral.pr_code ?? referral.tracking_code;
+      merged.ref_code = referral.ref_code ?? referral.tracking_code;
+      merged.promo_code = referral.promo_code ?? referral.tracking_code;
+    }
+
+    if (referral.pr_membership_id) {
+      merged.pr_membership_id = referral.pr_membership_id;
+    }
+
+    if (referral.pr_role) {
+      merged.pr_role = referral.pr_role;
+    }
+
+    if (referral.pr_omaggio_default !== undefined) {
+      merged.pr_omaggio_default = referral.pr_omaggio_default;
+      merged.entry_omaggio = referral.pr_omaggio_default;
+      merged.is_complimentary = referral.pr_omaggio_default;
+    }
+
+    if (referral.wallet_pass_eligible !== undefined) {
+      merged.wallet_pass_eligible = referral.wallet_pass_eligible;
+    }
+
+    if (!Object.keys(merged).length) return undefined;
+    return merged as Prisma.InputJsonValue;
   }
 
   private getErrorDetails(error: unknown): { code?: string; message: string } {
@@ -708,13 +840,63 @@ export class ReservationsService {
       }
     }
 
+    const incomingMeta = this.asObjectRecord(normalized.meta);
+    const referralCode = this.parseTrackingCodeFromMeta(incomingMeta);
+    const invitedByUserId = this.readMetaString(incomingMeta, 'inviter_user_id');
+    const prMembershipOrFilters: Prisma.venue_pr_membershipsWhereInput[] = [
+      ...(referralCode
+        ? [{ ref_code: { equals: referralCode, mode: 'insensitive' as const } }]
+        : []),
+      ...(invitedByUserId ? [{ user_id: invitedByUserId }] : []),
+    ];
+
+    const prMembership =
+      (referralCode || invitedByUserId) && event?.venue_id
+        ? await this.prisma.venue_pr_memberships.findFirst({
+            where: {
+              venue_id: event.venue_id,
+              is_active: true,
+              OR: prMembershipOrFilters,
+            },
+            select: {
+              id: true,
+              user_id: true,
+              role: true,
+              ref_code: true,
+            },
+          })
+        : null;
+
+    const isPrComplimentaryEntry =
+      type === 'entry' &&
+      Boolean(prMembership && this.roleHasDefaultPrComplimentary(prMembership.role));
+
+    const referralMeta: ReservationReferralMeta | null =
+      prMembership || referralCode || invitedByUserId
+        ? {
+            inviter_user_id: prMembership?.user_id ?? invitedByUserId,
+            tracking_code: prMembership?.ref_code ?? referralCode,
+            pr_code: prMembership?.ref_code ?? referralCode,
+            ref_code: prMembership?.ref_code ?? referralCode,
+            promo_code: prMembership?.ref_code ?? referralCode,
+            pr_membership_id: prMembership?.id,
+            pr_role: prMembership?.role,
+            pr_omaggio_default: isPrComplimentaryEntry,
+            wallet_pass_eligible: isPrComplimentaryEntry,
+          }
+        : null;
+
     const venueTableId: string | null | undefined =
       normalized.venue_table_id ?? null;
     const tableName = this.normalizeTableName(normalized.table_name);
-    const reservationMeta =
+    const tableReservationMeta =
       type === 'table'
         ? await this.buildTableReservationMeta(normalized.meta, userId)
         : undefined;
+    const reservationMeta = this.mergeReferralMeta(
+      this.asObjectRecord(tableReservationMeta ?? incomingMeta),
+      referralMeta ?? {},
+    );
 
     let totalAmount: Prisma.Decimal | undefined;
     if (
@@ -726,6 +908,10 @@ export class ReservationsService {
         throw new BadRequestException('total_amount must be a number >= 0');
       }
       totalAmount = new Prisma.Decimal(n);
+    }
+
+    if (isPrComplimentaryEntry && type === 'entry') {
+      totalAmount = new Prisma.Decimal(0);
     }
 
     if (type === 'table') {
@@ -1017,10 +1203,16 @@ export class ReservationsService {
           ? Gender.F
           : Gender.ALTRO;
 
+    const reservationIsComplimentary = this.isReservationComplimentary(
+      reservation.meta,
+      reservation.total_amount,
+    );
+
     const entryPrice = await resolveEntryUnitPrice({
       prisma: this.prisma,
       eventId,
       gender,
+      isComplimentary: reservationIsComplimentary,
     });
 
     const result = await this.prisma.$transaction(async (tx) => {

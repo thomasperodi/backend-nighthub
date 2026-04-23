@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
@@ -29,11 +30,38 @@ const revokedTokens = new Set<string>();
 @Injectable()
 export class AuthService {
   private readonly activityThrottleMs = 60 * 1000;
+  private readonly logger = new Logger(AuthService.name);
 
   constructor(
     private prisma: PrismaService,
     private jwtService: JwtService,
   ) {}
+
+  private isTransientPrismaConnectivityError(error: unknown): boolean {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      return (
+        error.code === 'P1001' ||
+        error.code === 'P1002' ||
+        error.code === 'P1017'
+      );
+    }
+
+    if (error instanceof Prisma.PrismaClientInitializationError) {
+      return true;
+    }
+
+    if (error instanceof Prisma.PrismaClientUnknownRequestError) {
+      const msg = String(error.message || '').toLowerCase();
+      return (
+        msg.includes('server has closed the connection') ||
+        msg.includes('connection reset') ||
+        msg.includes('connection closed') ||
+        msg.includes("can't reach database server")
+      );
+    }
+
+    return false;
+  }
 
   async touchUserActivity(userId: string, observedAt: Date = new Date()) {
     if (!userId) {
@@ -44,20 +72,33 @@ export class AuthService {
       throw new BadRequestException('observedAt invalid');
     }
 
-    const throttleBefore = new Date(observedAt.getTime() - this.activityThrottleMs);
+    const throttleBefore = new Date(
+      observedAt.getTime() - this.activityThrottleMs,
+    );
 
-    await (this.prisma as any).users.updateMany({
-      where: {
-        id: userId,
-        OR: [
-          { last_active_at: null },
-          { last_active_at: { lt: throttleBefore } },
-        ],
-      },
-      data: {
-        last_active_at: observedAt,
-      },
-    });
+    try {
+      await this.prisma.users.updateMany({
+        where: {
+          id: userId,
+          OR: [
+            { last_active_at: null },
+            { last_active_at: { lt: throttleBefore } },
+          ],
+        },
+        data: {
+          last_active_at: observedAt,
+        },
+      });
+    } catch (error) {
+      // Activity tracking should be best-effort and must not break authenticated requests.
+      if (this.isTransientPrismaConnectivityError(error)) {
+        this.logger.warn(
+          `Skipping activity update for user ${userId}: temporary database connectivity issue.`,
+        );
+      } else {
+        throw error;
+      }
+    }
 
     return {
       user_id: userId,

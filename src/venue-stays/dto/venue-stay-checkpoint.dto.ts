@@ -4,6 +4,10 @@ export class VenueStayCheckpointDto {
   @IsString()
   venue_id!: string;
 
+  @IsOptional()
+  @IsString()
+  event_id?: string;
+
   @IsIn(['enter', 'exit'])
   event_type!: 'enter' | 'exit';
 

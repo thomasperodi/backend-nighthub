@@ -362,9 +362,16 @@ export class StaffController {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       return this.staffService
         .assertEventTableBelongsToVenue(tableId, user.venue_id)
-        .then(() => this.staffService.addTablePayment(tableId, dto.amount));
+        .then(() =>
+          this.staffService.addTablePayment(tableId, dto.amount, {
+            staffId: user.id,
+            stationId: dto.station_id,
+          }),
+        );
     }
-    return this.staffService.addTablePayment(tableId, dto.amount);
+    return this.staffService.addTablePayment(tableId, dto.amount, {
+      stationId: dto.station_id,
+    });
   }
 
   // Cameriere: lista tavoli assegnati/visibili

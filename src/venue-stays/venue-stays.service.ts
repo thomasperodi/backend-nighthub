@@ -8,13 +8,25 @@ export class VenueStaysService {
   async checkpoint(params: {
     user_id: string;
     venue_id: string;
+    event_id?: string;
     event_type: 'enter' | 'exit';
     timestamp?: string;
   }) {
-    const { user_id, venue_id, event_type, timestamp } = params;
+    const { user_id, venue_id, event_id, event_type, timestamp } = params;
 
     if (!user_id) throw new BadRequestException('user_id required');
     if (!venue_id) throw new BadRequestException('venue_id required');
+
+    if (event_id) {
+      const event = await this.prisma.events.findUnique({
+        where: { id: event_id },
+        select: { id: true, venue_id: true },
+      });
+      if (!event) throw new NotFoundException('Event not found');
+      if (event.venue_id !== venue_id) {
+        throw new BadRequestException('event_id does not belong to venue_id');
+      }
+    }
 
     const enteredAt = timestamp ? new Date(timestamp) : new Date();
     if (Number.isNaN(enteredAt.getTime())) {
@@ -23,7 +35,7 @@ export class VenueStaysService {
 
     if (event_type === 'enter') {
       const openStay = await this.prisma.venue_stays.findFirst({
-        where: { user_id, venue_id, exited_at: null },
+        where: { user_id, venue_id, event_id: event_id ?? null, exited_at: null },
         orderBy: { entered_at: 'desc' },
       });
 
@@ -33,13 +45,14 @@ export class VenueStaysService {
         data: {
           user_id,
           venue_id,
+          event_id: event_id ?? null,
           entered_at: enteredAt,
         },
       });
     }
 
     const openStay = await this.prisma.venue_stays.findFirst({
-      where: { user_id, venue_id, exited_at: null },
+      where: { user_id, venue_id, event_id: event_id ?? null, exited_at: null },
       orderBy: { entered_at: 'desc' },
     });
 
@@ -62,12 +75,14 @@ export class VenueStaysService {
   async list(params: {
     user_id?: string;
     venue_id?: string;
+    event_id?: string;
     limit?: number;
   }) {
     const take = Math.min(Math.max(params.limit ?? 100, 1), 500);
 
     return this.prisma.venue_stays.findMany({
       where: {
+        event_id: params.event_id,
         user_id: params.user_id,
         venue_id: params.venue_id,
       },

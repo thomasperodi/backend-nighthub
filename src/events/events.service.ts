@@ -2,7 +2,9 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import {
   DiscountType,
@@ -45,10 +47,70 @@ type TablePricingOverrideInput = {
 
 @Injectable()
 export class EventsService {
+  private readonly logger = new Logger(EventsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: SupabaseStorageService,
   ) {}
+
+  private isTransientPrismaConnectivityError(error: unknown): boolean {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      return (
+        error.code === 'P1001' ||
+        error.code === 'P1002' ||
+        error.code === 'P1017'
+      );
+    }
+
+    if (error instanceof Prisma.PrismaClientInitializationError) {
+      return true;
+    }
+
+    if (error instanceof Prisma.PrismaClientUnknownRequestError) {
+      const msg = String(error.message || '').toLowerCase();
+      return (
+        msg.includes('server has closed the connection') ||
+        msg.includes('connection reset') ||
+        msg.includes('connection closed') ||
+        msg.includes("can't reach database server")
+      );
+    }
+
+    return false;
+  }
+
+  private async runPrismaQueryWithRetry<T>(
+    operationName: string,
+    query: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await query();
+    } catch (error) {
+      if (!this.isTransientPrismaConnectivityError(error)) {
+        throw error;
+      }
+
+      this.logger.warn(
+        `${operationName} failed due to temporary database connectivity issue. Retrying once.`,
+      );
+
+      try {
+        return await query();
+      } catch (retryError) {
+        if (!this.isTransientPrismaConnectivityError(retryError)) {
+          throw retryError;
+        }
+
+        this.logger.error(
+          `${operationName} failed after retry: temporary database connectivity issue persists.`,
+        );
+        throw new ServiceUnavailableException(
+          'Servizio eventi temporaneamente non disponibile. Riprova tra pochi secondi.',
+        );
+      }
+    }
+  }
 
   private getEventsTimeZone(): string {
     // Events times (date + @db.Time) are intended as local venue time.
@@ -186,8 +248,12 @@ export class EventsService {
 
     let total: number | undefined;
     if (params.withTotal) {
-      const rows = await this.prisma.$queryRaw<Array<{ total: number }>>(
-        Prisma.sql`SELECT COUNT(*)::int AS total ${whereBase}`,
+      const rows = await this.runPrismaQueryWithRetry(
+        'events.listEventIdsByComputedStatus.count',
+        () =>
+          this.prisma.$queryRaw<Array<{ total: number }>>(
+            Prisma.sql`SELECT COUNT(*)::int AS total ${whereBase}`,
+          ),
       );
       total = rows?.[0]?.total ?? 0;
     }
@@ -197,13 +263,17 @@ export class EventsService {
         ? Prisma.sql` LIMIT ${take} OFFSET ${skip}`
         : Prisma.empty;
 
-    const idRows = await this.prisma.$queryRaw<Array<{ id: string }>>(
-      Prisma.sql`
-        SELECT e."id"
-        ${whereBase}
-        ORDER BY e."date" ASC, e."start_time" ASC NULLS LAST
-        ${limitOffset}
-      `,
+    const idRows = await this.runPrismaQueryWithRetry(
+      'events.listEventIdsByComputedStatus.ids',
+      () =>
+        this.prisma.$queryRaw<Array<{ id: string }>>(
+          Prisma.sql`
+            SELECT e."id"
+            ${whereBase}
+            ORDER BY e."date" ASC, e."start_time" ASC NULLS LAST
+            ${limitOffset}
+          `,
+        ),
     );
 
     return { ids: idRows.map((r) => r.id), total };
@@ -773,40 +843,44 @@ export class EventsService {
 
       if (!ids.length) return [] as events[];
 
-      const rows = await this.prisma.events.findMany({
-        where: { id: { in: ids } },
-        orderBy: [{ date: 'asc' }, { start_time: 'asc' }],
-        select: {
-          id: true,
-          venue_id: true,
-          name: true,
-          description: true,
-          image: true,
-          is_featured: true,
-          date: true,
-          start_time: true,
-          end_time: true,
-          status: true,
-          created_at: true,
-          updated_at: true,
-          promos: {
-            where: { status: PromoStatus.active },
-            orderBy: { created_at: 'desc' },
-            take: 3,
+      const rows = await this.runPrismaQueryWithRetry(
+        'events.listEvents.findManyByIds',
+        () =>
+          this.prisma.events.findMany({
+            where: { id: { in: ids } },
+            orderBy: [{ date: 'asc' }, { start_time: 'asc' }],
             select: {
               id: true,
               venue_id: true,
-              event_id: true,
-              title: true,
+              name: true,
               description: true,
-              discount_type: true,
-              discount_value: true,
+              image: true,
+              is_featured: true,
+              date: true,
+              start_time: true,
+              end_time: true,
               status: true,
               created_at: true,
+              updated_at: true,
+              promos: {
+                where: { status: PromoStatus.active },
+                orderBy: { created_at: 'desc' },
+                take: 3,
+                select: {
+                  id: true,
+                  venue_id: true,
+                  event_id: true,
+                  title: true,
+                  description: true,
+                  discount_type: true,
+                  discount_value: true,
+                  status: true,
+                  created_at: true,
+                },
+              },
             },
-          },
-        },
-      });
+          }),
+      );
 
       const byId = new Map(rows.map((r) => [r.id, r]));
       const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
@@ -819,40 +893,44 @@ export class EventsService {
       return ordered.map((e) => this.serializeEvent(e)) as any;
     }
 
-    const list = await this.prisma.events.findMany({
-      where,
-      orderBy: [{ date: 'asc' }, { start_time: 'asc' }],
-      select: {
-        id: true,
-        venue_id: true,
-        name: true,
-        description: true,
-        image: true,
-        is_featured: true,
-        date: true,
-        start_time: true,
-        end_time: true,
-        status: true,
-        created_at: true,
-        updated_at: true,
-        promos: {
-          where: { status: PromoStatus.active },
-          orderBy: { created_at: 'desc' },
-          take: 3,
+    const list = await this.runPrismaQueryWithRetry(
+      'events.listEvents.findMany',
+      () =>
+        this.prisma.events.findMany({
+          where,
+          orderBy: [{ date: 'asc' }, { start_time: 'asc' }],
           select: {
             id: true,
             venue_id: true,
-            event_id: true,
-            title: true,
+            name: true,
             description: true,
-            discount_type: true,
-            discount_value: true,
+            image: true,
+            is_featured: true,
+            date: true,
+            start_time: true,
+            end_time: true,
             status: true,
             created_at: true,
+            updated_at: true,
+            promos: {
+              where: { status: PromoStatus.active },
+              orderBy: { created_at: 'desc' },
+              take: 3,
+              select: {
+                id: true,
+                venue_id: true,
+                event_id: true,
+                title: true,
+                description: true,
+                discount_type: true,
+                discount_value: true,
+                status: true,
+                created_at: true,
+              },
+            },
           },
-        },
-      },
-    });
+        }),
+    );
 
     if (this.isDebugEventsEnabled()) {
       console.log('[events.service] listEvents db results', {
@@ -930,39 +1008,43 @@ export class EventsService {
         };
       }
 
-      const rows = await this.prisma.events.findMany({
-        where: { id: { in: ids } },
-        select: {
-          id: true,
-          venue_id: true,
-          name: true,
-          description: true,
-          image: true,
-          is_featured: true,
-          date: true,
-          start_time: true,
-          end_time: true,
-          status: true,
-          created_at: true,
-          updated_at: true,
-          promos: {
-            where: { status: PromoStatus.active },
-            orderBy: { created_at: 'desc' },
-            take: 3,
+      const rows = await this.runPrismaQueryWithRetry(
+        'events.listEventsPaginated.findManyByIds',
+        () =>
+          this.prisma.events.findMany({
+            where: { id: { in: ids } },
             select: {
               id: true,
               venue_id: true,
-              event_id: true,
-              title: true,
+              name: true,
               description: true,
-              discount_type: true,
-              discount_value: true,
+              image: true,
+              is_featured: true,
+              date: true,
+              start_time: true,
+              end_time: true,
               status: true,
               created_at: true,
+              updated_at: true,
+              promos: {
+                where: { status: PromoStatus.active },
+                orderBy: { created_at: 'desc' },
+                take: 3,
+                select: {
+                  id: true,
+                  venue_id: true,
+                  event_id: true,
+                  title: true,
+                  description: true,
+                  discount_type: true,
+                  discount_value: true,
+                  status: true,
+                  created_at: true,
+                },
+              },
             },
-          },
-        },
-      });
+          }),
+      );
 
       const byId = new Map(rows.map((r) => [r.id, r]));
       const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
@@ -988,45 +1070,49 @@ export class EventsService {
     if (requestedStatus === EventStatus.DRAFT) where.status = requestedStatus;
     if (filters?.date) where.date = this.parseDate(filters.date);
 
-    const [total, data] = await this.prisma.$transaction([
-      this.prisma.events.count({ where }),
-      this.prisma.events.findMany({
-        where,
-        orderBy: [{ date: 'asc' }, { start_time: 'asc' }],
-        skip,
-        take,
-        select: {
-          id: true,
-          venue_id: true,
-          name: true,
-          description: true,
-          image: true,
-          is_featured: true,
-          date: true,
-          start_time: true,
-          end_time: true,
-          status: true,
-          created_at: true,
-          updated_at: true,
-          promos: {
-            where: { status: PromoStatus.active },
-            orderBy: { created_at: 'desc' },
-            take: 3,
+    const [total, data] = await this.runPrismaQueryWithRetry(
+      'events.listEventsPaginated.transaction',
+      () =>
+        this.prisma.$transaction([
+          this.prisma.events.count({ where }),
+          this.prisma.events.findMany({
+            where,
+            orderBy: [{ date: 'asc' }, { start_time: 'asc' }],
+            skip,
+            take,
             select: {
               id: true,
               venue_id: true,
-              event_id: true,
-              title: true,
+              name: true,
               description: true,
-              discount_type: true,
-              discount_value: true,
+              image: true,
+              is_featured: true,
+              date: true,
+              start_time: true,
+              end_time: true,
               status: true,
               created_at: true,
+              updated_at: true,
+              promos: {
+                where: { status: PromoStatus.active },
+                orderBy: { created_at: 'desc' },
+                take: 3,
+                select: {
+                  id: true,
+                  venue_id: true,
+                  event_id: true,
+                  title: true,
+                  description: true,
+                  discount_type: true,
+                  discount_value: true,
+                  status: true,
+                  created_at: true,
+                },
+              },
             },
-          },
-        },
-      }),
-    ]);
+          }),
+        ]),
+    );
 
     await Promise.all(
       data.map((e) =>
@@ -1428,10 +1514,14 @@ export class EventsService {
     });
     if (!venueExists) throw new NotFoundException('Venue not found');
 
-    const venueEvents = await this.prisma.events.findMany({
-      where: { venue_id: venueId },
-      select: { id: true },
-    });
+    const venueEvents = await this.runPrismaQueryWithRetry(
+      'events.venueStats.findMany',
+      () =>
+        this.prisma.events.findMany({
+          where: { venue_id: venueId },
+          select: { id: true },
+        }),
+    );
 
     const stats = await Promise.all(
       venueEvents.map((e) => this.getEventStats(e.id)),

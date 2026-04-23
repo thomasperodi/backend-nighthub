@@ -113,6 +113,8 @@ export class PaymentsController {
       userId: user.id,
       eventId: dto.event_id,
       quantity: dto.quantity,
+      trackingCode: dto.tracking_code ?? dto.ref_code ?? dto.pr_code,
+      inviterUserId: dto.inviter_user_id,
     });
   }
 
@@ -142,6 +144,8 @@ export class PaymentsController {
       userId: user.id,
       eventId: dto.event_id,
       quantity: dto.quantity,
+      trackingCode: dto.tracking_code ?? dto.ref_code ?? dto.pr_code,
+      inviterUserId: dto.inviter_user_id,
     });
   }
 

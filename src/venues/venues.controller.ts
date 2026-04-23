@@ -14,10 +14,17 @@ import type { Response } from 'express';
 import { VenuesService } from './venues.service';
 import { EventsService } from '../events/events.service';
 import { CreateVenueDto } from './dto/create-venue.dto';
+import { CreateVenueStationsBulkDto } from './dto/create-venue-stations-bulk.dto';
 import { UpdateVenueDto } from './dto/update-venue.dto';
 import { UpdateVenuePricingDto } from './dto/update-venue-pricing.dto';
 import { CreateVenueTablesBulkDto } from './dto/create-venue-tables-bulk.dto';
+import { UpdateVenueStationDto } from './dto/update-venue-station.dto';
 import { UpdateVenueTableDto } from './dto/update-venue-table.dto';
+import { CreateVenuePrMemberDto } from './dto/create-venue-pr-member.dto';
+import { UpdateVenuePrMemberDto } from './dto/update-venue-pr-member.dto';
+import { AssignPrEventDto } from './dto/assign-pr-event.dto';
+import { RegisterPrScanDto } from './dto/register-pr-scan.dto';
+import { RegisterPrEntryDto } from './dto/register-pr-entry.dto';
 import { Public } from '../auth/public.decorator';
 import { Roles } from '../auth/roles.decorator';
 import { CurrentUser } from '../auth/current-user.decorator';
@@ -38,6 +45,12 @@ export class VenuesController {
       'public, max-age=0, s-maxage=300, stale-while-revalidate=3600',
     );
     return this.venuesService.listVenues();
+  }
+
+  @Get('pr-network/me')
+  @Roles('client', 'staff', 'venue', 'admin')
+  listMyPrMemberships(@CurrentUser() user?: RequestUser) {
+    return this.venuesService.listMyPrVenueMemberships(user);
   }
 
   @Get(':id')
@@ -124,6 +137,120 @@ export class VenuesController {
     return this.venuesService.updateVenuePricing(id, body);
   }
 
+  @Get(':id/users')
+  @Roles('client', 'staff', 'venue', 'admin')
+  listUsersForPrNetwork(
+    @Param('id') id: string,
+    @Query('search') search: string | undefined,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.listAssignableUsersForPr(id, search, user);
+  }
+
+  @Get(':id/pr-network/me')
+  @Roles('client', 'staff', 'venue', 'admin')
+  getMyPrNetworkMembership(
+    @Param('id') id: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.getMyPrNetworkMembership(id, user);
+  }
+
+  @Get(':id/pr-network')
+  @Roles('client', 'staff', 'venue', 'admin')
+  listPrNetworkMembers(
+    @Param('id') id: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.listVenuePrNetworkMembers(id, user);
+  }
+
+  @Post(':id/pr-network')
+  @Roles('client', 'staff', 'venue', 'admin')
+  createPrNetworkMember(
+    @Param('id') id: string,
+    @Body() body: CreateVenuePrMemberDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.createVenuePrNetworkMember(id, body, user);
+  }
+
+  @Patch(':id/pr-network/:memberId')
+  @Roles('client', 'staff', 'venue', 'admin')
+  updatePrNetworkMember(
+    @Param('id') id: string,
+    @Param('memberId') memberId: string,
+    @Body() body: UpdateVenuePrMemberDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.updateVenuePrNetworkMember(id, memberId, body, user);
+  }
+
+  @Delete(':id/pr-network/:memberId')
+  @Roles('client', 'staff', 'venue', 'admin')
+  deletePrNetworkMember(
+    @Param('id') id: string,
+    @Param('memberId') memberId: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.deleteVenuePrNetworkMember(id, memberId, user);
+  }
+
+  @Post(':id/pr-events/assignments')
+  @Roles('client', 'staff', 'venue', 'admin')
+  assignPrToEvent(
+    @Param('id') id: string,
+    @Body() body: AssignPrEventDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.assignPrMemberToEvent(id, body, user);
+  }
+
+  @Get(':id/pr-events/:eventId/assignments')
+  @Roles('client', 'staff', 'venue', 'admin')
+  listPrEventAssignments(
+    @Param('id') id: string,
+    @Param('eventId') eventId: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.listPrEventAssignments(id, eventId, user);
+  }
+
+  @Post(':id/pr-scans')
+  @Roles('client', 'staff', 'venue', 'admin')
+  registerPrQrScan(
+    @Param('id') id: string,
+    @Body() body: RegisterPrScanDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.registerPrQrScan(id, body, user);
+  }
+
+  @Post(':id/pr-scans/:scanId/entry')
+  @Roles('client', 'staff', 'venue', 'admin')
+  registerPrEntry(
+    @Param('id') id: string,
+    @Param('scanId') scanId: string,
+    @Body() body: RegisterPrEntryDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.registerPrEntryFromScan(id, scanId, body, user);
+  }
+
+  @Get(':id/pr-dashboard')
+  @Roles('client', 'staff', 'venue', 'admin')
+  getPrDashboard(
+    @Param('id') id: string,
+    @Query('eventId') eventId: string | undefined,
+    @Query('membershipId') membershipId: string | undefined,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.getPrDashboardStats(id, user, {
+      event_id: eventId,
+      membership_id: membershipId,
+    });
+  }
+
   @Delete(':id')
   @Roles('admin')
   delete(@Param('id') id: string) {
@@ -184,6 +311,51 @@ export class VenuesController {
     return this.venuesService.getAnalytics(id);
   }
 
+  @Get(':id/analytics/overview')
+  @Roles('venue', 'admin')
+  analyticsOverview(
+    @Param('id') id: string,
+    @Query('eventId') eventId?: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.getAnalyticsOverview(id, eventId);
+  }
+
+  @Get(':id/analytics/demographics')
+  @Roles('venue', 'admin')
+  analyticsDemographics(
+    @Param('id') id: string,
+    @Query('eventId') eventId?: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.getAnalyticsDemographics(id, eventId);
+  }
+
+  @Get(':id/analytics/revenue-breakdown')
+  @Roles('venue', 'admin')
+  analyticsRevenueBreakdown(
+    @Param('id') id: string,
+    @Query('eventId') eventId?: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.getRevenueBreakdown(id, eventId);
+  }
+
   @Get(':id/promos')
   @Public()
   promos(@Param('id') id: string, @Res({ passthrough: true }) res?: Response) {
@@ -203,6 +375,65 @@ export class VenuesController {
       'public, max-age=0, s-maxage=300, stale-while-revalidate=3600',
     );
     return this.venuesService.listVenueTables(id);
+  }
+
+  @Get(':id/stations')
+  @Roles('staff', 'venue', 'admin')
+  stations(
+    @Param('id') id: string,
+    @CurrentUser() user?: RequestUser,
+    @Res({ passthrough: true }) res?: Response,
+  ) {
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=120, stale-while-revalidate=600',
+    );
+    if (String(user?.role || '').toLowerCase() !== 'admin') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.listVenueStations(id);
+  }
+
+  @Post(':id/stations')
+  @Roles('venue', 'admin')
+  createStations(
+    @Param('id') id: string,
+    @Body() body: CreateVenueStationsBulkDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+    }
+    return this.venuesService.createVenueStationsBulk(id, body);
+  }
+
+  @Patch(':id/stations/:stationId')
+  @Roles('venue', 'admin')
+  updateStation(
+    @Param('id') id: string,
+    @Param('stationId') stationId: string,
+    @Body() body: UpdateVenueStationDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+    }
+    return this.venuesService.updateVenueStation(id, stationId, body);
+  }
+
+  @Delete(':id/stations/:stationId')
+  @Roles('venue', 'admin')
+  deleteStation(
+    @Param('id') id: string,
+    @Param('stationId') stationId: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+    }
+    return this.venuesService.deleteVenueStation(id, stationId);
   }
 
   @Post(':id/tables')
