@@ -1,4 +1,10 @@
-import { IsEmail, IsOptional, IsString, MinLength } from 'class-validator';
+import {
+  IsEmail,
+  IsOptional,
+  IsString,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 
 export class ForgotPasswordDto {
   @IsOptional()
@@ -13,4 +19,9 @@ export class ForgotPasswordDto {
   @IsString()
   @MinLength(3)
   username?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(1024)
+  redirect_to?: string;
 }

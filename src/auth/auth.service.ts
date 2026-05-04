@@ -10,6 +10,8 @@ import { RegisterDto } from './dto/register.dto';
 import { hash, compare } from 'bcrypt';
 import { Prisma, UserRole, users } from '@prisma/client';
 import { JwtService } from '@nestjs/jwt';
+import { createClient } from '@supabase/supabase-js';
+import { randomBytes } from 'crypto';
 
 export type PublicUser = {
   id: string;
@@ -32,6 +34,7 @@ export class AuthService {
   private readonly activityThrottleMs = 60 * 1000;
   private readonly passwordResetTokenTtlSeconds = 15 * 60;
   private readonly logger = new Logger(AuthService.name);
+  private supabaseAdminClient?: ReturnType<typeof createClient>;
 
   constructor(
     private prisma: PrismaService,
@@ -68,6 +71,152 @@ export class AuthService {
     return String(value || '')
       .trim()
       .toLowerCase();
+  }
+
+  private getSupabaseAdminClient() {
+    if (this.supabaseAdminClient) return this.supabaseAdminClient;
+
+    const url = String(
+      process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || '',
+    ).trim();
+    const serviceRoleKey = String(
+      process.env.SUPABASE_SERVICE_ROLE_KEY ||
+        process.env.EXPO_PUBLIC_SUPABASE_SERVICE_ROLE_KEY ||
+        '',
+    ).trim();
+
+    if (!url || !serviceRoleKey) {
+      throw new BadRequestException(
+        'Supabase Auth non configurato: imposta SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY',
+      );
+    }
+
+    this.supabaseAdminClient = createClient(url, serviceRoleKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+    });
+
+    return this.supabaseAdminClient;
+  }
+
+  private async getEmailFromSupabaseRecoveryAccessToken(
+    accessToken: string,
+  ): Promise<string> {
+    const supabase = this.getSupabaseAdminClient();
+    const { data, error } = await supabase.auth.getUser(accessToken);
+
+    if (error || !data?.user?.email) {
+      throw new BadRequestException(
+        'Token recovery Supabase non valido o scaduto',
+      );
+    }
+
+    return data.user.email.trim().toLowerCase();
+  }
+
+  private isSupabaseForgotPasswordEnabled(): boolean {
+    const provider = String(process.env.FORGOT_PASSWORD_PROVIDER || '').trim();
+    return provider.toLowerCase() === 'supabase';
+  }
+
+  private getSupabaseResetRedirectUrl(overrideRedirectTo?: string): string {
+    const override = String(overrideRedirectTo || '').trim();
+    if (override) {
+      try {
+        const parsed = new URL(override);
+        const allowedProtocols = new Set([
+          'https:',
+          'http:',
+          'nighthub:',
+          'exp:',
+        ]);
+
+        if (allowedProtocols.has(parsed.protocol)) {
+          return override;
+        }
+
+        this.logger.warn(
+          `Ignored unsupported reset redirect protocol: ${parsed.protocol}`,
+        );
+      } catch {
+        this.logger.warn(
+          `Ignored invalid redirect_to for forgot-password: ${override}`,
+        );
+      }
+    }
+
+    return String(
+      process.env.SUPABASE_RESET_REDIRECT_URL ||
+        process.env.APP_RESET_PASSWORD_URL ||
+        process.env.FRONTEND_RESET_PASSWORD_URL ||
+        'nighthub://reset-password',
+    ).trim();
+  }
+
+  private isSupabaseUserAlreadyExistsError(error: unknown): boolean {
+    const maybeError = error as {
+      message?: string;
+      code?: string;
+      status?: number;
+      name?: string;
+    } | null;
+
+    const message = String(maybeError?.message || '').toLowerCase();
+    const code = String(maybeError?.code || '').toLowerCase();
+    const name = String(maybeError?.name || '').toLowerCase();
+    const status = Number(maybeError?.status || 0);
+
+    return (
+      message.includes('already registered') ||
+      message.includes('already been registered') ||
+      message.includes('has already been registered') ||
+      message.includes('user already exists') ||
+      message.includes('duplicate key') ||
+      code.includes('user_already') ||
+      code.includes('email_exists') ||
+      (name.includes('authapierror') && status === 422)
+    );
+  }
+
+  private async ensureSupabaseAuthUser(email: string) {
+    const supabase = this.getSupabaseAdminClient();
+    const temporaryPassword = randomBytes(24).toString('base64url');
+
+    const { error } = await supabase.auth.admin.createUser({
+      email,
+      password: temporaryPassword,
+      email_confirm: true,
+      user_metadata: {
+        source: 'backend-password-reset',
+      },
+    });
+
+    if (error && !this.isSupabaseUserAlreadyExistsError(error)) {
+      throw error;
+    }
+  }
+
+  private async sendSupabasePasswordResetEmail(
+    email: string,
+    redirectTo: string,
+  ): Promise<boolean> {
+    const supabase = this.getSupabaseAdminClient();
+
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo,
+    });
+
+    if (error) {
+      this.logger.warn(
+        `Supabase reset email failed for ${email}: ${error.message}`,
+      );
+      return false;
+    }
+
+    return true;
   }
 
   private buildResetPasswordUrl(token: string): string | null {
@@ -341,7 +490,7 @@ export class AuthService {
     return { access_token, user: publicUser };
   }
 
-  async requestPasswordReset(identifier?: string) {
+  async requestPasswordReset(identifier?: string, redirectTo?: string) {
     const normalizedIdentifier = this.normalizeIdentifier(identifier || '');
     if (!normalizedIdentifier) {
       throw new BadRequestException('identifier required');
@@ -358,6 +507,44 @@ export class AuthService {
 
     if (!user) {
       return genericResponse;
+    }
+
+    if (this.isSupabaseForgotPasswordEnabled()) {
+      const resolvedRedirectTo = this.getSupabaseResetRedirectUrl(redirectTo);
+      let emailSent = false;
+
+      try {
+        await this.ensureSupabaseAuthUser(user.email);
+        emailSent = await this.sendSupabasePasswordResetEmail(
+          user.email,
+          resolvedRedirectTo,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Supabase forgot-password setup failed for ${user.email}: ${String(error)}`,
+        );
+      }
+
+      if (emailSent) {
+        if (process.env.NODE_ENV !== 'production') {
+          return {
+            ...genericResponse,
+            provider: 'supabase',
+            email_sent: emailSent,
+            redirect_to: resolvedRedirectTo,
+          };
+        }
+
+        return genericResponse;
+      }
+
+      if (process.env.NODE_ENV === 'production') {
+        return genericResponse;
+      }
+
+      this.logger.warn(
+        `Supabase reset email non disponibile per ${user.email}: fallback locale attivo (dev only).`,
+      );
     }
 
     const resetToken = this.jwtService.sign(
@@ -379,6 +566,7 @@ export class AuthService {
     if (process.env.NODE_ENV !== 'production') {
       return {
         ...genericResponse,
+        provider: 'legacy',
         reset_token: resetToken,
         expires_in_seconds: this.passwordResetTokenTtlSeconds,
         email_sent: emailSent,
@@ -425,6 +613,51 @@ export class AuthService {
     });
 
     await this.touchUserActivity(payload.sub, new Date());
+
+    return { success: true };
+  }
+
+  async resetPasswordFromSupabaseRecovery(
+    accessToken: string,
+    newPassword: string,
+  ) {
+    if (!accessToken) {
+      throw new BadRequestException('access_token required');
+    }
+
+    if (!newPassword || newPassword.length < 6) {
+      throw new BadRequestException(
+        'La nuova password deve contenere almeno 6 caratteri',
+      );
+    }
+
+    const email =
+      await this.getEmailFromSupabaseRecoveryAccessToken(accessToken);
+
+    const user = await this.prisma.users.findFirst({
+      where: {
+        email: {
+          equals: email,
+          mode: 'insensitive',
+        },
+      },
+    });
+
+    if (!user) {
+      throw new BadRequestException(
+        'Nessun account NightHub associato alla recovery Supabase',
+      );
+    }
+
+    const bcryptHash = hash as (s: string, rounds: number) => Promise<string>;
+    const hashedPassword = await bcryptHash(newPassword, 10);
+
+    await this.prisma.users.update({
+      where: { id: user.id },
+      data: { password_hash: hashedPassword },
+    });
+
+    await this.touchUserActivity(user.id, new Date());
 
     return { success: true };
   }

@@ -6,6 +6,7 @@ import {
   PushTokenDto,
   ForgotPasswordDto,
   ResetPasswordDto,
+  ResetPasswordSupabaseDto,
 } from './dto';
 import { Public } from './public.decorator';
 import { CurrentUser } from './current-user.decorator';
@@ -31,13 +32,22 @@ export class AuthController {
   @Public()
   forgotPassword(@Body() dto: ForgotPasswordDto) {
     const identifier = dto.identifier || dto.email || dto.username;
-    return this.authService.requestPasswordReset(identifier);
+    return this.authService.requestPasswordReset(identifier, dto.redirect_to);
   }
 
   @Post('reset-password')
   @Public()
   resetPassword(@Body() dto: ResetPasswordDto) {
     return this.authService.resetPassword(dto.token, dto.new_password);
+  }
+
+  @Post('reset-password-supabase')
+  @Public()
+  resetPasswordSupabase(@Body() dto: ResetPasswordSupabaseDto) {
+    return this.authService.resetPasswordFromSupabaseRecovery(
+      dto.access_token,
+      dto.new_password,
+    );
   }
 
   @Post('logout')
