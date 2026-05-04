@@ -17,6 +17,7 @@ import { RecordSaleDto } from './dto/record-sale.dto';
 import { EventsService } from '../events/events.service';
 import { UpdateTableHostessDto } from './dto/update-table-hostess.dto';
 import { AddTablePaymentDto } from './dto/add-table-payment.dto';
+import { CreateTableBottleOrderDto } from './dto/create-table-bottle-order.dto';
 import { Roles } from '../auth/roles.decorator';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { RequestUser } from '../auth/types';
@@ -31,20 +32,42 @@ export class StaffController {
 
   @Post('entries')
   async recordEntry(@Body() dto: RecordEntryDto, @CurrentUser() user: RequestUser) {
-    if (user.role !== 'admin') {
-      if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
-      const payload = dto as unknown as {
-        staff_id?: string;
-        event_id?: string;
-        eventId?: string;
-      };
-      payload.staff_id = user.id;
-      const eventId = payload.event_id ?? payload.eventId;
-      if (eventId) {
-        await this.staffService.assertEventBelongsToVenue(eventId, user.venue_id);
+    try {
+      if (user.role !== 'admin') {
+        if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
+        const payload = dto as unknown as {
+          staff_id?: string;
+          event_id?: string;
+          eventId?: string;
+        };
+        payload.staff_id = user.id;
+        const eventId = payload.event_id ?? payload.eventId;
+        if (eventId) {
+          await this.staffService.assertEventBelongsToVenue(eventId, user.venue_id);
+        }
       }
+
+      return this.staffService.recordEntry(dto);
+    } catch (error: any) {
+      console.error('[staff.controller] recordEntry error', {
+        userId: user?.id ?? null,
+        role: user?.role ?? null,
+        venueId: user?.venue_id ?? null,
+        payload: {
+          event_id: (dto as any)?.event_id ?? null,
+          station_id: (dto as any)?.station_id ?? null,
+          quantity: (dto as any)?.quantity ?? null,
+          entry_type: (dto as any)?.entry_type ?? null,
+          gender: (dto as any)?.gender ?? null,
+          is_complimentary: (dto as any)?.is_complimentary ?? null,
+          age_bucket: (dto as any)?.age_bucket ?? null,
+        },
+        status: error?.status ?? error?.response?.status ?? null,
+        message: error?.message ?? 'Unknown error',
+        response: error?.response ?? null,
+      });
+      throw error;
     }
-    return this.staffService.recordEntry(dto);
   }
 
   @Get('entries')
@@ -374,6 +397,24 @@ export class StaffController {
     });
   }
 
+  @Post('waiter/tables/:id/bottle-orders')
+  async createTableBottleOrder(
+    @Param('id') tableId: string,
+    @Body() dto: CreateTableBottleOrderDto,
+    @CurrentUser() user: RequestUser,
+  ) {
+    if (user.role !== 'admin') {
+      if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
+      await this.staffService.assertEventTableBelongsToVenue(tableId, user.venue_id);
+    }
+
+    return this.staffService.createTableBottleOrder(tableId, dto, {
+      staffId: user.role === 'admin' ? undefined : user.id,
+      autoSettle: dto.auto_settle,
+      stationId: dto.station_id,
+    });
+  }
+
   // Cameriere: lista tavoli assegnati/visibili
   @Get('waiter/tables')
   async listWaiterTables(
@@ -406,6 +447,69 @@ export class StaffController {
       venueId: effectiveVenueId,
       onlyBooked: onlyBooked === 'true' || onlyBooked === '1',
     });
+  }
+
+  @Get('bottle-orders')
+  async listBottleOrders(
+    @CurrentUser() user: RequestUser,
+    @Query('eventId') eventId?: string,
+    @Query('venueId') venueId?: string,
+    @Query('staffId') staffId?: string,
+    @Query('status') status?: string,
+  ) {
+    const isAdmin = user.role === 'admin';
+    const effectiveVenueId: string | undefined = isAdmin
+      ? venueId
+      : user.venue_id ?? undefined;
+    if (!isAdmin && !effectiveVenueId) throw new ForbiddenException('Missing venue_id');
+
+    const resolvedEventId = await this.staffService.resolveEventIdForStaffApi({
+      eventId,
+      venueId: effectiveVenueId,
+      staffId: isAdmin ? staffId : undefined,
+    });
+
+    if (!isAdmin && effectiveVenueId) {
+      await this.staffService.assertEventBelongsToVenue(resolvedEventId, effectiveVenueId);
+    }
+
+    return this.staffService.listBottleOrders({
+      eventId: resolvedEventId,
+      venueId: effectiveVenueId,
+      status,
+    });
+  }
+
+  @Post('bottle-orders/:id/prepare')
+  async prepareBottleOrder(
+    @Param('id') orderId: string,
+    @CurrentUser() user: RequestUser,
+  ) {
+    if (user.role !== 'admin') {
+      if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
+      await this.staffService.assertBottleOrderBelongsToVenue(orderId, user.venue_id);
+    }
+
+    return this.staffService.markBottleOrderPreparing(
+      orderId,
+      user.role === 'admin' ? undefined : user.id,
+    );
+  }
+
+  @Post('bottle-orders/:id/dispatch')
+  async dispatchBottleOrder(
+    @Param('id') orderId: string,
+    @CurrentUser() user: RequestUser,
+  ) {
+    if (user.role !== 'admin') {
+      if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
+      await this.staffService.assertBottleOrderBelongsToVenue(orderId, user.venue_id);
+    }
+
+    return this.staffService.markBottleOrderDelivered(
+      orderId,
+      user.role === 'admin' ? undefined : user.id,
+    );
   }
 
   // Cameriere: salda il tavolo (completa pagamento)

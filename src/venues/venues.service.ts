@@ -7,6 +7,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import type { RequestUser } from '../auth/types';
 import {
+  AgeBucket,
   EntryMethod,
   EventStatus,
   Gender,
@@ -229,6 +230,76 @@ export class VenuesService {
     return list;
   }
 
+
+
+  private normalizeBottlePriceList(value: unknown) {
+    if (!Array.isArray(value)) {
+      return [] as Array<{ key: string; label: string; price: number }>;
+    }
+
+    const list: Array<{ key: string; label: string; price: number }> = [];
+    const seenKeys = new Set<string>();
+
+    for (const raw of value) {
+      if (!raw || typeof raw !== 'object') continue;
+      const row = raw as { key?: unknown; label?: unknown; price?: unknown };
+      const key = typeof row.key === 'string' ? row.key.trim() : '';
+      const label = typeof row.label === 'string' ? row.label.trim() : '';
+      const price = Number(row.price);
+
+      if (!key || seenKeys.has(key)) continue;
+      if (!label) continue;
+      if (!Number.isFinite(price) || price < 0) continue;
+
+      seenKeys.add(key);
+      list.push({
+        key,
+        label,
+        price: Number(price.toFixed(2)),
+      });
+    }
+
+    return list;
+  }
+
+  private normalizeBottlePriceListInput(value: unknown) {
+    if (!Array.isArray(value)) {
+      throw new BadRequestException('bottle_price_list must be an array');
+    }
+
+    const list: Array<{ key: string; label: string; price: number }> = [];
+    const seenKeys = new Set<string>();
+
+    for (const raw of value) {
+      const row = raw as { key?: unknown; label?: unknown; price?: unknown };
+      const key = typeof row.key === 'string' ? row.key.trim() : '';
+      const label = typeof row.label === 'string' ? row.label.trim() : '';
+      const price = Number(row.price);
+
+      if (!key) {
+        throw new BadRequestException('Bottle item key is required');
+      }
+      if (seenKeys.has(key)) {
+        throw new BadRequestException(`Duplicate bottle price key: ${key}`);
+      }
+      if (!label) {
+        throw new BadRequestException(`Bottle label is required for ${key}`);
+      }
+      if (!Number.isFinite(price) || price < 0) {
+        throw new BadRequestException(`Invalid bottle price for ${key}`);
+      }
+
+      seenKeys.add(key);
+      list.push({
+        key,
+        label,
+        price: Number(price.toFixed(2)),
+      });
+    }
+
+    return list;
+  }
+
   private getStripeClient(): Stripe {
     const secret = process.env.STRIPE_SECRET_KEY;
     if (!secret) {
@@ -281,6 +352,28 @@ export class VenuesService {
     if (age < 30) return '25-29';
     if (age < 35) return '30-34';
     return '35+';
+  }
+  
+  private ageBucketFromStored(value?: AgeBucket | null): string {
+    if (!value) return 'Non disponibile';
+    if (value === AgeBucket.AGE_18_20) return '18-20';
+    if (value === AgeBucket.AGE_21_24) return '21-24';
+    if (value === AgeBucket.AGE_25_29) return '25-29';
+    if (value === AgeBucket.AGE_30_34) return '30-34';
+    if (value === AgeBucket.AGE_35_PLUS) return '35+';
+    return 'Non disponibile';
+  }
+  
+  private representativeAgeFromStoredBucket(
+    value?: AgeBucket | null,
+  ): number | null {
+    if (!value) return null;
+    if (value === AgeBucket.AGE_18_20) return 19;
+    if (value === AgeBucket.AGE_21_24) return 22.5;
+    if (value === AgeBucket.AGE_25_29) return 27;
+    if (value === AgeBucket.AGE_30_34) return 32;
+    if (value === AgeBucket.AGE_35_PLUS) return 37;
+    return null;
   }
 
   private hourLabelFromDate(date?: Date | null): string | null {
@@ -391,6 +484,31 @@ export class VenuesService {
     if (entryType === 'male') return Gender.M;
     if (entryType === 'female') return Gender.F;
     return Gender.ALTRO;
+  }
+
+  private normalizeManualGenderInput(gender?: 'M' | 'F' | 'ALTRO'): Gender | null {
+    if (gender === 'M') return Gender.M;
+    if (gender === 'F') return Gender.F;
+    if (gender === 'ALTRO') return Gender.ALTRO;
+    return null;
+  }
+
+  private normalizeAgeBucketInput(
+    bucket?:
+      | 'AGE_18_20'
+      | 'AGE_21_24'
+      | 'AGE_25_29'
+      | 'AGE_30_34'
+      | 'AGE_35_PLUS'
+      | 'UNKNOWN',
+  ): AgeBucket | null {
+    if (!bucket) return null;
+    if (bucket === 'AGE_18_20') return AgeBucket.AGE_18_20;
+    if (bucket === 'AGE_21_24') return AgeBucket.AGE_21_24;
+    if (bucket === 'AGE_25_29') return AgeBucket.AGE_25_29;
+    if (bucket === 'AGE_30_34') return AgeBucket.AGE_30_34;
+    if (bucket === 'AGE_35_PLUS') return AgeBucket.AGE_35_PLUS;
+    return AgeBucket.UNKNOWN;
   }
 
   private sanitizePrRefCode(seed: string): string {
@@ -742,6 +860,7 @@ export class VenuesService {
     venue_id: string;
     cloakroom_unit_price: number;
     bar_price_list: Array<{ key: string; label: string; price: number }>;
+    bottle_price_list: Array<{ key: string; label: string; price: number }>;
   }> {
     const venue = await this.prisma.venues.findUnique({
       where: { id },
@@ -749,6 +868,7 @@ export class VenuesService {
         id: true,
         cloakroom_unit_price: true,
         bar_price_list: true,
+        bottle_price_list: true,
       },
     });
 
@@ -761,6 +881,7 @@ export class VenuesService {
         (cloakroom > 0 ? cloakroom : DEFAULT_CLOAKROOM_UNIT_PRICE).toFixed(2),
       ),
       bar_price_list: this.normalizeBarPriceList(venue.bar_price_list),
+      bottle_price_list: this.normalizeBottlePriceList(venue.bottle_price_list),
     };
   }
 
@@ -771,6 +892,7 @@ export class VenuesService {
     venue_id: string;
     cloakroom_unit_price: number;
     bar_price_list: Array<{ key: string; label: string; price: number }>;
+    bottle_price_list: Array<{ key: string; label: string; price: number }>;
   }> {
     await this.getVenue(id);
 
@@ -789,6 +911,11 @@ export class VenuesService {
       data.bar_price_list = normalized as Prisma.InputJsonValue;
     }
 
+    if (updates.bottle_price_list !== undefined) {
+      const normalized = this.normalizeBottlePriceListInput(updates.bottle_price_list);
+      data.bottle_price_list = normalized as Prisma.InputJsonValue;
+    }
+
     if (Object.keys(data).length === 0) {
       return this.getVenuePricing(id);
     }
@@ -800,6 +927,7 @@ export class VenuesService {
         id: true,
         cloakroom_unit_price: true,
         bar_price_list: true,
+        bottle_price_list: true,
       },
     });
 
@@ -809,6 +937,7 @@ export class VenuesService {
         this.decimalToNumber(updated.cloakroom_unit_price).toFixed(2),
       ),
       bar_price_list: this.normalizeBarPriceList(updated.bar_price_list),
+      bottle_price_list: this.normalizeBottlePriceList(updated.bottle_price_list),
     };
   }
 
@@ -1728,6 +1857,15 @@ export class VenuesService {
       guest_user_id?: string;
       station_id?: string;
       entry_type?: 'male' | 'female' | 'free';
+      gender?: 'M' | 'F' | 'ALTRO';
+      is_complimentary?: boolean;
+      age_bucket?:
+        | 'AGE_18_20'
+        | 'AGE_21_24'
+        | 'AGE_25_29'
+        | 'AGE_30_34'
+        | 'AGE_35_PLUS'
+        | 'UNKNOWN';
     },
     user?: RequestUser,
   ) {
@@ -1796,8 +1934,13 @@ export class VenuesService {
       };
     }
 
-    const entryType = payload.entry_type ?? 'free';
-    const gender = this.entryTypeToGender(entryType);
+    const entryType = payload.entry_type;
+    const explicitGender = this.normalizeManualGenderInput(payload.gender);
+    const gender = explicitGender ??
+      (entryType ? this.entryTypeToGender(entryType) : Gender.ALTRO);
+    const isComplimentary =
+      payload.is_complimentary ?? (entryType ? entryType === 'free' : false);
+    const ageBucket = this.normalizeAgeBucketInput(payload.age_bucket);
 
     let resolvedStationId: string | null = null;
     if (payload.station_id) {
@@ -1839,7 +1982,7 @@ export class VenuesService {
       prisma: this.prisma,
       eventId: scan.event_id,
       gender,
-      isComplimentary: entryType === 'free',
+      isComplimentary,
     });
 
     const createdEntry = await this.prisma.entries.create({
@@ -1851,6 +1994,8 @@ export class VenuesService {
         pr_membership_id: scan.pr_membership_id,
         sesso: gender,
         price: entryPrice,
+        is_complimentary: isComplimentary,
+        age_bucket: ageBucket,
         method: EntryMethod.QR,
       },
       select: {
@@ -2848,6 +2993,7 @@ export class VenuesService {
           event_id: true,
           user_id: true,
           sesso: true,
+          age_bucket: true,
           price: true,
           created_at: true,
           user: {
@@ -3077,22 +3223,30 @@ export class VenuesService {
       userId?: string | null;
       gender?: Gender | null;
       birthDate?: Date | null;
+      ageBucket?: AgeBucket | null;
     }) => {
       const metrics = eventMetrics.get(params.eventId);
       if (!metrics) return;
 
+      const computedAge = this.calculateAge(
+        params.birthDate,
+        eventMeta.get(params.eventId)?.date ?? null,
+      );
+      const resolvedAge =
+        computedAge ?? this.representativeAgeFromStoredBucket(params.ageBucket);
+      const resolvedBucket =
+        computedAge != null
+          ? this.ageBucket(computedAge)
+          : this.ageBucketFromStored(params.ageBucket);
+
       if (!params.userId) {
         addGender(metrics, params.gender);
-        const age = this.calculateAge(
-          params.birthDate,
-          eventMeta.get(params.eventId)?.date ?? null,
-        );
-        if (age != null) {
-          metrics.ageValues.push(age);
-          audienceAgeValues.push(age);
+        if (resolvedAge != null) {
+          metrics.ageValues.push(resolvedAge);
+          audienceAgeValues.push(resolvedAge);
           ageBucketCounts.set(
-            this.ageBucket(age),
-            (ageBucketCounts.get(this.ageBucket(age)) ?? 0) + 1,
+            resolvedBucket,
+            (ageBucketCounts.get(resolvedBucket) ?? 0) + 1,
           );
         } else {
           ageBucketCounts.set(
@@ -3114,16 +3268,12 @@ export class VenuesService {
 
       addGender(metrics, params.gender);
 
-      const age = this.calculateAge(
-        params.birthDate,
-        eventMeta.get(params.eventId)?.date ?? null,
-      );
-      if (age != null) {
-        metrics.ageValues.push(age);
-        audienceAgeValues.push(age);
+      if (resolvedAge != null) {
+        metrics.ageValues.push(resolvedAge);
+        audienceAgeValues.push(resolvedAge);
         ageBucketCounts.set(
-          this.ageBucket(age),
-          (ageBucketCounts.get(this.ageBucket(age)) ?? 0) + 1,
+          resolvedBucket,
+          (ageBucketCounts.get(resolvedBucket) ?? 0) + 1,
         );
       } else {
         ageBucketCounts.set(
@@ -3150,13 +3300,17 @@ export class VenuesService {
         userId: entry.user_id,
         gender: entry.user?.sesso ?? entry.sesso,
         birthDate: entry.user?.birth_date,
+        ageBucket: entry.age_bucket,
       });
 
-      const age = this.calculateAge(
+      const computedAge = this.calculateAge(
         entry.user?.birth_date,
         eventMeta.get(entry.event_id)?.date ?? null,
       );
-      const bucket = this.ageBucket(age);
+      const bucket =
+        computedAge != null
+          ? this.ageBucket(computedAge)
+          : this.ageBucketFromStored(entry.age_bucket);
       const currentBucket = ageEntryWindowMap.get(bucket) ?? {
         count: 0,
         hours: [],
@@ -3177,7 +3331,10 @@ export class VenuesService {
       ageEntryWindowMap.set(bucket, currentBucket);
 
       if (!reservedEntryIds.has(entry.id) && entry.user_id) {
-        const bucketKey = this.ageBucket(age);
+        const bucketKey =
+          computedAge != null
+            ? this.ageBucket(computedAge)
+            : this.ageBucketFromStored(entry.age_bucket);
         ageBucketCounts.set(
           bucketKey,
           ageBucketCounts.get(bucketKey) ?? 0,

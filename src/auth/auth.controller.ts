@@ -1,6 +1,12 @@
 import { Controller, Post, Body, Headers, Delete } from '@nestjs/common';
 import { AuthService } from './auth.service';
-import { RegisterDto, LoginDto, PushTokenDto } from './dto';
+import {
+  RegisterDto,
+  LoginDto,
+  PushTokenDto,
+  ForgotPasswordDto,
+  ResetPasswordDto,
+} from './dto';
 import { Public } from './public.decorator';
 import { CurrentUser } from './current-user.decorator';
 import type { RequestUser } from './types';
@@ -19,6 +25,19 @@ export class AuthController {
   @Public()
   login(@Body() dto: LoginDto) {
     return this.authService.login(dto);
+  }
+
+  @Post('forgot-password')
+  @Public()
+  forgotPassword(@Body() dto: ForgotPasswordDto) {
+    const identifier = dto.identifier || dto.email || dto.username;
+    return this.authService.requestPasswordReset(identifier);
+  }
+
+  @Post('reset-password')
+  @Public()
+  resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.authService.resetPassword(dto.token, dto.new_password);
   }
 
   @Post('logout')

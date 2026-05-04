@@ -14,6 +14,19 @@ class VenueBarPriceItemDto {
   price!: number;
 }
 
+class VenueBottlePriceItemDto {
+  @IsString()
+  key!: string;
+
+  @IsOptional()
+  @IsString()
+  label?: string;
+
+  @IsNumber()
+  @Min(0)
+  price!: number;
+}
+
 export class UpdateVenuePricingDto {
   @IsOptional()
   @IsNumber()
@@ -25,4 +38,10 @@ export class UpdateVenuePricingDto {
   @ValidateNested({ each: true })
   @Type(() => VenueBarPriceItemDto)
   bar_price_list?: VenueBarPriceItemDto[];
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => VenueBottlePriceItemDto)
+  bottle_price_list?: VenueBottlePriceItemDto[];
 }

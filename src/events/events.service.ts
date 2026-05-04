@@ -1430,30 +1430,13 @@ export class EventsService {
   async recalculateEventStats(eventId: string): Promise<EventStats> {
     await this.getEvent(eventId);
 
-    const [entriesAgg, paidEntryReservationsAgg, directEntriesAgg, barAgg, cloakAgg, tableAgg] =
+    const [entriesAgg, barAgg, cloakAgg, tableAgg] =
       await this.prisma.$transaction([
         this.prisma.entries.aggregate({
           where: { event_id: eventId },
           _count: { id: true },
+          _sum: { price: true },
         }),
-        this.prisma.reservations.aggregate({
-          where: {
-            event_id: eventId,
-            type: 'entry',
-            status: { in: ['confirmed', 'completed'] },
-            total_amount: { not: null },
-          },
-          _sum: { total_amount: true },
-        }),
-        this.prisma.$queryRaw<Array<{ total: Prisma.Decimal | null }>>(
-          Prisma.sql`
-            SELECT COALESCE(SUM(e.price), 0) AS total
-            FROM "entries" e
-            LEFT JOIN "reservations" r ON r."checkin_entry_id" = e."id"
-            WHERE e."event_id" = ${eventId}::uuid
-              AND (r."id" IS NULL OR r."total_amount" IS NULL)
-          `,
-        ),
         this.prisma.bar_sales.aggregate({
           where: { event_id: eventId },
           _sum: { amount: true },
@@ -1468,17 +1451,10 @@ export class EventsService {
         }),
       ]);
 
-    const paidEntryReservationsRevenue = this.decimalToNumber(
-      paidEntryReservationsAgg._sum.total_amount,
-    );
-    const directEntriesRevenue = this.decimalToNumber(
-      directEntriesAgg[0]?.total ?? null,
-    );
-
     return {
       event_id: eventId,
       total_entries: Number(entriesAgg._count.id ?? 0),
-      total_entries_revenue: paidEntryReservationsRevenue + directEntriesRevenue,
+      total_entries_revenue: this.decimalToNumber(entriesAgg._sum.price),
       total_bar: this.decimalToNumber(barAgg._sum.amount),
       total_cloakroom: this.decimalToNumber(cloakAgg._sum.amount),
       total_tables: this.decimalToNumber(tableAgg._sum.pagato_totale),

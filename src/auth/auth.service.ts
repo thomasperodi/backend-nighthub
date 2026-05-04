@@ -30,6 +30,7 @@ const revokedTokens = new Set<string>();
 @Injectable()
 export class AuthService {
   private readonly activityThrottleMs = 60 * 1000;
+  private readonly passwordResetTokenTtlSeconds = 15 * 60;
   private readonly logger = new Logger(AuthService.name);
 
   constructor(
@@ -61,6 +62,114 @@ export class AuthService {
     }
 
     return false;
+  }
+
+  private normalizeIdentifier(value: string): string {
+    return String(value || '')
+      .trim()
+      .toLowerCase();
+  }
+
+  private buildResetPasswordUrl(token: string): string | null {
+    const base = String(
+      process.env.APP_RESET_PASSWORD_URL ||
+        process.env.FRONTEND_RESET_PASSWORD_URL ||
+        '',
+    ).trim();
+
+    if (!base) return null;
+
+    try {
+      const url = new URL(base);
+      url.searchParams.set('token', token);
+      return url.toString();
+    } catch {
+      return null;
+    }
+  }
+
+  private async sendPasswordResetEmail(params: {
+    email: string;
+    name?: string | null;
+    token: string;
+  }) {
+    const apiKey = String(process.env.BREVO_API_KEY || '').trim();
+    const fromEmail = String(process.env.BREVO_FROM_EMAIL || '').trim();
+    const fromName = String(process.env.BREVO_FROM_NAME || 'NightHub').trim();
+    const resetUrl = this.buildResetPasswordUrl(params.token);
+
+    if (!apiKey || !fromEmail || !resetUrl) {
+      return false;
+    }
+
+    const displayName = String(params.name || '').trim() || 'utente';
+    const subject = 'Reset password Night App';
+    const html = `
+      <div style="font-family:Arial,sans-serif;line-height:1.5;color:#111">
+        <p>Ciao ${displayName},</p>
+        <p>abbiamo ricevuto una richiesta di reset della password.</p>
+        <p>
+          <a href="${resetUrl}" style="display:inline-block;padding:10px 14px;background:#111;color:#fff;text-decoration:none;border-radius:8px;">
+            Reimposta password
+          </a>
+        </p>
+        <p>Se il pulsante non funziona, copia questo codice token nell'app:</p>
+        <p style="font-family:monospace;background:#f4f4f4;padding:8px;border-radius:6px;word-break:break-all;">${params.token}</p>
+        <p>Il link scade tra 15 minuti.</p>
+        <p>Se non hai richiesto tu questa operazione, ignora questa email.</p>
+      </div>
+    `;
+
+    try {
+      const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+          'api-key': apiKey,
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sender: {
+            email: fromEmail,
+            name: fromName,
+          },
+          to: [{ email: params.email, name: displayName }],
+          subject,
+          htmlContent: html,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        this.logger.warn(
+          `Password reset email failed for ${params.email}: ${response.status} ${errorBody}`,
+        );
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        `Password reset email request error for ${params.email}: ${String(error)}`,
+      );
+      return false;
+    }
+  }
+
+  private async findUserByIdentifier(
+    identifier: string,
+  ): Promise<users | null> {
+    const normalized = this.normalizeIdentifier(identifier);
+    if (!normalized) return null;
+
+    return this.prisma.users.findFirst({
+      where: {
+        OR: [
+          { email: { equals: normalized, mode: 'insensitive' } },
+          { username: { equals: normalized, mode: 'insensitive' } },
+        ],
+      },
+    });
   }
 
   async touchUserActivity(userId: string, observedAt: Date = new Date()) {
@@ -187,13 +296,28 @@ export class AuthService {
   }
 
   async login(dto: LoginDto): Promise<LoginResponse> {
-    const user: users | null = await this.prisma.users.findUnique({
-      where: { email: dto.email },
-    });
+    const input = dto as unknown as {
+      identifier?: unknown;
+      email?: unknown;
+      password?: unknown;
+    };
+
+    const rawIdentifier =
+      typeof input.identifier === 'string'
+        ? input.identifier
+        : typeof input.email === 'string'
+          ? input.email
+          : '';
+    const identifier = this.normalizeIdentifier(rawIdentifier);
+    if (!identifier || typeof input.password !== 'string' || !input.password) {
+      return null;
+    }
+
+    const user: users | null = await this.findUserByIdentifier(identifier);
     if (!user) return null;
 
     const bcryptCompare = compare as (a: string, b: string) => Promise<boolean>;
-    const valid = await bcryptCompare(dto.password, user.password_hash);
+    const valid = await bcryptCompare(input.password, user.password_hash);
     if (!valid) return null;
 
     await this.touchUserActivity(user.id, new Date());
@@ -215,6 +339,94 @@ export class AuthService {
     };
 
     return { access_token, user: publicUser };
+  }
+
+  async requestPasswordReset(identifier?: string) {
+    const normalizedIdentifier = this.normalizeIdentifier(identifier || '');
+    if (!normalizedIdentifier) {
+      throw new BadRequestException('identifier required');
+    }
+
+    const user = await this.findUserByIdentifier(normalizedIdentifier);
+
+    // Always return a generic success message to avoid user enumeration.
+    const genericResponse = {
+      success: true,
+      message:
+        'Se l account esiste, riceverai istruzioni per il reset della password.',
+    };
+
+    if (!user) {
+      return genericResponse;
+    }
+
+    const resetToken = this.jwtService.sign(
+      {
+        sub: user.id,
+        type: 'password_reset',
+      },
+      {
+        expiresIn: `${this.passwordResetTokenTtlSeconds}s`,
+      },
+    );
+
+    const emailSent = await this.sendPasswordResetEmail({
+      email: user.email,
+      name: user.name,
+      token: resetToken,
+    });
+
+    if (process.env.NODE_ENV !== 'production') {
+      return {
+        ...genericResponse,
+        reset_token: resetToken,
+        expires_in_seconds: this.passwordResetTokenTtlSeconds,
+        email_sent: emailSent,
+      };
+    }
+
+    if (!emailSent) {
+      this.logger.warn(
+        `Password reset requested for user ${user.id} but email could not be sent. Configure BREVO_API_KEY, BREVO_FROM_EMAIL and APP_RESET_PASSWORD_URL.`,
+      );
+    }
+
+    return genericResponse;
+  }
+
+  async resetPassword(token: string, newPassword: string) {
+    if (!token) {
+      throw new BadRequestException('token required');
+    }
+
+    if (!newPassword || newPassword.length < 6) {
+      throw new BadRequestException(
+        'La nuova password deve contenere almeno 6 caratteri',
+      );
+    }
+
+    let payload: { sub?: string; type?: string };
+    try {
+      payload = this.jwtService.verify(token);
+    } catch {
+      throw new BadRequestException('Token reset non valido o scaduto');
+    }
+
+    if (!payload?.sub || payload?.type !== 'password_reset') {
+      throw new BadRequestException('Token reset non valido o scaduto');
+    }
+
+    const bcryptHash = hash as (s: string, rounds: number) => Promise<string>;
+    const hashedPassword = await bcryptHash(newPassword, 10);
+
+    await this.prisma.users.update({
+      where: { id: payload.sub },
+      data: { password_hash: hashedPassword },
+    });
+
+    await this.touchUserActivity(payload.sub, new Date());
+
+    return { success: true };
   }
 
   // Revoke token (logout)

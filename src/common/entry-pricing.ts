@@ -1,4 +1,5 @@
-import { EventAccessMode, Gender, Prisma } from '@prisma/client';
+import { BadRequestException } from '@nestjs/common';
+import { Gender, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
 function getEventTimeZone(): string {
@@ -62,13 +63,34 @@ function scorePriceRow(params: {
   const { rowGender, targetGender, startSeconds, endSeconds } = params;
 
   let score = 0;
-  if (rowGender === targetGender) score += 10;
-  else if (rowGender === null) score += 1;
 
-  if (startSeconds !== null && endSeconds !== null) score += 5;
-  else if (startSeconds !== null || endSeconds !== null) score += 3;
+  // Prioritize exact-gender prices, but still allow neutral prices as fallback.
+  if (rowGender === targetGender) score += 20;
+  else if (rowGender === null) score += 10;
+
+  // Prefer explicit time windows over all-night prices.
+  if (startSeconds !== null && endSeconds !== null) score += 18;
+  else if (startSeconds !== null || endSeconds !== null) score += 12;
+  else score += 2;
 
   return score;
+}
+
+function getWindowCoverageSeconds(
+  startSeconds: number | null,
+  endSeconds: number | null,
+): number {
+  const fullDaySeconds = 24 * 60 * 60;
+
+  if (startSeconds === null && endSeconds === null) return fullDaySeconds;
+  if (startSeconds === null || endSeconds === null) {
+    // Open-ended windows are treated as less specific than bounded windows.
+    return 12 * 60 * 60;
+  }
+
+  if (startSeconds === endSeconds) return fullDaySeconds;
+  if (startSeconds < endSeconds) return endSeconds - startSeconds;
+  return fullDaySeconds - startSeconds + endSeconds;
 }
 
 function pickBestRow(
@@ -83,49 +105,50 @@ function pickBestRow(
 ): Prisma.Decimal | null {
   if (!rows.length) return null;
 
-  const specificGenderRows = rows.filter((row) => row.gender === targetGender);
-  const neutralGenderRows = rows.filter((row) => row.gender === null);
+  const eligibleRows = rows.filter(
+    (row) => row.gender === targetGender || row.gender === null,
+  );
+
+  if (!eligibleRows.length) return null;
 
   const sortBySpecificity = (
     a: {
+      gender: Gender | null;
       startSeconds: number | null;
       endSeconds: number | null;
       createdAt: Date;
     },
     b: {
+      gender: Gender | null;
       startSeconds: number | null;
       endSeconds: number | null;
       createdAt: Date;
     },
   ) => {
     const aScore = scorePriceRow({
-      rowGender: targetGender,
+      rowGender: a.gender,
       targetGender,
       startSeconds: a.startSeconds,
       endSeconds: a.endSeconds,
     });
     const bScore = scorePriceRow({
-      rowGender: targetGender,
+      rowGender: b.gender,
       targetGender,
       startSeconds: b.startSeconds,
       endSeconds: b.endSeconds,
     });
 
     if (bScore !== aScore) return bScore - aScore;
+
+    const aCoverage = getWindowCoverageSeconds(a.startSeconds, a.endSeconds);
+    const bCoverage = getWindowCoverageSeconds(b.startSeconds, b.endSeconds);
+    if (aCoverage !== bCoverage) return aCoverage - bCoverage;
+
     return b.createdAt.getTime() - a.createdAt.getTime();
   };
 
-  if (specificGenderRows.length) {
-    const selected = [...specificGenderRows].sort(sortBySpecificity)[0];
-    return selected?.price ?? null;
-  }
-
-  if (neutralGenderRows.length) {
-    const selected = [...neutralGenderRows].sort(sortBySpecificity)[0];
-    return selected?.price ?? null;
-  }
-
-  return null;
+  const selected = [...eligibleRows].sort(sortBySpecificity)[0];
+  return selected?.price ?? null;
 }
 
 export async function resolveEntryUnitPrice(params: {
@@ -147,19 +170,22 @@ export async function resolveEntryUnitPrice(params: {
 
   const event = await prisma.events.findUnique({
     where: { id: eventId },
-    select: { access_mode: true },
+    select: { id: true },
   });
 
   if (!event) return new Prisma.Decimal(0);
-  if (event.access_mode === EventAccessMode.PRE_SALE) {
-    return new Prisma.Decimal(0);
-  }
 
   const nowSeconds = getSecondsInTimeZone(getEventTimeZone(), at);
   const priceRows = await prisma.event_entry_prices.findMany({
     where: { event_id: eventId },
     orderBy: [{ created_at: 'desc' }],
   });
+
+  if (!priceRows.length) {
+    throw new BadRequestException(
+      'Listino ingressi non configurato per questo evento',
+    );
+  }
 
   const applicable = priceRows
     .map((row) => {
@@ -181,7 +207,22 @@ export async function resolveEntryUnitPrice(params: {
     })
     .filter((item) => item.matchesTime);
 
+  if (!applicable.length) {
+    throw new BadRequestException(
+      'Nessun prezzo ingresso valido per la fascia oraria corrente',
+    );
+  }
+
   const selectedPrice = pickBestRow(applicable, gender);
-  if (!selectedPrice) return new Prisma.Decimal(0);
+  if (!selectedPrice) {
+    throw new BadRequestException(
+      `Nessun prezzo ingresso configurato per il sesso ${gender} nella fascia oraria corrente`,
+    );
+  }
+
+  if (selectedPrice.isNegative()) {
+    throw new BadRequestException('Il prezzo ingresso non puo essere negativo');
+  }
+
   return new Prisma.Decimal(selectedPrice);
 }

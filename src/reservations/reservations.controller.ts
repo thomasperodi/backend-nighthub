@@ -19,6 +19,49 @@ import type { RequestUser } from '../auth/types';
 export class ReservationsController {
   constructor(private readonly reservationsService: ReservationsService) {}
 
+  private parseOptionalGuests(value: unknown): number | undefined {
+    if (value === undefined) return undefined;
+    const guests = Number(value);
+    if (!Number.isInteger(guests) || guests < 1) {
+      throw new BadRequestException('guests must be an integer >= 1');
+    }
+    return guests;
+  }
+
+  private parseOptionalTableName(value: unknown): string | null | undefined {
+    if (value === undefined) return undefined;
+    if (value === null || value === '') return null;
+    if (typeof value !== 'string' && typeof value !== 'number') {
+      throw new BadRequestException('table_name must be a string');
+    }
+
+    const tableName = String(value).trim();
+    if (!tableName.length) return null;
+    if (tableName.length > 60) {
+      throw new BadRequestException('table_name must be <= 60 chars');
+    }
+    return tableName;
+  }
+
+  private parseOptionalTableId(value: unknown): string | null | undefined {
+    if (value === undefined) return undefined;
+    if (value === null) return null;
+    const tableId = String(value).trim();
+    return tableId.length ? tableId : null;
+  }
+
+  private parseOptionalTotalAmount(value: unknown): number | null | undefined {
+    if (value === undefined) return undefined;
+    if (value === null || value === '') return null;
+
+    const amount = Number(value);
+    if (!Number.isFinite(amount) || amount < 0) {
+      throw new BadRequestException('total_amount must be a number >= 0');
+    }
+
+    return amount;
+  }
+
   @Get()
   @Roles('client', 'venue', 'admin')
   list(
@@ -152,25 +195,40 @@ export class ReservationsController {
     const qrData = body?.qr_data ?? body?.qrData ?? body?.data;
     const adminStaffId = body?.staff_id;
 
-    if (!eventId) throw new BadRequestException('event_id required');
-    if (!qrData) throw new BadRequestException('qr_data required');
+    try {
+      if (!eventId) throw new BadRequestException('event_id required');
+      if (!qrData) throw new BadRequestException('qr_data required');
 
-    const staffId =
-      user.role === 'admin' && typeof adminStaffId === 'string' && adminStaffId
-        ? adminStaffId
-        : user.id;
+      const staffId =
+        user.role === 'admin' && typeof adminStaffId === 'string' && adminStaffId
+          ? adminStaffId
+          : user.id;
 
-    if (user.role !== 'admin') {
-      const venueId = user.venue_id ?? undefined;
-      if (!venueId) throw new ForbiddenException('Missing venue_id for this user');
-      await this.reservationsService.assertEventBelongsToVenue(eventId, venueId);
+      if (user.role !== 'admin') {
+        const venueId = user.venue_id ?? undefined;
+        if (!venueId) throw new ForbiddenException('Missing venue_id for this user');
+        await this.reservationsService.assertEventBelongsToVenue(eventId, venueId);
+      }
+
+      return this.reservationsService.checkInEntryReservationByQr({
+        eventId,
+        staffId,
+        qrData,
+      });
+    } catch (error: any) {
+      console.error('[reservations.controller] scanEntryQr error', {
+        userId: user?.id ?? null,
+        role: user?.role ?? null,
+        venueId: user?.venue_id ?? null,
+        eventId: eventId ?? null,
+        staffIdProvided: adminStaffId ?? null,
+        qrPreview: String(qrData ?? '').slice(0, 40),
+        errorName: error?.name,
+        errorMessage: error?.message,
+        statusCode: error?.status ?? error?.statusCode ?? null,
+      });
+      throw error;
     }
-
-    return this.reservationsService.checkInEntryReservationByQr({
-      eventId,
-      staffId,
-      qrData,
-    });
   }
 
   @Patch(':id')
@@ -191,6 +249,39 @@ export class ReservationsController {
     // Allow only safe fields to be updated via API.
     const updates: any = {};
     if (body && typeof body === 'object' && 'status' in body) updates.status = body.status;
+
+    const guests = this.parseOptionalGuests(
+      body?.guests ?? body?.guests_count ?? body?.guestsCount,
+    );
+    if (guests !== undefined) updates.guests = guests;
+
+    const tableName = this.parseOptionalTableName(
+      body?.table_name ?? body?.tableName,
+    );
+    if (tableName !== undefined) updates.table_name = tableName;
+
+    const tableId = this.parseOptionalTableId(
+      body?.venue_table_id ?? body?.venueTableId ?? body?.table_id ?? body?.tableId,
+    );
+    if (tableId !== undefined) updates.venue_table_id = tableId;
+
+    const totalAmount = this.parseOptionalTotalAmount(
+      body?.total_amount ?? body?.totalAmount,
+    );
+    if (totalAmount !== undefined) updates.total_amount = totalAmount;
+
+    if (
+      r.type !== 'table' &&
+      (
+        guests !== undefined ||
+        tableName !== undefined ||
+        tableId !== undefined ||
+        totalAmount !== undefined
+      )
+    ) {
+      throw new BadRequestException('Only table reservations can update guests/table fields');
+    }
+
     if (Object.keys(updates).length === 0) {
       throw new BadRequestException('No updatable fields provided');
     }

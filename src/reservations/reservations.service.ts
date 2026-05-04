@@ -5,7 +5,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { EntryMethod, Gender, Prisma } from '@prisma/client';
+import { AgeBucket, EntryMethod, Gender, Prisma } from '@prisma/client';
 import { randomUUID } from 'crypto';
 import { resolveEntryUnitPrice } from '../common/entry-pricing';
 
@@ -247,6 +247,27 @@ export class ReservationsService {
     if (totalAmount === null || totalAmount === undefined) return false;
     const amount = Number(totalAmount);
     return Number.isFinite(amount) && amount <= 0;
+  }
+
+  private ageBucketFromBirthDate(
+    birthDate?: Date | null,
+    at: Date = new Date(),
+  ): AgeBucket | null {
+    if (!birthDate) return null;
+
+    let age = at.getFullYear() - birthDate.getFullYear();
+    const monthDiff = at.getMonth() - birthDate.getMonth();
+    const dayDiff = at.getDate() - birthDate.getDate();
+    if (monthDiff < 0 || (monthDiff === 0 && dayDiff < 0)) {
+      age -= 1;
+    }
+
+    if (!Number.isFinite(age) || age < 0) return null;
+    if (age <= 20) return AgeBucket.AGE_18_20;
+    if (age <= 24) return AgeBucket.AGE_21_24;
+    if (age <= 29) return AgeBucket.AGE_25_29;
+    if (age <= 34) return AgeBucket.AGE_30_34;
+    return AgeBucket.AGE_35_PLUS;
   }
 
   private mergeReferralMeta(
@@ -735,6 +756,127 @@ export class ReservationsService {
     return n;
   }
 
+  private unwrapSetField(value: unknown): unknown {
+    if (
+      value &&
+      typeof value === 'object' &&
+      'set' in (value as Record<string, unknown>)
+    ) {
+      return (value as Record<string, unknown>).set;
+    }
+    return value;
+  }
+
+  private parseGuestsUpdateValue(value: unknown): number | undefined {
+    if (value === undefined) return undefined;
+    return this.normalizeGuests(this.unwrapSetField(value));
+  }
+
+  private parseTableIdUpdateValue(value: unknown): string | null | undefined {
+    if (value === undefined) return undefined;
+    const raw = this.unwrapSetField(value);
+    if (raw === null) return null;
+
+    if (typeof raw !== 'string' && typeof raw !== 'number') {
+      throw new BadRequestException('venue_table_id must be a string');
+    }
+
+    const next = String(raw).trim();
+    return next.length ? next : null;
+  }
+
+  private parseTotalAmountUpdateValue(
+    value: unknown,
+  ): number | null | undefined {
+    if (value === undefined) return undefined;
+    const raw = this.unwrapSetField(value);
+    if (raw === null || raw === '') return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) {
+      throw new BadRequestException('total_amount must be a number >= 0');
+    }
+    return n;
+  }
+
+  private async computeTableTotalAmount(params: {
+    eventId: string;
+    venueTableId: string;
+    guests: number;
+  }): Promise<Prisma.Decimal | null> {
+    const [table, eventTableCount, eventTableRows] = await Promise.all([
+      this.prisma.venue_tables.findUnique({
+        where: { id: params.venueTableId },
+        select: {
+          id: true,
+          venue_id: true,
+          per_testa: true,
+          costo_minimo: true,
+          persone_max: true,
+        },
+      }),
+      this.prisma.event_tables.count({
+        where: { event_id: params.eventId },
+      }),
+      this.prisma.event_tables.findMany({
+        where: {
+          event_id: params.eventId,
+          venue_table_id: params.venueTableId,
+        },
+        select: {
+          per_testa_override: true,
+          costo_minimo_override: true,
+          persone_max_override: true,
+        },
+        take: 1,
+      }),
+    ]);
+
+    if (!table) throw new NotFoundException('Table not found');
+
+    const eventTable = eventTableRows[0] ?? null;
+    if (eventTableCount > 0 && !eventTable) {
+      throw new BadRequestException(
+        'Selected table is not enabled for this event',
+      );
+    }
+
+    const eventOverridePerTesta: unknown = eventTable?.per_testa_override;
+    const eventOverrideCostoMinimo: unknown = eventTable?.costo_minimo_override;
+    const eventOverridePersoneMax: unknown = eventTable?.persone_max_override;
+
+    const effectivePerTesta: Prisma.Decimal | null =
+      eventOverridePerTesta === null || eventOverridePerTesta === undefined
+        ? (table.per_testa ?? null)
+        : (eventOverridePerTesta as Prisma.Decimal);
+    const effectiveCostoMinimo: Prisma.Decimal | null =
+      eventOverrideCostoMinimo === null ||
+      eventOverrideCostoMinimo === undefined
+        ? (table.costo_minimo ?? null)
+        : (eventOverrideCostoMinimo as Prisma.Decimal);
+    const effectivePersoneMax: number | null =
+      eventOverridePersoneMax === null || eventOverridePersoneMax === undefined
+        ? (table.persone_max ?? null)
+        : Number(eventOverridePersoneMax);
+
+    if (effectivePersoneMax && params.guests > effectivePersoneMax) {
+      throw new BadRequestException('guests exceeds table persone_max');
+    }
+
+    if (effectivePerTesta) {
+      const computed = effectivePerTesta.mul(new Prisma.Decimal(params.guests));
+      if (effectiveCostoMinimo) {
+        return Prisma.Decimal.max(computed, effectiveCostoMinimo);
+      }
+      return computed;
+    }
+
+    if (effectiveCostoMinimo) {
+      return effectiveCostoMinimo;
+    }
+
+    return null;
+  }
+
   async listReservations(params?: {
     eventId?: string;
     userId?: string;
@@ -1140,8 +1282,12 @@ export class ReservationsService {
         ? await this.prisma.reservations.findUnique({
             where: { qr_token: parsed.qrToken },
             include: {
-              user: { select: { id: true, sesso: true, name: true } },
-              event: { select: { id: true, name: true, venue_id: true } },
+              user: {
+                select: { id: true, sesso: true, name: true, birth_date: true },
+              },
+              event: {
+                select: { id: true, name: true, venue_id: true, date: true },
+              },
             },
           })
         : null) ?? null;
@@ -1150,8 +1296,10 @@ export class ReservationsService {
       reservation = await this.prisma.reservations.findUnique({
         where: { id: parsed.reservationId },
         include: {
-          user: { select: { id: true, sesso: true, name: true } },
-          event: { select: { id: true, name: true, venue_id: true } },
+          user: {
+            select: { id: true, sesso: true, name: true, birth_date: true },
+          },
+          event: { select: { id: true, name: true, venue_id: true, date: true } },
         },
       });
     }
@@ -1166,8 +1314,10 @@ export class ReservationsService {
         },
         orderBy: { created_at: 'desc' },
         include: {
-          user: { select: { id: true, sesso: true, name: true } },
-          event: { select: { id: true, name: true, venue_id: true } },
+          user: {
+            select: { id: true, sesso: true, name: true, birth_date: true },
+          },
+          event: { select: { id: true, name: true, venue_id: true, date: true } },
         },
       });
     }
@@ -1207,6 +1357,10 @@ export class ReservationsService {
       reservation.meta,
       reservation.total_amount,
     );
+    const ageBucket = this.ageBucketFromBirthDate(
+      reservation.user?.birth_date ?? null,
+      new Date(),
+    );
 
     const entryPrice = await resolveEntryUnitPrice({
       prisma: this.prisma,
@@ -1223,6 +1377,8 @@ export class ReservationsService {
           staff_id: staffId,
           sesso: gender,
           price: entryPrice,
+          is_complimentary: reservationIsComplimentary,
+          age_bucket: ageBucket,
           method: EntryMethod.QR,
         },
       });
@@ -1612,6 +1768,73 @@ export class ReservationsService {
     updates: Prisma.reservationsUpdateInput & { status?: unknown },
   ) {
     const existing = await this.getReservation(id);
+
+    if (existing.type === 'table') {
+      const nextGuests = this.parseGuestsUpdateValue(
+        (updates as Record<string, unknown>).guests,
+      );
+      const nextTableId = this.parseTableIdUpdateValue(
+        (updates as Record<string, unknown>).venue_table_id,
+      );
+      const nextTotalAmount = this.parseTotalAmountUpdateValue(
+        (updates as Record<string, unknown>).total_amount,
+      );
+
+      const effectiveGuests = nextGuests ?? existing.guests;
+      const effectiveTableId =
+        nextTableId === undefined ? existing.venue_table_id : nextTableId;
+
+      const hasPricingRelevantUpdate =
+        nextGuests !== undefined ||
+        nextTableId !== undefined ||
+        nextTotalAmount !== undefined;
+
+      if (hasPricingRelevantUpdate) {
+        if (effectiveTableId) {
+          const computedTotal = await this.computeTableTotalAmount({
+            eventId: existing.event_id,
+            venueTableId: effectiveTableId,
+            guests: effectiveGuests,
+          });
+
+          if (computedTotal) {
+            updates.total_amount = computedTotal;
+          } else if (nextTotalAmount !== undefined) {
+            updates.total_amount =
+              nextTotalAmount === null
+                ? null
+                : new Prisma.Decimal(nextTotalAmount);
+          } else if (
+            nextGuests !== undefined &&
+            existing.total_amount !== null &&
+            existing.guests > 0
+          ) {
+            const scaled =
+              Number(existing.total_amount) *
+              (effectiveGuests / existing.guests);
+            if (Number.isFinite(scaled) && scaled >= 0) {
+              updates.total_amount = new Prisma.Decimal(scaled);
+            }
+          }
+        } else if (nextTotalAmount !== undefined) {
+          updates.total_amount =
+            nextTotalAmount === null
+              ? null
+              : new Prisma.Decimal(nextTotalAmount);
+        } else if (
+          nextGuests !== undefined &&
+          existing.total_amount !== null &&
+          existing.guests > 0
+        ) {
+          const scaled =
+            Number(existing.total_amount) * (effectiveGuests / existing.guests);
+          if (Number.isFinite(scaled) && scaled >= 0) {
+            updates.total_amount = new Prisma.Decimal(scaled);
+          }
+        }
+      }
+    }
+
     const updated = await this.prisma.reservations.update({
       where: { id },
       data: updates,

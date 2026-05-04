@@ -5,9 +5,11 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  AgeBucket,
   EntryMethod,
   Gender,
   Prisma,
+  TableBottleOrderStatus,
   VenueStationType,
   bar_sales,
   cloakroom_sales,
@@ -19,6 +21,7 @@ import { RecordSaleDto } from './dto/record-sale.dto';
 import { UpdateTableHostessDto } from './dto/update-table-hostess.dto';
 import { EventsService } from '../events/events.service';
 import { resolveEntryUnitPrice } from '../common/entry-pricing';
+import { CreateTableBottleOrderDto } from './dto/create-table-bottle-order.dto';
 
 @Injectable()
 export class StaffService {
@@ -43,6 +46,20 @@ export class StaffService {
     });
     if (!t) throw new NotFoundException('Table not found');
     if (t.event.venue_id !== venueId) {
+      throw new ForbiddenException('Forbidden');
+    }
+  }
+
+  async assertBottleOrderBelongsToVenue(orderId: string, venueId: string) {
+    const order = await this.prisma.table_bottle_orders.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        event_table: { select: { event: { select: { venue_id: true } } } },
+      },
+    });
+    if (!order) throw new NotFoundException('Bottle order not found');
+    if (order.event_table.event.venue_id !== venueId) {
       throw new ForbiddenException('Forbidden');
     }
   }
@@ -312,6 +329,25 @@ export class StaffService {
     return Gender.ALTRO;
   }
 
+  private normalizeGenderInput(gender?: RecordEntryDto['gender']): Gender | null {
+    if (gender === 'M') return Gender.M;
+    if (gender === 'F') return Gender.F;
+    if (gender === 'ALTRO') return Gender.ALTRO;
+    return null;
+  }
+
+  private normalizeAgeBucketInput(
+    bucket?: RecordEntryDto['age_bucket'],
+  ): AgeBucket | null {
+    if (!bucket) return null;
+    if (bucket === 'AGE_18_20') return AgeBucket.AGE_18_20;
+    if (bucket === 'AGE_21_24') return AgeBucket.AGE_21_24;
+    if (bucket === 'AGE_25_29') return AgeBucket.AGE_25_29;
+    if (bucket === 'AGE_30_34') return AgeBucket.AGE_30_34;
+    if (bucket === 'AGE_35_PLUS') return AgeBucket.AGE_35_PLUS;
+    return AgeBucket.UNKNOWN;
+  }
+
   private async sendExpoPush(params: {
     token: string;
     title: string;
@@ -371,14 +407,40 @@ export class StaffService {
       stationType: VenueStationType.entry,
     });
 
-    const sesso = this.entryTypeToGender(dto.entry_type ?? 'free');
+    const explicitGender = this.normalizeGenderInput(dto.gender);
+    const fallbackGender = dto.entry_type
+      ? this.entryTypeToGender(dto.entry_type)
+      : null;
+    const sesso = explicitGender ?? fallbackGender ?? Gender.ALTRO;
+
+    const isComplimentary =
+      dto.is_complimentary ?? (dto.entry_type ? dto.entry_type === 'free' : false);
+    const ageBucket = this.normalizeAgeBucketInput(dto.age_bucket);
     const method = dto.user_id ? EntryMethod.QR : EntryMethod.RAPIDO;
     const entryPrice = await resolveEntryUnitPrice({
       prisma: this.prisma,
       eventId,
       gender: sesso,
-      isComplimentary: (dto.entry_type ?? 'free') === 'free',
+      isComplimentary,
     });
+
+    if (this.isDebugStaffEnabled()) {
+      console.log('[staff.service] recordEntry.input', {
+        eventId,
+        staffId: dto.staff_id ?? null,
+        stationId,
+        quantity,
+        userId: dto.user_id ?? null,
+        entryType: dto.entry_type ?? null,
+        genderInput: dto.gender ?? null,
+        resolvedGender: sesso,
+        isComplimentary,
+        ageBucket,
+        method,
+        unitPrice: entryPrice?.toString?.() ?? String(entryPrice),
+      });
+    }
+
     const createData: Prisma.entriesCreateManyInput[] = Array.from(
       { length: quantity },
       () => ({
@@ -388,12 +450,23 @@ export class StaffService {
         user_id: dto.user_id ?? null,
         sesso,
         price: entryPrice,
+        is_complimentary: isComplimentary,
+        age_bucket: ageBucket,
         method,
       }),
     );
 
     await this.prisma.entries.createMany({ data: createData });
     const stats = await this.eventsService.recalculateEventStats(eventId);
+
+    if (this.isDebugStaffEnabled()) {
+      console.log('[staff.service] recordEntry.success', {
+        eventId,
+        created: quantity,
+        totalEntries: stats?.total_entries ?? null,
+        totalEntriesRevenue: stats?.total_entries_revenue ?? null,
+      });
+    }
 
     if (dto.user_id) {
       const user = await this.prisma.users.findUnique({
@@ -584,6 +657,102 @@ export class StaffService {
     });
   }
 
+  private mapBottleOrder(order: any) {
+    const tableLabel =
+      order.event_table?.assigned_number ?? order.event_table?.venue_table?.numero ?? null;
+
+    return {
+      id: order.id,
+      event_table_id: order.event_table_id,
+      bottle_name: order.bottle_name,
+      quantity: Number(order.quantity ?? 0),
+      unit_price: Number(order.unit_price ?? 0),
+      total_price: Number(order.total_price ?? 0),
+      status: String(order.status ?? 'requested').toLowerCase(),
+      note: order.note ?? null,
+      created_at: order.created_at,
+      prepared_at: order.prepared_at ?? null,
+      delivered_at: order.delivered_at ?? null,
+      requested_by_staff_id: order.requested_by_staff_id ?? null,
+      prepared_by_staff_id: order.prepared_by_staff_id ?? null,
+      delivered_by_staff_id: order.delivered_by_staff_id ?? null,
+      is_table_saldato:
+        String(order.event_table?.stato ?? '').toLowerCase() === 'saldato',
+      table: order.event_table
+        ? {
+            id: order.event_table.id,
+            event_id: order.event_table.event_id,
+            numero: tableLabel,
+            nome: order.event_table.venue_table?.nome ?? 'Tavolo',
+            zona: order.event_table.venue_table?.zona ?? null,
+            table_name: order.event_table.table_name ?? null,
+            prenotati: Number(order.event_table.prenotati ?? 0),
+            entrati: Number(order.event_table.entrati ?? 0),
+          }
+        : null,
+    };
+  }
+
+  private async getBottleOrderById(orderId: string, venueId?: string) {
+    const order = await this.prisma.table_bottle_orders.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        event_table_id: true,
+        requested_by_staff_id: true,
+        prepared_by_staff_id: true,
+        delivered_by_staff_id: true,
+        bottle_name: true,
+        quantity: true,
+        unit_price: true,
+        total_price: true,
+        status: true,
+        note: true,
+        created_at: true,
+        prepared_at: true,
+        delivered_at: true,
+        event_table: {
+          select: {
+            id: true,
+            event_id: true,
+            venue_table_id: true,
+            assigned_number: true,
+            prenotati: true,
+            entrati: true,
+            stato: true,
+            venue_table: {
+              select: {
+                numero: true,
+                nome: true,
+                zona: true,
+                venue_id: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!order) throw new NotFoundException('Bottle order not found');
+    if (venueId && order.event_table.venue_table?.venue_id !== venueId) {
+      throw new ForbiddenException('Forbidden');
+    }
+
+    const tableNameByVenueTableId = await this.resolveReservationTableNames({
+      eventId: order.event_table.event_id,
+      venueId,
+    });
+
+    return this.mapBottleOrder({
+      ...order,
+      event_table: {
+        ...order.event_table,
+        table_name:
+          tableNameByVenueTableId.get(order.event_table.venue_table_id) ?? null,
+      },
+    });
+  }
+
   private async resolveReservationTableNames(params: {
     eventId: string;
     venueId?: string;
@@ -684,6 +853,9 @@ export class StaffService {
 
     return tables.map((t) => {
       const prenotati = prenotatiByVenueTableId.get(t.venue_table_id) ?? 0;
+      const per_testa = t.per_testa_override ?? t.venue_table?.per_testa ?? 0;
+      const costo_minimo =
+        t.costo_minimo_override ?? t.venue_table?.costo_minimo ?? null;
       const stato =
         t.entrati >= prenotati
           ? 'completo'
@@ -699,6 +871,8 @@ export class StaffService {
         prenotati,
         entrati: t.entrati,
         pagato_totale: t.pagato_totale,
+        per_testa,
+        costo_minimo,
         confermato: Boolean((t as any).confermato),
         stato,
         numero: t.assigned_number ?? t.venue_table?.numero ?? null,
@@ -732,6 +906,8 @@ export class StaffService {
         event_id: true,
         venue_table_id: true,
         assigned_number: true,
+        per_testa_override: true,
+        costo_minimo_override: true,
         venue_table: {
           select: {
             venue_id: true,
@@ -747,6 +923,26 @@ export class StaffService {
         pagato_totale: true,
         stato: true,
         table_sales: { orderBy: { created_at: 'desc' }, take: 50 },
+        bottle_orders: {
+          orderBy: [{ created_at: 'desc' }],
+          take: 20,
+          select: {
+            id: true,
+            event_table_id: true,
+            requested_by_staff_id: true,
+            prepared_by_staff_id: true,
+            delivered_by_staff_id: true,
+            bottle_name: true,
+            quantity: true,
+            unit_price: true,
+            total_price: true,
+            status: true,
+            note: true,
+            created_at: true,
+            prepared_at: true,
+            delivered_at: true,
+          },
+        },
       },
       orderBy: [{ venue_table: { numero: 'asc' } }],
     });
@@ -759,6 +955,9 @@ export class StaffService {
     return rows.map((t) => {
       const is_saldato = (t.stato ?? '').toLowerCase() === 'saldato';
       const pagato_totale = t.pagato_totale;
+      const per_testa = t.per_testa_override ?? t.venue_table?.per_testa ?? 0;
+      const costo_minimo =
+        t.costo_minimo_override ?? t.venue_table?.costo_minimo ?? null;
 
       return {
         id: t.id,
@@ -767,8 +966,8 @@ export class StaffService {
         nome: t.venue_table?.nome ?? 'Tavolo',
         table_name: tableNameByVenueTableId.get(t.venue_table_id) ?? null,
         zona: t.venue_table?.zona ?? null,
-        per_testa: t.venue_table?.per_testa ?? 0,
-        costo_minimo: t.venue_table?.costo_minimo ?? null,
+        per_testa,
+        costo_minimo,
         prenotati: t.prenotati ?? 0,
         entrati: t.entrati ?? 0,
         numero: t.assigned_number ?? t.venue_table?.numero ?? null,
@@ -785,6 +984,22 @@ export class StaffService {
           id: s.id,
           amount: Number(s.amount ?? 0),
           created_at: s.created_at,
+        })),
+        bottle_orders: (t.bottle_orders ?? []).map((order) => ({
+          id: order.id,
+          event_table_id: order.event_table_id,
+          requested_by_staff_id: order.requested_by_staff_id ?? null,
+          prepared_by_staff_id: order.prepared_by_staff_id ?? null,
+          delivered_by_staff_id: order.delivered_by_staff_id ?? null,
+          bottle_name: order.bottle_name,
+          quantity: Number(order.quantity ?? 0),
+          unit_price: Number(order.unit_price ?? 0),
+          total_price: Number(order.total_price ?? 0),
+          status: String(order.status ?? 'requested').toLowerCase(),
+          note: order.note ?? null,
+          created_at: order.created_at,
+          prepared_at: order.prepared_at ?? null,
+          delivered_at: order.delivered_at ?? null,
         })),
       };
     });
@@ -932,6 +1147,282 @@ export class StaffService {
     await this.eventsService.recalculateEventStats(table.event_id);
 
     return { table: updated, sale };
+  }
+
+  async createTableBottleOrder(
+    tableId: string,
+    dto: CreateTableBottleOrderDto,
+    options?: { staffId?: string; autoSettle?: boolean; stationId?: string },
+  ) {
+    const bottleKey = String(dto.bottle_key ?? '').trim();
+    let bottleName = String(dto.bottle_name ?? '').trim();
+    const quantity = Number(dto.quantity ?? 0);
+    let unitPrice = Number(dto.unit_price ?? 0);
+
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      throw new BadRequestException('quantity must be a positive integer');
+    }
+
+    const table = await this.prisma.event_tables.findUnique({
+      where: { id: tableId },
+      select: {
+        id: true,
+        event_id: true,
+        event: { select: { venue_id: true } },
+      },
+    });
+    if (!table) throw new NotFoundException('Table not found');
+
+    if (bottleKey) {
+      const venue = await this.prisma.venues.findUnique({
+        where: { id: table.event.venue_id },
+        select: { bottle_price_list: true },
+      });
+
+      const catalog = Array.isArray(venue?.bottle_price_list)
+        ? (venue.bottle_price_list as Array<{
+            key?: unknown;
+            label?: unknown;
+            price?: unknown;
+          }>)
+        : [];
+
+      const selectedBottle = catalog.find(
+        (item) => typeof item?.key === 'string' && item.key.trim() === bottleKey,
+      );
+
+      bottleName =
+        typeof selectedBottle?.label === 'string' ? selectedBottle.label.trim() : '';
+      unitPrice = Number(selectedBottle?.price ?? 0);
+
+      if (!bottleName || !Number.isFinite(unitPrice) || unitPrice <= 0) {
+        throw new BadRequestException('Selected bottle is not available for this venue');
+      }
+    } else {
+      if (!bottleName) {
+        throw new BadRequestException('bottle_name is required');
+      }
+      if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+        throw new BadRequestException('unit_price must be positive');
+      }
+    }
+
+    const stationId = await this.resolveStationId({
+      stationId: options?.stationId ?? dto.station_id ?? null,
+      venueId: table.event.venue_id,
+      stationType: VenueStationType.table,
+    });
+
+    const totalPrice = new Prisma.Decimal(unitPrice).mul(quantity);
+    const shouldSettle = options?.autoSettle ?? dto.auto_settle ?? true;
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      const order = await tx.table_bottle_orders.create({
+        data: {
+          event_table_id: tableId,
+          requested_by_staff_id: options?.staffId ?? null,
+          bottle_name: bottleName,
+          quantity,
+          unit_price: new Prisma.Decimal(unitPrice),
+          total_price: totalPrice,
+          note: dto.note?.trim() || null,
+          status: TableBottleOrderStatus.requested,
+        },
+        select: { id: true },
+      });
+
+      await tx.table_sales.create({
+        data: {
+          event_id: table.event_id,
+          event_table_id: tableId,
+          staff_id: options?.staffId ?? null,
+          station_id: stationId,
+          amount: totalPrice,
+          metadata: {
+            type: 'bottle_order',
+            bottle_order_id: order.id,
+            bottle_key: bottleKey || null,
+            bottle_name: bottleName,
+            quantity,
+            unit_price: unitPrice,
+            total_price: unitPrice * quantity,
+          },
+        },
+      });
+
+      await tx.event_tables.update({
+        where: { id: tableId },
+        data: {
+          pagato_totale: { increment: totalPrice },
+          ...(shouldSettle ? { stato: 'saldato' } : {}),
+        },
+      });
+
+      return order.id;
+    });
+
+    await this.eventsService.recalculateEventStats(table.event_id);
+
+    return this.getBottleOrderById(result, table.event.venue_id);
+  }
+
+  async listBottleOrders(params: {
+    eventId?: string;
+    venueId?: string;
+    status?: string;
+  }) {
+    const { eventId, venueId, status } = params;
+    if (!eventId) {
+      return [];
+    }
+
+    await this.ensureEventTablesSeeded(eventId);
+
+    const normalizedStatus = String(status ?? '').trim().toLowerCase();
+    const statusFilter =
+      normalizedStatus === 'requested' ||
+      normalizedStatus === 'preparing' ||
+      normalizedStatus === 'delivered'
+        ? (normalizedStatus as TableBottleOrderStatus)
+        : undefined;
+
+    const rows = await this.prisma.table_bottle_orders.findMany({
+      where: {
+        ...(statusFilter ? { status: statusFilter } : {}),
+        event_table: {
+          event_id: eventId,
+          ...(venueId ? { venue_table: { venue_id: venueId } } : {}),
+        },
+      },
+      orderBy: [{ created_at: 'desc' }],
+      select: {
+        id: true,
+        event_table_id: true,
+        requested_by_staff_id: true,
+        prepared_by_staff_id: true,
+        delivered_by_staff_id: true,
+        bottle_name: true,
+        quantity: true,
+        unit_price: true,
+        total_price: true,
+        status: true,
+        note: true,
+        created_at: true,
+        prepared_at: true,
+        delivered_at: true,
+        event_table: {
+          select: {
+            id: true,
+            event_id: true,
+            venue_table_id: true,
+            assigned_number: true,
+            prenotati: true,
+            entrati: true,
+            stato: true,
+            venue_table: {
+              select: {
+                numero: true,
+                nome: true,
+                zona: true,
+                venue_id: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const tableNameByVenueTableId = await this.resolveReservationTableNames({
+      eventId,
+      venueId,
+    });
+
+    return rows.map((order) =>
+      this.mapBottleOrder({
+        ...order,
+        event_table: {
+          ...order.event_table,
+          table_name: tableNameByVenueTableId.get(order.event_table.venue_table_id) ?? null,
+        },
+      }),
+    );
+  }
+
+  async markBottleOrderPreparing(orderId: string, staffId?: string) {
+    const existing = await this.prisma.table_bottle_orders.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        status: true,
+        event_table: {
+          select: {
+            event: { select: { venue_id: true } },
+          },
+        },
+      },
+    });
+    if (!existing) throw new NotFoundException('Bottle order not found');
+
+    if (existing.status !== TableBottleOrderStatus.requested) {
+      return this.getBottleOrderById(orderId, existing.event_table.event.venue_id);
+    }
+
+    await this.prisma.table_bottle_orders.update({
+      where: { id: orderId },
+      data: {
+        status: TableBottleOrderStatus.preparing,
+        prepared_by_staff_id: staffId ?? null,
+        prepared_at: new Date(),
+      },
+    });
+
+    return this.getBottleOrderById(orderId, existing.event_table.event.venue_id);
+  }
+
+  async markBottleOrderDelivered(orderId: string, staffId?: string) {
+    const existing = await this.prisma.table_bottle_orders.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        status: true,
+        event_table_id: true,
+        event_table: {
+          select: {
+            stato: true,
+            event: { select: { venue_id: true } },
+          },
+        },
+      },
+    });
+    if (!existing) throw new NotFoundException('Bottle order not found');
+
+    if (existing.status !== TableBottleOrderStatus.delivered) {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.table_bottle_orders.update({
+          where: { id: orderId },
+          data: {
+            status: TableBottleOrderStatus.delivered,
+            delivered_by_staff_id: staffId ?? null,
+            delivered_at: new Date(),
+            ...(existing.status === TableBottleOrderStatus.requested
+              ? {
+                  prepared_by_staff_id: staffId ?? null,
+                  prepared_at: new Date(),
+                }
+              : {}),
+          },
+        });
+
+        if (String(existing.event_table.stato ?? '').toLowerCase() !== 'saldato') {
+          await tx.event_tables.update({
+            where: { id: existing.event_table_id },
+            data: { stato: 'saldato' },
+          });
+        }
+      });
+    }
+
+    return this.getBottleOrderById(orderId, existing.event_table.event.venue_id);
   }
 
   // Cameriere: salda il tavolo (segna come completamente pagato)

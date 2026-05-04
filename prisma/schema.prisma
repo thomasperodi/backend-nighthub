@@ -45,6 +45,12 @@ enum TicketOrderStatus {
   failed
 }
 
+enum TableBottleOrderStatus {
+  requested
+  preparing
+  delivered
+}
+
 enum ReservationStatus {
   pending
   confirmed
@@ -78,6 +84,15 @@ enum Gender {
   M
   F
   ALTRO
+}
+
+enum AgeBucket {
+  AGE_18_20
+  AGE_21_24
+  AGE_25_29
+  AGE_30_34
+  AGE_35_PLUS
+  UNKNOWN
 }
 
 enum FriendRequestStatus {
@@ -176,6 +191,9 @@ model users {
   ticket_orders ticket_orders[]
   user_promos   user_promos[]
   venue_stays   venue_stays[]
+  requested_bottle_orders table_bottle_orders[] @relation("BottleOrderRequestedBy")
+  prepared_bottle_orders  table_bottle_orders[] @relation("BottleOrderPreparedBy")
+  delivered_bottle_orders table_bottle_orders[] @relation("BottleOrderDeliveredBy")
 
   sent_friend_requests     friend_requests[] @relation("FriendRequestsSent")
   received_friend_requests friend_requests[] @relation("FriendRequestsReceived")
@@ -209,6 +227,7 @@ model venues {
   stripe_account_id String? @unique
   cloakroom_unit_price Decimal @default(3) @db.Decimal(10,2)
   bar_price_list Json?
+  bottle_price_list Json?
   stripe_charges_enabled Boolean @default(false)
   stripe_payouts_enabled Boolean @default(false)
   stripe_onboarding_completed_at DateTime?
@@ -554,6 +573,7 @@ model event_tables {
   event         events       @relation(fields: [event_id], references: [id])
   venue_table   venue_tables @relation(fields: [venue_table_id], references: [id])
   table_sales   table_sales[]
+  bottle_orders table_bottle_orders[]
 
   @@unique([event_id, venue_table_id])
   @@index([event_id])
@@ -575,6 +595,8 @@ model entries {
 
   sesso      Gender
   price      Decimal     @default(0)
+  is_complimentary Boolean @default(false)
+  age_bucket AgeBucket?
   method     EntryMethod
 
   created_at DateTime    @default(now())
@@ -586,6 +608,7 @@ model entries {
   pr_membership venue_pr_memberships? @relation("PrMembershipEntries", fields: [pr_membership_id], references: [id], onDelete: SetNull)
 
   @@index([event_id, created_at])
+  @@index([event_id, age_bucket, created_at])
   @@index([event_id, station_id, created_at])
   @@index([user_id])
   @@index([staff_id])
@@ -653,6 +676,35 @@ model table_sales {
   @@index([event_table_id, created_at])
   @@index([event_id, station_id, created_at])
   @@index([staff_id, created_at])
+}
+
+model table_bottle_orders {
+  id                    String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_table_id        String                 @db.Uuid
+  requested_by_staff_id String?                @db.Uuid
+  prepared_by_staff_id  String?                @db.Uuid
+  delivered_by_staff_id String?                @db.Uuid
+  bottle_name           String
+  quantity              Int                    @default(1)
+  unit_price            Decimal                @db.Decimal(10,2)
+  total_price           Decimal                @db.Decimal(10,2)
+  status                TableBottleOrderStatus @default(requested)
+  note                  String?
+  created_at            DateTime               @default(now())
+  prepared_at           DateTime?
+  delivered_at          DateTime?
+  updated_at            DateTime               @updatedAt
+
+  event_table  event_tables @relation(fields: [event_table_id], references: [id])
+  requested_by users?       @relation("BottleOrderRequestedBy", fields: [requested_by_staff_id], references: [id], onDelete: SetNull)
+  prepared_by  users?       @relation("BottleOrderPreparedBy", fields: [prepared_by_staff_id], references: [id], onDelete: SetNull)
+  delivered_by users?       @relation("BottleOrderDeliveredBy", fields: [delivered_by_staff_id], references: [id], onDelete: SetNull)
+
+  @@index([event_table_id, created_at])
+  @@index([status, created_at])
+  @@index([requested_by_staff_id, created_at])
+  @@index([prepared_by_staff_id, created_at])
+  @@index([delivered_by_staff_id, created_at])
 }
 
 model event_presence_events {
