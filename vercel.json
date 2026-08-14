@@ -17,11 +17,7 @@
   "crons": [
     {
       "path": "/events/sync-status",
-      "schedule": "*/15 * * * *"
-    },
-    {
-      "path": "/reservations/sync-status",
-      "schedule": "0 * * * *"
+      "schedule": "0 2 * * *"
     },
     {
       "path": "/auth/cleanup-tokens",
