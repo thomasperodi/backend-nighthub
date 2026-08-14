@@ -243,7 +243,7 @@ export class VenuesService {
     qrToken: string,
   ): string | null {
     if (!passId || !qrToken) return null;
-    return `/venues/passes/apple/${encodeURIComponent(passId)}?token=${encodeURIComponent(qrToken)}`;
+    return `/api/venues/passes/apple/${encodeURIComponent(passId)}?token=${encodeURIComponent(qrToken)}`;
   }
 
   private readBufferFromEnv(
