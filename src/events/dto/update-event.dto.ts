@@ -23,7 +23,7 @@ export class UpdateEventDto {
   }>;
 
   table_pricing?: Array<{
-    venue_table_id: string;
+    venue_table_zone_id: string;
     per_testa?: number | string;
     costo_minimo?: number | string;
     persone_max?: number;

@@ -1,4 +1,13 @@
-import { BadRequestException, Body, Controller, Delete, Get, Param, Post, Query } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Post,
+  Query,
+} from '@nestjs/common';
 import { FriendsService } from './friends.service';
 import { FriendRequestDto } from './dto/friend-request.dto';
 import { CreateGroupDto } from './dto/create-group.dto';
@@ -35,15 +44,27 @@ export class FriendsController {
     return this.friendsService.getMapPresence(user.id);
   }
 
+  @Get('friends/tonight')
+  @Roles('client')
+  tonight(@CurrentUser() user: RequestUser) {
+    return this.friendsService.getFriendsTonight(user.id);
+  }
+
   @Post('friends/location')
   @Roles('client')
-  updateLocation(@Body() body: FriendLocationUpdateDto, @CurrentUser() user: RequestUser) {
+  updateLocation(
+    @Body() body: FriendLocationUpdateDto,
+    @CurrentUser() user: RequestUser,
+  ) {
     return this.friendsService.updateLocation(user.id, body);
   }
 
   @Post('friends/location-sharing')
   @Roles('client')
-  updateLocationSharing(@Body() body: FriendLocationSharingDto, @CurrentUser() user: RequestUser) {
+  updateLocationSharing(
+    @Body() body: FriendLocationSharingDto,
+    @CurrentUser() user: RequestUser,
+  ) {
     return this.friendsService.updateLocationSharing(user.id, body.enabled);
   }
 
@@ -150,7 +171,10 @@ export class FriendsController {
 
   @Get('friend-groups/:id/table-proposals')
   @Roles('client')
-  listGroupTableProposals(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+  listGroupTableProposals(
+    @Param('id') id: string,
+    @CurrentUser() user: RequestUser,
+  ) {
     return this.friendsService.listGroupTableProposals(id, user.id);
   }
 

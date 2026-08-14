@@ -8,7 +8,10 @@ import { Public } from './auth/public.decorator';
 export class AppController {
   constructor(private readonly appService: AppService) {}
 
-  private normalizeBaseUrl(value: string | undefined, fallback: string): string {
+  private normalizeBaseUrl(
+    value: string | undefined,
+    fallback: string,
+  ): string {
     const raw = String(value || '').trim();
     if (!raw) return fallback;
     const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
@@ -46,7 +49,8 @@ export class AppController {
 
     const encodedEventId = encodeURIComponent(String(eventId || '').trim());
     const query = new URLSearchParams();
-    if (typeof pr === 'string' && pr.trim().length > 0) query.set('pr', pr.trim());
+    if (typeof pr === 'string' && pr.trim().length > 0)
+      query.set('pr', pr.trim());
     if (wallet === 'apple' || wallet === 'google') query.set('wallet', wallet);
 
     const queryString = query.toString();
@@ -55,7 +59,8 @@ export class AppController {
     const deepLink = `nighthub://event/${encodedEventId}${querySuffix}`;
 
     const appBase = this.normalizeBaseUrl(
-      process.env.EXPO_PUBLIC_APP_SHARE_URL || process.env.EXPO_PUBLIC_APP_BASE_URL,
+      process.env.EXPO_PUBLIC_APP_SHARE_URL ||
+        process.env.EXPO_PUBLIC_APP_BASE_URL,
       'https://nighthub.app',
     );
     const webUrl = `${appBase}/event/${encodedEventId}${querySuffix}`;
@@ -79,7 +84,10 @@ export class AppController {
     const safeIosStoreUrl = this.escapeHtml(iosStoreUrl);
     const safeAndroidStoreUrl = this.escapeHtml(androidStoreUrl);
 
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.setHeader(
+      'Cache-Control',
+      'no-store, no-cache, must-revalidate, max-age=0',
+    );
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
 

@@ -9,9 +9,7 @@ export class PublicPromosController {
   constructor(private readonly promosService: PromosService) {}
 
   @Get('public/promos/active')
-  promosActive(
-    @Res({ passthrough: true }) res?: Response,
-  ) {
+  promosActive(@Res({ passthrough: true }) res?: Response) {
     res?.setHeader(
       'Cache-Control',
       'public, max-age=0, s-maxage=60, stale-while-revalidate=600',

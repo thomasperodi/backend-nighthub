@@ -229,7 +229,10 @@ export class PromosService {
     const payload = line.replace(/^\[target_rule\]\s*/i, '').trim();
     if (!payload) return null;
 
-    const pairs = payload.split(';').map((part) => part.trim()).filter(Boolean);
+    const pairs = payload
+      .split(';')
+      .map((part) => part.trim())
+      .filter(Boolean);
     const kv = new Map<string, string>();
     for (const pair of pairs) {
       const [key, ...rest] = pair.split('=');
@@ -243,7 +246,10 @@ export class PromosService {
       : undefined;
 
     const weeksRaw = Number(kv.get('weeks'));
-    const weeks = Number.isFinite(weeksRaw) && weeksRaw > 0 ? Math.floor(weeksRaw) : undefined;
+    const weeks =
+      Number.isFinite(weeksRaw) && weeksRaw > 0
+        ? Math.floor(weeksRaw)
+        : undefined;
 
     const customers = (kv.get('customers') || '')
       .split('|')
@@ -280,7 +286,10 @@ export class PromosService {
     if (!promos.length) return promos;
 
     const [user, userEntries] = await Promise.all([
-      this.prisma.users.findUnique({ where: { id: userId }, select: { id: true, username: true } }),
+      this.prisma.users.findUnique({
+        where: { id: userId },
+        select: { id: true, username: true },
+      }),
       this.prisma.entries.findMany({
         where: { user_id: userId },
         select: { created_at: true, event_id: true },
@@ -288,7 +297,9 @@ export class PromosService {
       }),
     ]);
 
-    const eventIds = Array.from(new Set(userEntries.map((entry) => entry.event_id).filter(Boolean)));
+    const eventIds = Array.from(
+      new Set(userEntries.map((entry) => entry.event_id).filter(Boolean)),
+    );
     const events = eventIds.length
       ? await this.prisma.events.findMany({
           where: { id: { in: eventIds } },
@@ -313,7 +324,9 @@ export class PromosService {
     }
 
     const normalizedUserId = this.normalizeIdentity(userId);
-    const normalizedUsername = user?.username ? this.normalizeIdentity(user.username) : null;
+    const normalizedUsername = user?.username
+      ? this.normalizeIdentity(user.username)
+      : null;
 
     return promos.filter((promo) => {
       const rule = this.parseTargetRule(promo.description);
@@ -330,9 +343,14 @@ export class PromosService {
       }
 
       if (rule.segment === 'specific') {
-        const allowed = (rule.customers ?? []).map((item) => this.normalizeIdentity(item));
+        const allowed = (rule.customers ?? []).map((item) =>
+          this.normalizeIdentity(item),
+        );
         if (!allowed.length) return false;
-        return allowed.includes(normalizedUserId) || (!!normalizedUsername && allowed.includes(normalizedUsername));
+        return (
+          allowed.includes(normalizedUserId) ||
+          (!!normalizedUsername && allowed.includes(normalizedUsername))
+        );
       }
 
       const weeks = Math.max(1, rule.weeks ?? 1);
@@ -430,13 +448,21 @@ export class PromosService {
 
   async createPromo(input: Partial<Prisma.promosCreateInput>) {
     const p = await this.prisma.promos.create({ data: input as any });
-    await this.sendPromoCreatedPush({
+
+    // Fire-and-forget: the push fan-out to all clients shouldn't block the response to
+    // whoever created the promo.
+    void this.sendPromoCreatedPush({
       id: p.id,
       venue_id: p.venue_id,
       event_id: p.event_id,
       title: p.title,
       description: p.description,
+    }).catch((error) => {
+      this.logger.warn(
+        `sendPromoCreatedPush failed for promo ${p.id}: ${String(error)}`,
+      );
     });
+
     return p;
   }
 

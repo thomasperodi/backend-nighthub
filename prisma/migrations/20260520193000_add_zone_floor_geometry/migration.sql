@@ -1,0 +1,5 @@
+ALTER TABLE "public"."venue_table_zones"
+  ADD COLUMN IF NOT EXISTS "floor_x" DECIMAL(10,2),
+  ADD COLUMN IF NOT EXISTS "floor_y" DECIMAL(10,2),
+  ADD COLUMN IF NOT EXISTS "floor_w" DECIMAL(10,2),
+  ADD COLUMN IF NOT EXISTS "floor_h" DECIMAL(10,2);

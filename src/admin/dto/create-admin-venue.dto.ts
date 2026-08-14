@@ -4,7 +4,6 @@ import {
   IsNumber,
   IsOptional,
   IsString,
-  IsUUID,
   Min,
 } from 'class-validator';
 
@@ -15,6 +14,10 @@ export class CreateAdminVenueDto {
   @IsOptional()
   @IsString()
   city?: string;
+
+  @IsOptional()
+  @IsString()
+  address?: string;
 
   @IsOptional()
   @IsNumber()
@@ -46,7 +49,9 @@ export class CreateAdminVenueDto {
   @IsString()
   contract_notes?: string;
 
+  // Accepts a user id, email, or username - whichever the admin has on hand (see
+  // AdminService.resolveUserByIdentifier).
   @IsOptional()
-  @IsUUID()
+  @IsString()
   manager_user_id?: string;
 }

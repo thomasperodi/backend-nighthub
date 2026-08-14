@@ -1,15 +1,10 @@
 import { Module } from '@nestjs/common';
-import { JwtModule } from '@nestjs/jwt';
 import { ReservationsController } from './reservations.controller';
 import { ReservationsService } from './reservations.service';
+import { BadgesModule } from '../badges/badges.module';
 
 @Module({
-  imports: [
-    JwtModule.register({
-      secret: process.env.JWT_SECRET || 'please_change_me',
-      signOptions: { expiresIn: '7d' },
-    }),
-  ],
+  imports: [BadgesModule],
   controllers: [ReservationsController],
   providers: [ReservationsService],
   exports: [ReservationsService],

@@ -1,8 +1,11 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
+  NotFoundException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
@@ -11,7 +14,9 @@ import { hash, compare } from 'bcrypt';
 import { Prisma, UserRole, users } from '@prisma/client';
 import { JwtService } from '@nestjs/jwt';
 import { createClient } from '@supabase/supabase-js';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
+import { REFRESH_TOKEN_TTL_MS } from './jwt.config';
+import type { AccessTokenPayload, RequestUser } from './types';
 
 export type PublicUser = {
   id: string;
@@ -21,13 +26,42 @@ export type PublicUser = {
   avatar?: string | null;
   role: string;
   venue_id?: string | null;
+  pr_venue_id?: string | null;
   created_at?: Date | null;
 };
 
-export type LoginResponse = { access_token: string; user: PublicUser } | null;
+export type LoginResult = {
+  accessToken: string;
+  user: PublicUser;
+  refreshToken: string;
+  refreshTokenExpiresAt: Date;
+} | null;
 
-// Simple in-memory revoked tokens store (for demo). For production use Redis or DB-backed store.
-const revokedTokens = new Set<string>();
+export type RefreshResult = {
+  accessToken: string;
+  user: PublicUser;
+  refreshToken: string;
+  refreshTokenExpiresAt: Date;
+};
+
+export type SessionMeta = { userAgent?: string; ip?: string };
+
+export type SessionSummary = {
+  id: string;
+  created_at: Date;
+  expires_at: Date;
+  user_agent: string | null;
+  ip: string | null;
+};
+
+// The refresh token is an opaque, high-entropy random value (NOT a JWT), sent to the
+// browser exclusively via an HttpOnly cookie scoped to the auth routes - JavaScript can
+// never read it, and it is never included in any JSON response body. Only its SHA-256
+// hash is ever persisted (see `refresh_tokens` in prisma/schema.prisma), so a database
+// leak alone does not hand out usable refresh tokens.
+export const REFRESH_COOKIE_NAME = 'nighthub_refresh_token';
+export const REFRESH_COOKIE_PATH = '/api/auth';
+export { REFRESH_TOKEN_TTL_MS };
 
 @Injectable()
 export class AuthService {
@@ -65,6 +99,22 @@ export class AuthService {
     }
 
     return false;
+  }
+
+  private async resolvePrDisplayContext(
+    userId: string,
+    baseRole: string,
+  ): Promise<{ role: string; pr_venue_id: string | null }> {
+    const activeMembership = await this.prisma.venue_pr_memberships.findFirst({
+      where: { user_id: userId, is_active: true },
+      select: { venue_id: true },
+    });
+
+    if (!activeMembership) {
+      return { role: baseRole, pr_venue_id: null };
+    }
+
+    return { role: 'pr', pr_venue_id: activeMembership.venue_id };
   }
 
   private normalizeIdentifier(value: string): string {
@@ -364,16 +414,11 @@ export class AuthService {
     };
   }
 
-  async register(dto: RegisterDto): Promise<PublicUser> {
-    const allowedRoles = new Set<string>(Object.values(UserRole));
-    const desiredRole = (dto.role ?? UserRole.client)
-      .toString()
-      .trim()
-      .toLowerCase();
-    if (!allowedRoles.has(desiredRole)) {
-      throw new BadRequestException('role invalid');
-    }
-    const role = desiredRole as UserRole;
+  async register(dto: RegisterDto, meta: SessionMeta = {}): Promise<LoginResult> {
+    // Public self-registration always creates a `client` account. Promoting a user to
+    // staff/venue/admin is an admin-only operation (AdminService.updateUserAssignment) -
+    // never trust a role/venue_id supplied by an unauthenticated caller here.
+    const role = UserRole.client;
 
     const bcryptHash = hash as (s: string, rounds: number) => Promise<string>;
     const hashedPassword = await bcryptHash(dto.password, 10);
@@ -387,13 +432,6 @@ export class AuthService {
     const name = String(dto.name || '').trim();
     if (!name) {
       throw new BadRequestException('name required');
-    }
-
-    if ((role === UserRole.staff || role === UserRole.venue) && !dto.venue_id) {
-      throw new BadRequestException('venue_id required for staff/venue');
-    }
-    if (role === UserRole.client && dto.venue_id) {
-      throw new BadRequestException('venue_id not allowed for client');
     }
 
     const birthDate = dto.birth_date ? new Date(dto.birth_date) : undefined;
@@ -414,7 +452,6 @@ export class AuthService {
           avatar: dto.avatar ?? undefined,
           sesso: dto.sesso ?? undefined,
           birth_date: birthDate ?? undefined,
-          venue_id: dto.venue_id ?? undefined,
         },
       });
     } catch (err) {
@@ -430,21 +467,106 @@ export class AuthService {
       throw err;
     }
 
-    const publicUser: PublicUser = {
+    // Auto-login after registration: the frontend expects the same session shape as
+    // POST /auth/login (access token in the body, refresh token in the cookie) so a new
+    // user is immediately authenticated instead of having to submit their password again
+    // right after typing it.
+    const accessToken = this.signAccessToken(user);
+    const refreshSession = await this.issueRefreshSession(user.id, meta);
+    const publicUser = await this.buildPublicUser(user);
+
+    return {
+      accessToken,
+      user: publicUser,
+      refreshToken: refreshSession.raw,
+      refreshTokenExpiresAt: refreshSession.expiresAt,
+    };
+  }
+
+  private signAccessToken(
+    user: Pick<users, 'id' | 'role' | 'venue_id'>,
+  ): string {
+    // Payload stays minimal on purpose (sub, role, venue_id only) - no email, no password,
+    // nothing that would be sensitive if the token were ever intercepted. Expiry comes from
+    // JwtModule's default signOptions (ACCESS_TOKEN_TTL_SECONDS, see jwt.config.ts).
+    const payload: AccessTokenPayload = {
+      sub: user.id,
+      role: user.role,
+      venue_id: user.venue_id,
+    };
+    return this.jwtService.sign(payload);
+  }
+
+  /**
+   * The single place that verifies an access token JWT. Used by JwtAuthGuard for every
+   * normal authenticated request, and reused (instead of re-implemented) anywhere else in
+   * the app that needs to accept an access token outside the guard - see
+   * EventsController's cron endpoint, which also allows a shared-secret fallback.
+   */
+  verifyAccessToken(token: string): RequestUser {
+    let payload: unknown;
+    try {
+      payload = this.jwtService.verify(token);
+    } catch {
+      throw new UnauthorizedException('Invalid token');
+    }
+
+    if (!payload || typeof payload !== 'object' || !('sub' in payload)) {
+      throw new UnauthorizedException('Invalid token payload');
+    }
+
+    const p = payload as Partial<AccessTokenPayload>;
+    const id = String(p.sub || '');
+    const role = String(p.role || '').toLowerCase();
+    if (!id || !role) throw new UnauthorizedException('Invalid token payload');
+
+    return { id, role, venue_id: p.venue_id ?? null };
+  }
+
+  private hashRefreshToken(rawToken: string): string {
+    return createHash('sha256').update(rawToken).digest('hex');
+  }
+
+  private async issueRefreshSession(
+    userId: string,
+    meta: SessionMeta,
+    familyId?: string,
+  ): Promise<{ raw: string; expiresAt: Date; id: string }> {
+    const raw = randomBytes(64).toString('base64url');
+    const tokenHash = this.hashRefreshToken(raw);
+    const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
+
+    const row = await this.prisma.refresh_tokens.create({
+      data: {
+        user_id: userId,
+        token_hash: tokenHash,
+        family_id: familyId ?? randomUUID(),
+        expires_at: expiresAt,
+        user_agent: meta.userAgent?.slice(0, 512),
+        ip: meta.ip?.slice(0, 64),
+      },
+      select: { id: true },
+    });
+
+    return { raw, expiresAt, id: row.id };
+  }
+
+  private async buildPublicUser(user: users): Promise<PublicUser> {
+    const prContext = await this.resolvePrDisplayContext(user.id, user.role);
+    return {
       id: user.id,
       email: user.email,
       username: user.username,
       name: user.name,
       avatar: user.avatar,
-      role: user.role,
+      role: prContext.role,
       venue_id: user.venue_id,
+      pr_venue_id: prContext.pr_venue_id,
       created_at: user.created_at,
     };
-
-    return publicUser;
   }
 
-  async login(dto: LoginDto): Promise<LoginResponse> {
+  async login(dto: LoginDto, meta: SessionMeta = {}): Promise<LoginResult> {
     const input = dto as unknown as {
       identifier?: unknown;
       email?: unknown;
@@ -469,25 +591,211 @@ export class AuthService {
     const valid = await bcryptCompare(input.password, user.password_hash);
     if (!valid) return null;
 
+    // Deliberately thrown (not `return null`) so a suspended account gets a distinct,
+    // explicit error instead of blending into the generic "invalid credentials" response.
+    await this.assertUsableAccount(user);
+
     await this.touchUserActivity(user.id, new Date());
 
-    // Include venue_id in the token payload to enable efficient venue-scoped authorization.
-    // Fallback DB lookup is still possible for older tokens.
-    const payload = { sub: user.id, role: user.role, venue_id: user.venue_id };
-    const access_token = this.jwtService.sign(payload, { expiresIn: '7d' });
+    const accessToken = this.signAccessToken(user);
+    const refreshSession = await this.issueRefreshSession(user.id, meta);
+    const publicUser = await this.buildPublicUser(user);
 
-    const publicUser: PublicUser = {
-      id: user.id,
-      email: user.email,
-      username: user.username,
-      name: user.name,
-      avatar: user.avatar,
-      role: user.role,
-      venue_id: user.venue_id,
-      created_at: user.created_at,
+    return {
+      accessToken,
+      user: publicUser,
+      refreshToken: refreshSession.raw,
+      refreshTokenExpiresAt: refreshSession.expiresAt,
     };
+  }
 
-    return { access_token, user: publicUser };
+  /**
+   * POST /auth/refresh core logic. Verifies the opaque refresh token read from the
+   * HttpOnly cookie, then rotates it: the presented token is revoked and a brand-new one
+   * is issued in the same "family" (family_id), which is what lets reuse detection revoke
+   * the whole session below if the old, already-rotated token is ever presented again.
+   */
+  async refreshSession(
+    rawToken: string | undefined,
+    meta: SessionMeta = {},
+  ): Promise<RefreshResult> {
+    if (!rawToken) {
+      throw new UnauthorizedException('Missing refresh token');
+    }
+
+    const tokenHash = this.hashRefreshToken(rawToken);
+    const existing = await this.prisma.refresh_tokens.findUnique({
+      where: { token_hash: tokenHash },
+    });
+
+    if (!existing) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    if (existing.revoked_at) {
+      // This exact token was already rotated away (or explicitly revoked) once before.
+      // Being presented again means either a replay of an old cookie, or a genuine token
+      // theft where the legitimate rotation already happened. Either way, treat the whole
+      // session as compromised rather than just rejecting this one request.
+      await this.revokeFamily(existing.family_id);
+      this.logger.warn(
+        `Refresh token reuse detected for user ${existing.user_id}, family ${existing.family_id} - session revoked.`,
+      );
+      throw new UnauthorizedException('Refresh token reuse detected');
+    }
+
+    if (existing.expires_at.getTime() < Date.now()) {
+      throw new UnauthorizedException('Refresh token expired');
+    }
+
+    const user = await this.prisma.users.findUnique({
+      where: { id: existing.user_id },
+    });
+    if (!user) {
+      await this.revokeFamily(existing.family_id);
+      throw new UnauthorizedException('User no longer exists');
+    }
+    try {
+      await this.assertUsableAccount(user);
+    } catch (error) {
+      // A suspension applied mid-session revokes the whole refresh family immediately -
+      // this is what bounds a suspension to at most one access-token TTL (15 min, see
+      // jwt-auth.guard.ts) instead of the account staying usable until the refresh token's
+      // own multi-day expiry.
+      await this.revokeFamily(existing.family_id);
+      throw error;
+    }
+
+    const next = await this.issueRefreshSession(
+      user.id,
+      meta,
+      existing.family_id,
+    );
+
+    await this.prisma.refresh_tokens.update({
+      where: { id: existing.id },
+      data: { revoked_at: new Date(), replaced_by: next.id },
+    });
+
+    const accessToken = this.signAccessToken(user);
+    const publicUser = await this.buildPublicUser(user);
+
+    return {
+      accessToken,
+      user: publicUser,
+      refreshToken: next.raw,
+      refreshTokenExpiresAt: next.expiresAt,
+    };
+  }
+
+  // Checked at login and at refresh (never per-request - see the comment on
+  // JwtAuthGuard.canActivate for why access tokens are deliberately stateless). Covers two
+  // independent suspension levers an admin can pull: the user's own `is_active`, and - for
+  // venue/staff accounts - their venue's `contract_status` (set via
+  // AdminService.setAccountActive).
+  private async assertUsableAccount(user: users): Promise<void> {
+    if (!user.is_active) {
+      throw new ForbiddenException('Account sospeso. Contatta il supporto.');
+    }
+    if ((user.role === 'venue' || user.role === 'staff') && user.venue_id) {
+      const venue = await this.prisma.venues.findUnique({
+        where: { id: user.venue_id },
+        select: { contract_status: true },
+      });
+      if (venue?.contract_status === 'suspended') {
+        throw new ForbiddenException(
+          'Il locale associato a questo account è sospeso. Contatta il supporto.',
+        );
+      }
+    }
+  }
+
+  private async revokeFamily(familyId: string) {
+    await this.prisma.refresh_tokens.updateMany({
+      where: { family_id: familyId, revoked_at: null },
+      data: { revoked_at: new Date() },
+    });
+  }
+
+  /** POST /auth/logout: revokes only the current session's refresh token. Idempotent and
+   * DB-backed, so (unlike the old in-memory blacklist) it actually works across the
+   * multiple concurrent instances a serverless deployment (Vercel) can run. */
+  async logout(rawToken?: string): Promise<{ success: boolean }> {
+    if (!rawToken) return { success: true };
+
+    const tokenHash = this.hashRefreshToken(rawToken);
+    await this.prisma.refresh_tokens.updateMany({
+      where: { token_hash: tokenHash, revoked_at: null },
+      data: { revoked_at: new Date() },
+    });
+
+    return { success: true };
+  }
+
+  async listSessions(userId: string): Promise<SessionSummary[]> {
+    return this.prisma.refresh_tokens.findMany({
+      where: {
+        user_id: userId,
+        revoked_at: null,
+        expires_at: { gt: new Date() },
+      },
+      orderBy: { created_at: 'desc' },
+      select: {
+        id: true,
+        created_at: true,
+        expires_at: true,
+        user_agent: true,
+        ip: true,
+      },
+    });
+  }
+
+  async revokeSessionById(
+    userId: string,
+    sessionId: string,
+  ): Promise<{ success: boolean }> {
+    const row = await this.prisma.refresh_tokens.findUnique({
+      where: { id: sessionId },
+      select: { id: true, user_id: true, revoked_at: true },
+    });
+
+    // Ownership check: a session belongs to exactly one user. Report "not found" rather
+    // than "forbidden" either way, so this endpoint can't be used to probe which session
+    // ids exist for other users.
+    if (!row || row.user_id !== userId) {
+      throw new NotFoundException('Session not found');
+    }
+
+    if (!row.revoked_at) {
+      await this.prisma.refresh_tokens.update({
+        where: { id: sessionId },
+        data: { revoked_at: new Date() },
+      });
+    }
+
+    return { success: true };
+  }
+
+  /** "Logout everywhere". `exceptRawToken`, when passed, keeps the caller's own current
+   * session alive (e.g. a "log out other devices" action from a settings screen). */
+  async revokeAllSessions(
+    userId: string,
+    exceptRawToken?: string,
+  ): Promise<{ success: boolean }> {
+    const exceptTokenHash = exceptRawToken
+      ? this.hashRefreshToken(exceptRawToken)
+      : undefined;
+
+    await this.prisma.refresh_tokens.updateMany({
+      where: {
+        user_id: userId,
+        revoked_at: null,
+        ...(exceptTokenHash ? { token_hash: { not: exceptTokenHash } } : {}),
+      },
+      data: { revoked_at: new Date() },
+    });
+
+    return { success: true };
   }
 
   async requestPasswordReset(identifier?: string, redirectTo?: string) {
@@ -551,6 +859,9 @@ export class AuthService {
       {
         sub: user.id,
         type: 'password_reset',
+        // Unique per issued token so resetPassword() can mark this exact token as consumed
+        // and reject a second use, instead of the token staying valid for its whole TTL.
+        jti: randomUUID(),
       },
       {
         expiresIn: `${this.passwordResetTokenTtlSeconds}s`,
@@ -593,15 +904,40 @@ export class AuthService {
       );
     }
 
-    let payload: { sub?: string; type?: string };
+    let payload: { sub?: string; type?: string; jti?: string; exp?: number };
     try {
       payload = this.jwtService.verify(token);
     } catch {
       throw new BadRequestException('Token reset non valido o scaduto');
     }
 
-    if (!payload?.sub || payload?.type !== 'password_reset') {
+    if (!payload?.sub || payload?.type !== 'password_reset' || !payload?.jti) {
       throw new BadRequestException('Token reset non valido o scaduto');
+    }
+
+    // Atomically claim this token's jti. The `jti` primary key means a concurrent or
+    // repeated attempt with the same token hits a unique-constraint violation here instead
+    // of both succeeding - single-use is enforced by the database, not by a check-then-act
+    // race in application code.
+    try {
+      await this.prisma.used_password_reset_tokens.create({
+        data: {
+          jti: payload.jti,
+          expires_at: payload.exp
+            ? new Date(payload.exp * 1000)
+            : new Date(Date.now() + this.passwordResetTokenTtlSeconds * 1000),
+        },
+      });
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new BadRequestException(
+          'Token reset già utilizzato: richiedine uno nuovo',
+        );
+      }
+      throw error;
     }
 
     const bcryptHash = hash as (s: string, rounds: number) => Promise<string>;
@@ -662,21 +998,100 @@ export class AuthService {
     return { success: true };
   }
 
-  // Revoke token (logout)
-  logout(token?: string) {
-    if (!token) return false;
-    revokedTokens.add(token);
-    return true;
+  // Authenticated change-password (distinct from the forgot/reset-password flow above,
+  // which doesn't require knowing the current password). Revokes every other refresh
+  // session on success - the same reasoning as a suspension: a password change should not
+  // leave old sessions (e.g. a stolen device) still valid.
+  async changePassword(
+    userId: string,
+    currentPassword: string,
+    newPassword: string,
+  ) {
+    if (!currentPassword) {
+      throw new BadRequestException('current_password required');
+    }
+    if (!newPassword || newPassword.length < 6) {
+      throw new BadRequestException(
+        'La nuova password deve contenere almeno 6 caratteri',
+      );
+    }
+
+    const user = await this.prisma.users.findUnique({ where: { id: userId } });
+    if (!user) throw new NotFoundException('User not found');
+
+    const bcryptCompare = compare as (a: string, b: string) => Promise<boolean>;
+    const valid = await bcryptCompare(currentPassword, user.password_hash);
+    if (!valid) {
+      throw new BadRequestException('Password attuale non corretta');
+    }
+
+    const bcryptHash = hash as (s: string, rounds: number) => Promise<string>;
+    const hashedPassword = await bcryptHash(newPassword, 10);
+
+    await this.prisma.$transaction([
+      this.prisma.users.update({
+        where: { id: userId },
+        data: { password_hash: hashedPassword },
+      }),
+      this.prisma.refresh_tokens.updateMany({
+        where: { user_id: userId, revoked_at: null },
+        data: { revoked_at: new Date() },
+      }),
+    ]);
+
+    return { success: true };
   }
 
-  isTokenRevoked(token?: string) {
-    if (!token) return false;
-    return revokedTokens.has(token);
-  }
-
+  // A hard `users.delete` throws a foreign-key violation the moment the account has any
+  // reservation/entry/friendship/etc. (most of those relations have no onDelete: Cascade -
+  // same class of bug as the one fixed on deleteEvent). Anonymizing + deactivating instead
+  // of deleting sidesteps that entirely, and is also the more correct behavior here: a
+  // venue's historical entry/revenue counts shouldn't disappear because one attendee later
+  // deleted their account. Sessions are revoked so the account can't be used again.
   async deleteUser(userId: string) {
-    // remove related data first if needed, then delete user
-    await this.prisma.users.delete({ where: { id: userId } });
+    const anonymizedSuffix = randomUUID();
+
+    await this.prisma.$transaction([
+      this.prisma.users.update({
+        where: { id: userId },
+        data: {
+          is_active: false,
+          email: `deleted-${anonymizedSuffix}@nighthub.deleted`,
+          username: `deleted-${anonymizedSuffix}`,
+          name: null,
+          phone: null,
+          avatar: null,
+          push_token: null,
+          location_sharing_enabled: false,
+          last_latitude: null,
+          last_longitude: null,
+        },
+      }),
+      this.prisma.refresh_tokens.updateMany({
+        where: { user_id: userId, revoked_at: null },
+        data: { revoked_at: new Date() },
+      }),
+    ]);
+  }
+
+  // Called by the cleanup-tokens cron endpoint - purges rows that are inert but would
+  // otherwise accumulate forever (nothing else deletes them).
+  async cleanupExpiredTokens() {
+    const now = new Date();
+    const [refreshTokens, resetTokens] = await Promise.all([
+      this.prisma.refresh_tokens.deleteMany({
+        where: { expires_at: { lt: now } },
+      }),
+      this.prisma.used_password_reset_tokens.deleteMany({
+        where: { expires_at: { lt: now } },
+      }),
+    ]);
+
+    return {
+      success: true,
+      deleted_refresh_tokens: refreshTokens.count,
+      deleted_reset_tokens: resetTokens.count,
+    };
   }
 
   async setPushToken(userId: string, pushToken: string) {

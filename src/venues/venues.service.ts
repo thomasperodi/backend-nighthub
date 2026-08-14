@@ -3,8 +3,14 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  InternalServerErrorException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { SupabaseStorageService } from '../common/storage/supabase-storage.service';
+import { BadgesService } from '../badges/badges.service';
+import { AuditLogService } from '../common/audit/audit-log.service';
+import { TtlCache } from '../common/ttl-cache';
+import { geocodeAddress } from '../common/geocoding';
 import type { RequestUser } from '../auth/types';
 import {
   AgeBucket,
@@ -14,14 +20,18 @@ import {
   Prisma,
   ReservationStatus,
   ReservationType,
+  VenueFloorLandmarkType,
   VenueStationType,
+  VenueTableBookingPolicy,
   events,
   promos,
+  venue_floor_landmarks,
+  venue_floor_plans,
+  venue_table_zones,
   venue_tables,
   venue_stations,
   venues,
 } from '@prisma/client';
-import Stripe from 'stripe';
 import { resolveEntryUnitPrice } from '../common/entry-pricing';
 import { CreateVenueTablesBulkDto } from './dto/create-venue-tables-bulk.dto';
 import { CreateVenueStationsBulkDto } from './dto/create-venue-stations-bulk.dto';
@@ -34,6 +44,10 @@ import {
   DEFAULT_CLOAKROOM_UNIT_PRICE,
   VenueBarPriceKey,
 } from './venue-pricing.constants';
+import { randomUUID } from 'crypto';
+import { readFileSync } from 'fs';
+import { isAbsolute, resolve as resolvePath } from 'path';
+import { PKPass } from 'passkit-generator';
 
 type AnalyticsDistributionItem = {
   label: string;
@@ -62,6 +76,12 @@ type AnalyticsEventSummary = {
   men: number;
   other: number;
   unknown: number;
+};
+
+type VenueFloorPlanPayload = venue_floor_plans & {
+  landmarks: venue_floor_landmarks[];
+  zones: venue_table_zones[];
+  tables: venue_tables[];
 };
 
 type PrNetworkRoleDb = 'responsabile' | 'capo_squadra' | 'pr';
@@ -133,9 +153,74 @@ type PrMembershipVenueRow = {
   updated_at: Date;
 };
 
+type PrSeasonPassStatusDb = 'active' | 'revoked' | 'expired';
+
+type PrSeasonPassRow = {
+  id: string;
+  venue_id: string;
+  pr_membership_id: string;
+  user_id: string;
+  status: PrSeasonPassStatusDb;
+  valid_from: Date;
+  valid_until: Date;
+  qr_token: string;
+  serial_number: string;
+  wallet_apple_url: string | null;
+  wallet_google_url: string | null;
+  wallet_last_issued_at: Date | null;
+  revoked_at: Date | null;
+  metadata: unknown;
+  created_at: Date;
+  updated_at: Date;
+  membership_role: PrNetworkRoleDb;
+  membership_is_active: boolean;
+};
+
+type PrSeasonPassAppleDownloadRow = {
+  id: string;
+  venue_id: string;
+  pr_membership_id: string;
+  user_id: string;
+  status: PrSeasonPassStatusDb;
+  valid_from: Date;
+  valid_until: Date;
+  qr_token: string;
+  serial_number: string;
+  revoked_at: Date | null;
+  venue_name: string;
+  venue_city: string | null;
+  user_name: string | null;
+  user_username: string | null;
+  user_email: string;
+  membership_role: PrNetworkRoleDb;
+  membership_is_active: boolean;
+};
+
 @Injectable()
 export class VenuesService {
-  constructor(private readonly prisma: PrismaService) {}
+  // Short-TTL in-process cache for the expensive analytics aggregates (audit §6: the real
+  // fix is pre-aggregation, but a short TTL cache is a safe, low-risk stopgap that
+  // deduplicates repeated/polled hits without changing the response shape or staleness
+  // tolerance the frontend already has (these views already accept `s-maxage` HTTP caching).
+  private readonly analyticsCache = new TtlCache();
+  private static readonly ANALYTICS_CACHE_TTL_MS = 15_000;
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly storage: SupabaseStorageService,
+    private readonly badgesService: BadgesService,
+    private readonly auditLog: AuditLogService,
+  ) {}
+
+  private evaluateBadges(userId: string | null | undefined) {
+    if (!userId) return;
+    void this.badgesService.evaluateForUser(userId).catch(() => {});
+  }
+
+  private readonly minimalPassPngBuffer = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7+RhsAAAAASUVORK5CYII=',
+    'base64',
+  );
 
   private readonly weekdayLabels = [
     'Dom',
@@ -146,6 +231,256 @@ export class VenuesService {
     'Ven',
     'Sab',
   ];
+
+  private isUuid(value: string): boolean {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      String(value || '').trim(),
+    );
+  }
+
+  private buildInternalAppleWalletUrl(
+    passId: string,
+    qrToken: string,
+  ): string | null {
+    if (!passId || !qrToken) return null;
+    return `/venues/passes/apple/${encodeURIComponent(passId)}?token=${encodeURIComponent(qrToken)}`;
+  }
+
+  private readBufferFromEnv(
+    base64EnvName: string,
+    pathEnvName: string,
+  ): Buffer | null {
+    const base64Value = String(process.env[base64EnvName] || '').trim();
+    if (base64Value) {
+      if (base64Value.includes('-----BEGIN')) {
+        return Buffer.from(base64Value.replace(/\\n/g, '\n'));
+      }
+      try {
+        return Buffer.from(base64Value, 'base64');
+      } catch {
+        throw new InternalServerErrorException(
+          `${base64EnvName} is not a valid base64 payload`,
+        );
+      }
+    }
+
+    const pathValue = String(process.env[pathEnvName] || '').trim();
+    if (!pathValue) return null;
+
+    try {
+      const resolvedPath = isAbsolute(pathValue)
+        ? pathValue
+        : resolvePath(process.cwd(), pathValue);
+      return readFileSync(resolvedPath);
+    } catch {
+      throw new InternalServerErrorException(
+        `${pathEnvName} points to an unreadable file`,
+      );
+    }
+  }
+
+  private readBufferFromEnvCandidates(
+    entries: Array<{ base64EnvName: string; pathEnvName: string }>,
+  ): Buffer | null {
+    for (const entry of entries) {
+      const value = this.readBufferFromEnv(
+        entry.base64EnvName,
+        entry.pathEnvName,
+      );
+      if (value) return value;
+    }
+    return null;
+  }
+
+  private getAppleWalletPasskitConfig() {
+    const passTypeIdentifier = String(
+      process.env.APPLE_WALLET_PASS_TYPE_IDENTIFIER ||
+        process.env.WALLET_APPLE_PASS_TYPE_IDENTIFIER ||
+        '',
+    ).trim();
+    const teamIdentifier = String(
+      process.env.APPLE_WALLET_TEAM_IDENTIFIER ||
+        process.env.WALLET_APPLE_TEAM_IDENTIFIER ||
+        '',
+    ).trim();
+
+    const organizationName = String(
+      process.env.APPLE_WALLET_ORGANIZATION_NAME ||
+        process.env.WALLET_APPLE_ORGANIZATION_NAME ||
+        'NightHub',
+    ).trim();
+    const logoText = String(
+      process.env.APPLE_WALLET_LOGO_TEXT ||
+        process.env.WALLET_APPLE_LOGO_TEXT ||
+        'NightHub PR',
+    ).trim();
+
+    if (!passTypeIdentifier) {
+      throw new InternalServerErrorException(
+        'Missing APPLE_WALLET_PASS_TYPE_IDENTIFIER',
+      );
+    }
+    if (!teamIdentifier) {
+      throw new InternalServerErrorException(
+        'Missing APPLE_WALLET_TEAM_IDENTIFIER',
+      );
+    }
+
+    const wwdr = this.readBufferFromEnvCandidates([
+      {
+        base64EnvName: 'APPLE_WALLET_WWDR_BASE64',
+        pathEnvName: 'APPLE_WALLET_WWDR_PATH',
+      },
+      {
+        base64EnvName: 'WALLET_APPLE_WWDR_BASE64',
+        pathEnvName: 'WALLET_APPLE_WWDR_PATH',
+      },
+    ]);
+    const signerCert = this.readBufferFromEnvCandidates([
+      {
+        base64EnvName: 'APPLE_WALLET_SIGNER_CERT_BASE64',
+        pathEnvName: 'APPLE_WALLET_SIGNER_CERT_PATH',
+      },
+      {
+        base64EnvName: 'WALLET_APPLE_SIGNER_CERT_BASE64',
+        pathEnvName: 'WALLET_APPLE_SIGNER_CERT_PATH',
+      },
+    ]);
+    const signerKey = this.readBufferFromEnvCandidates([
+      {
+        base64EnvName: 'APPLE_WALLET_SIGNER_KEY_BASE64',
+        pathEnvName: 'APPLE_WALLET_SIGNER_KEY_PATH',
+      },
+      {
+        base64EnvName: 'WALLET_APPLE_SIGNER_KEY_BASE64',
+        pathEnvName: 'WALLET_APPLE_SIGNER_KEY_PATH',
+      },
+    ]);
+
+    const signerKeyPassphrase =
+      String(
+        process.env.APPLE_WALLET_SIGNER_KEY_PASSPHRASE ||
+          process.env.WALLET_APPLE_SIGNER_KEY_PASSPHRASE ||
+          '',
+      ).trim() || undefined;
+
+    if (!wwdr || !signerCert || !signerKey) {
+      throw new InternalServerErrorException(
+        'Apple Wallet certificates are not configured (WWDR, signer cert, signer key)',
+      );
+    }
+
+    return {
+      passTypeIdentifier,
+      teamIdentifier,
+      organizationName,
+      logoText,
+      wwdr,
+      signerCert,
+      signerKey,
+      signerKeyPassphrase,
+    };
+  }
+
+  private buildPrSeasonPassApplePkpass(
+    row: PrSeasonPassAppleDownloadRow,
+  ): Buffer {
+    const config = this.getAppleWalletPasskitConfig();
+
+    const holderName = row.user_name || row.user_username || row.user_email;
+    const qrPayload = JSON.stringify(
+      this.buildPrSeasonPassQrPayload({
+        passId: row.id,
+        venueId: row.venue_id,
+        membershipId: row.pr_membership_id,
+        userId: row.user_id,
+        qrToken: row.qr_token,
+        serialNumber: row.serial_number,
+        validUntil: row.valid_until,
+      }),
+    );
+
+    const passJson = {
+      formatVersion: 1 as const,
+      serialNumber: row.serial_number,
+      description: `Pass stagionale PR - ${row.venue_name}`,
+      organizationName: config.organizationName,
+      passTypeIdentifier: config.passTypeIdentifier,
+      teamIdentifier: config.teamIdentifier,
+      logoText: config.logoText,
+      backgroundColor: 'rgb(18, 20, 25)',
+      foregroundColor: 'rgb(245, 247, 251)',
+      labelColor: 'rgb(216, 179, 106)',
+      expirationDate: row.valid_until.toISOString(),
+      sharingProhibited: false,
+      generic: {
+        primaryFields: [
+          {
+            key: 'venue',
+            label: 'LOCALE',
+            value: row.venue_name,
+          },
+        ],
+        secondaryFields: [
+          {
+            key: 'holder',
+            label: 'PR',
+            value: holderName,
+          },
+          {
+            key: 'role',
+            label: 'RUOLO',
+            value: this.toPrRoleApi(row.membership_role),
+          },
+        ],
+        auxiliaryFields: [
+          {
+            key: 'valid_until',
+            label: 'VALIDO FINO',
+            value: row.valid_until.toISOString().slice(0, 10),
+          },
+        ],
+        backFields: [
+          {
+            key: 'serial_number',
+            label: 'Seriale pass',
+            value: row.serial_number,
+          },
+          {
+            key: 'membership_id',
+            label: 'Membership',
+            value: row.pr_membership_id,
+          },
+          {
+            key: 'city',
+            label: 'Citta',
+            value: row.venue_city || '-',
+          },
+        ],
+      },
+    };
+
+    const pass = new PKPass(
+      {
+        'icon.png': this.minimalPassPngBuffer,
+        'icon@2x.png': this.minimalPassPngBuffer,
+        'icon@3x.png': this.minimalPassPngBuffer,
+        'logo.png': this.minimalPassPngBuffer,
+        'logo@2x.png': this.minimalPassPngBuffer,
+        'logo@3x.png': this.minimalPassPngBuffer,
+        'pass.json': Buffer.from(JSON.stringify(passJson)),
+      },
+      {
+        wwdr: config.wwdr,
+        signerCert: config.signerCert,
+        signerKey: config.signerKey,
+        signerKeyPassphrase: config.signerKeyPassphrase,
+      },
+    );
+
+    pass.setBarcodes(qrPayload);
+    return pass.getAsBuffer();
+  }
 
   private decimalToNumber(value: unknown): number {
     if (value === null || value === undefined) return 0;
@@ -164,6 +499,48 @@ export class VenuesService {
       }
     }
     return 0;
+  }
+
+  private normalizeManagedImagePath(
+    value: string | null | undefined,
+    prefix: 'users' | 'venues',
+  ): string | null | undefined {
+    if (value === undefined) return undefined;
+    if (value === null) return null;
+
+    const input = String(value).trim();
+    if (!input) return null;
+
+    if (/^data:image\//i.test(input)) {
+      throw new BadRequestException(
+        'image must be uploaded before updating the venue',
+      );
+    }
+
+    const sanitizedInput = input.replace(/[?#].*$/, '');
+    const match = new RegExp(
+      `(^|/)(${prefix}/[A-Za-z0-9._-]+\\.(?:png|jpe?g|webp))$`,
+      'i',
+    ).exec(sanitizedInput);
+
+    if (!match?.[2]) {
+      throw new BadRequestException(
+        `image must be a valid ${prefix} storage path`,
+      );
+    }
+
+    return match[2];
+  }
+
+  private isManagedImagePath(
+    value: string | null | undefined,
+    prefix: 'users' | 'venues',
+  ): boolean {
+    if (!value) return false;
+    return new RegExp(
+      `(^|/)${prefix}/[A-Za-z0-9._-]+\\.(?:png|jpe?g|webp)$`,
+      'i',
+    ).test(value.replace(/[?#].*$/, ''));
   }
 
   private normalizeBarPriceList(value: unknown) {
@@ -197,7 +574,9 @@ export class VenuesService {
       const row = raw as { key?: unknown; label?: unknown; price?: unknown };
       const key = typeof row.key === 'string' ? row.key.trim() : '';
       if (!key || !BAR_PRICE_KEYS.has(key as VenueBarPriceKey)) {
-        throw new BadRequestException(`Unsupported bar price key: ${key || 'unknown'}`);
+        throw new BadRequestException(
+          `Unsupported bar price key: ${key || 'unknown'}`,
+        );
       }
       if (seenKeys.has(key)) {
         throw new BadRequestException(`Duplicate bar price key: ${key}`);
@@ -229,8 +608,6 @@ export class VenuesService {
 
     return list;
   }
-
-
 
   private normalizeBottlePriceList(value: unknown) {
     if (!Array.isArray(value)) {
@@ -300,17 +677,6 @@ export class VenuesService {
     return list;
   }
 
-  private getStripeClient(): Stripe {
-    const secret = process.env.STRIPE_SECRET_KEY;
-    if (!secret) {
-      throw new BadRequestException(
-        'Stripe not configured: missing STRIPE_SECRET_KEY',
-      );
-    }
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
-    return new Stripe(secret, { apiVersion: '2025-02-24.acacia' });
-  }
-
   private startOfDay(date: Date): Date {
     return new Date(date.getFullYear(), date.getMonth(), date.getDate());
   }
@@ -333,14 +699,14 @@ export class VenuesService {
     referenceDate?: Date | null,
   ): number | null {
     if (!birthDate || Number.isNaN(birthDate.getTime())) return null;
-    const ref = referenceDate && !Number.isNaN(referenceDate.getTime())
-      ? referenceDate
-      : new Date();
+    const ref =
+      referenceDate && !Number.isNaN(referenceDate.getTime())
+        ? referenceDate
+        : new Date();
     let age = ref.getFullYear() - birthDate.getFullYear();
     const monthDiff = ref.getMonth() - birthDate.getMonth();
     const beforeBirthday =
-      monthDiff < 0 ||
-      (monthDiff === 0 && ref.getDate() < birthDate.getDate());
+      monthDiff < 0 || (monthDiff === 0 && ref.getDate() < birthDate.getDate());
     if (beforeBirthday) age -= 1;
     return age >= 0 && age <= 100 ? age : null;
   }
@@ -353,7 +719,7 @@ export class VenuesService {
     if (age < 35) return '30-34';
     return '35+';
   }
-  
+
   private ageBucketFromStored(value?: AgeBucket | null): string {
     if (!value) return 'Non disponibile';
     if (value === AgeBucket.AGE_18_20) return '18-20';
@@ -363,7 +729,7 @@ export class VenuesService {
     if (value === AgeBucket.AGE_35_PLUS) return '35+';
     return 'Non disponibile';
   }
-  
+
   private representativeAgeFromStoredBucket(
     value?: AgeBucket | null,
   ): number | null {
@@ -408,13 +774,16 @@ export class VenuesService {
     source: Map<string, number>,
     total?: number,
   ): AnalyticsDistributionItem[] {
-    const resolvedTotal = total ?? Array.from(source.values()).reduce((acc, value) => acc + value, 0);
+    const resolvedTotal =
+      total ??
+      Array.from(source.values()).reduce((acc, value) => acc + value, 0);
     return Array.from(source.entries())
       .sort((a, b) => b[1] - a[1])
       .map(([label, count]) => ({
         label,
         count,
-        share: resolvedTotal > 0 ? this.round((count / resolvedTotal) * 100, 1) : 0,
+        share:
+          resolvedTotal > 0 ? this.round((count / resolvedTotal) * 100, 1) : 0,
       }));
   }
 
@@ -436,8 +805,12 @@ export class VenuesService {
     return 'Tavoli';
   }
 
-  private normalizeAppRole(role: unknown): 'client' | 'staff' | 'venue' | 'admin' | '' {
-    const normalized = String(role ?? '').trim().toLowerCase();
+  private normalizeAppRole(
+    role: unknown,
+  ): 'client' | 'staff' | 'venue' | 'admin' | '' {
+    const normalized = String(role ?? '')
+      .trim()
+      .toLowerCase();
     if (
       normalized === 'client' ||
       normalized === 'staff' ||
@@ -456,7 +829,9 @@ export class VenuesService {
   }
 
   private toPrRoleDb(role: string): PrNetworkRoleDb {
-    const normalized = String(role || '').trim().toLowerCase();
+    const normalized = String(role || '')
+      .trim()
+      .toLowerCase();
     if (normalized === 'responsabile') return 'responsabile';
     if (normalized === 'capo_squadra') return 'capo_squadra';
     if (normalized === 'pr') return 'pr';
@@ -486,7 +861,9 @@ export class VenuesService {
     return Gender.ALTRO;
   }
 
-  private normalizeManualGenderInput(gender?: 'M' | 'F' | 'ALTRO'): Gender | null {
+  private normalizeManualGenderInput(
+    gender?: 'M' | 'F' | 'ALTRO',
+  ): Gender | null {
     if (gender === 'M') return Gender.M;
     if (gender === 'F') return Gender.F;
     if (gender === 'ALTRO') return Gender.ALTRO;
@@ -592,6 +969,184 @@ export class VenuesService {
       created_at: this.toIsoString(row.created_at),
       updated_at: this.toIsoString(row.updated_at),
     };
+  }
+
+  private resolvePrSeasonPassStatus(
+    status: PrSeasonPassStatusDb,
+    validUntil: Date,
+    revokedAt: Date | null,
+  ): 'ACTIVE' | 'REVOKED' | 'EXPIRED' {
+    if (revokedAt || status === 'revoked') return 'REVOKED';
+    if (status === 'expired') return 'EXPIRED';
+    if (validUntil.getTime() < Date.now()) return 'EXPIRED';
+    return 'ACTIVE';
+  }
+
+  private buildPrSeasonPassQrPayload(params: {
+    passId: string;
+    venueId: string;
+    membershipId: string;
+    userId: string;
+    qrToken: string;
+    serialNumber: string;
+    validUntil: Date;
+  }) {
+    return {
+      type: 'pr_season_pass',
+      pass_id: params.passId,
+      venue_id: params.venueId,
+      pr_membership_id: params.membershipId,
+      user_id: params.userId,
+      qr_token: params.qrToken,
+      serial_number: params.serialNumber,
+      valid_until: params.validUntil.toISOString(),
+      iat: new Date().toISOString(),
+      ver: 1,
+    };
+  }
+
+  private applyWalletUrlTemplate(
+    template: string | undefined,
+    payload: Record<string, string>,
+  ): string | null {
+    const source = String(template || '').trim();
+    if (!source) return null;
+    let resolved = source;
+    for (const [key, value] of Object.entries(payload)) {
+      const encoded = encodeURIComponent(value);
+      resolved = resolved
+        .split(`{{${key}}}`)
+        .join(encoded)
+        .split(`:${key}`)
+        .join(encoded);
+    }
+    return resolved;
+  }
+
+  private buildPrSeasonPassWalletLinks(params: {
+    passId: string;
+    venueId: string;
+    membershipId: string;
+    userId: string;
+    qrToken: string;
+    serialNumber: string;
+    validUntil: Date;
+  }) {
+    const payload = {
+      pass_id: params.passId,
+      venue_id: params.venueId,
+      pr_membership_id: params.membershipId,
+      user_id: params.userId,
+      qr_token: params.qrToken,
+      serial_number: params.serialNumber,
+      valid_until: params.validUntil.toISOString(),
+    };
+
+    const templatedAppleUrl = this.applyWalletUrlTemplate(
+      process.env.WALLET_APPLE_PASS_URL_TEMPLATE,
+      payload,
+    );
+    const fallbackAppleUrl = this.buildInternalAppleWalletUrl(
+      params.passId,
+      params.qrToken,
+    );
+
+    return {
+      apple: templatedAppleUrl || fallbackAppleUrl,
+      google: this.applyWalletUrlTemplate(
+        process.env.WALLET_GOOGLE_PASS_URL_TEMPLATE,
+        payload,
+      ),
+    };
+  }
+
+  private buildDefaultSeasonPassValidity(membershipCreatedAt?: Date | null) {
+    const validFrom =
+      membershipCreatedAt instanceof Date
+        ? new Date(membershipCreatedAt)
+        : new Date();
+    const now = new Date();
+    const seasonEnd = new Date(
+      Date.UTC(now.getUTCFullYear(), 11, 31, 23, 59, 59),
+    );
+    const validUntil =
+      seasonEnd.getTime() > validFrom.getTime()
+        ? seasonEnd
+        : new Date(validFrom.getTime() + 1000 * 60 * 60 * 24 * 30);
+    return { validFrom, validUntil };
+  }
+
+  private mapPrSeasonPass(row: PrSeasonPassRow) {
+    const status = this.resolvePrSeasonPassStatus(
+      row.status,
+      row.valid_until,
+      row.revoked_at,
+    );
+
+    return {
+      id: row.id,
+      venue_id: row.venue_id,
+      pr_membership_id: row.pr_membership_id,
+      user_id: row.user_id,
+      role: this.toPrRoleApi(row.membership_role),
+      status,
+      membership_is_active: Boolean(row.membership_is_active),
+      valid_from: this.toIsoString(row.valid_from),
+      valid_until: this.toIsoString(row.valid_until),
+      revoked_at: row.revoked_at ? this.toIsoString(row.revoked_at) : null,
+      serial_number: row.serial_number,
+      wallet_apple_url: row.wallet_apple_url,
+      wallet_google_url: row.wallet_google_url,
+      wallet_last_issued_at: row.wallet_last_issued_at
+        ? this.toIsoString(row.wallet_last_issued_at)
+        : null,
+      qr_data: JSON.stringify(
+        this.buildPrSeasonPassQrPayload({
+          passId: row.id,
+          venueId: row.venue_id,
+          membershipId: row.pr_membership_id,
+          userId: row.user_id,
+          qrToken: row.qr_token,
+          serialNumber: row.serial_number,
+          validUntil: row.valid_until,
+        }),
+      ),
+      created_at: this.toIsoString(row.created_at),
+      updated_at: this.toIsoString(row.updated_at),
+    };
+  }
+
+  private async loadPrSeasonPassByMembership(
+    venueId: string,
+    membershipId: string,
+  ): Promise<PrSeasonPassRow | null> {
+    const rows = await this.prisma.$queryRaw<PrSeasonPassRow[]>(Prisma.sql`
+      SELECT
+        p.id,
+        p.venue_id,
+        p.pr_membership_id,
+        p.user_id,
+        p.status::text AS status,
+        p.valid_from,
+        p.valid_until,
+        p.qr_token,
+        p.serial_number,
+        p.wallet_apple_url,
+        p.wallet_google_url,
+        p.wallet_last_issued_at,
+        p.revoked_at,
+        p.metadata,
+        p.created_at,
+        p.updated_at,
+        m.role::text AS membership_role,
+        m.is_active AS membership_is_active
+      FROM venue_pr_membership_passes p
+      JOIN venue_pr_memberships m ON m.id = p.pr_membership_id
+      WHERE p.venue_id = ${venueId}::uuid
+        AND p.pr_membership_id = ${membershipId}::uuid
+      LIMIT 1
+    `);
+    return rows[0] ?? null;
   }
 
   private async loadPrMemberRows(venueId: string): Promise<PrMemberListRow[]> {
@@ -760,7 +1315,9 @@ export class VenuesService {
   ) {
     if (role === 'responsabile') {
       if (parent) {
-        throw new BadRequestException('Il ruolo RESPONSABILE non puo avere un superiore');
+        throw new BadRequestException(
+          'Il ruolo RESPONSABILE non puo avere un superiore',
+        );
       }
       return;
     }
@@ -770,11 +1327,15 @@ export class VenuesService {
     }
 
     if (role === 'capo_squadra' && parent.role !== 'responsabile') {
-      throw new BadRequestException('CAPO_SQUADRA deve avere un RESPONSABILE sopra di lui');
+      throw new BadRequestException(
+        'CAPO_SQUADRA deve avere un RESPONSABILE sopra di lui',
+      );
     }
 
     if (role === 'pr' && parent.role === 'pr') {
-      throw new BadRequestException('PR deve essere assegnato sotto un RESPONSABILE o CAPO_SQUADRA');
+      throw new BadRequestException(
+        'PR deve essere assegnato sotto un RESPONSABILE o CAPO_SQUADRA',
+      );
     }
   }
 
@@ -844,9 +1405,53 @@ export class VenuesService {
     return { owner: false, membership };
   }
 
-  async listVenues(): Promise<venues[]> {
+  // `getVenue` (existence check) and `resolvePrActorContext` (permission check) don't
+  // depend on each other's result, but were always awaited sequentially - every PR-network
+  // read paid for 2 round trips even when only allowed to proceed after both succeeded
+  // (and paid the same 2 round trips before being rejected, since the permission check
+  // itself needs its own query for any non-owner role). Running them concurrently halves
+  // that. `allSettled` (not `all`) preserves the original error priority: if both would
+  // fail, "venue not found" still wins over "forbidden", matching the previous sequential
+  // `await getVenue(); await resolvePrActorContext();` behavior.
+  private async getVenueAndPrActorContext(
+    venueId: string,
+    user?: RequestUser,
+    requireManagePermission = false,
+  ): Promise<{ owner: boolean; membership: PrMembershipRow | null }> {
+    const [venueResult, actorContextResult] = await Promise.allSettled([
+      this.getVenue(venueId),
+      this.resolvePrActorContext(venueId, user, requireManagePermission),
+    ]);
+    if (venueResult.status === 'rejected') throw venueResult.reason;
+    if (actorContextResult.status === 'rejected')
+      throw actorContextResult.reason;
+    return actorContextResult.value;
+  }
+
+  // Public listing (cached 300s at the controller) - `select` trims Stripe account/payout
+  // fields, contract/billing fields, and the bar/bottle price-list JSON blobs, none of
+  // which the public list view renders and none of which should be sent to an
+  // unauthenticated caller. Full row (incl. those fields, for the owner/admin) is still
+  // available via `getVenue(id)`.
+  async listVenues() {
+    // Safety net against unbounded growth; well above current venue counts so it doesn't
+    // change today's response, but caps the worst case as the platform scales.
     return await this.prisma.venues.findMany({
       orderBy: { created_at: 'desc' },
+      take: 1000,
+      select: {
+        id: true,
+        name: true,
+        city: true,
+        address: true,
+        description: true,
+        image: true,
+        latitude: true,
+        longitude: true,
+        radius_geofence: true,
+        created_at: true,
+        updated_at: true,
+      },
     });
   }
 
@@ -907,12 +1512,16 @@ export class VenuesService {
     }
 
     if (updates.bar_price_list !== undefined) {
-      const normalized = this.normalizeBarPriceListInput(updates.bar_price_list);
+      const normalized = this.normalizeBarPriceListInput(
+        updates.bar_price_list,
+      );
       data.bar_price_list = normalized as Prisma.InputJsonValue;
     }
 
     if (updates.bottle_price_list !== undefined) {
-      const normalized = this.normalizeBottlePriceListInput(updates.bottle_price_list);
+      const normalized = this.normalizeBottlePriceListInput(
+        updates.bottle_price_list,
+      );
       data.bottle_price_list = normalized as Prisma.InputJsonValue;
     }
 
@@ -937,13 +1546,16 @@ export class VenuesService {
         this.decimalToNumber(updated.cloakroom_unit_price).toFixed(2),
       ),
       bar_price_list: this.normalizeBarPriceList(updated.bar_price_list),
-      bottle_price_list: this.normalizeBottlePriceList(updated.bottle_price_list),
+      bottle_price_list: this.normalizeBottlePriceList(
+        updated.bottle_price_list,
+      ),
     };
   }
 
   async createVenue(input: {
     name: string;
     city?: string;
+    address?: string;
     radius_geofence?: number;
     stripe_account_id?: string;
   }): Promise<venues> {
@@ -954,6 +1566,7 @@ export class VenuesService {
     const data: Prisma.venuesCreateInput = {
       name: input.name,
       city: input.city ?? undefined,
+      address: input.address ?? undefined,
     };
 
     if (input.radius_geofence !== undefined) {
@@ -961,6 +1574,14 @@ export class VenuesService {
     }
     if (input.stripe_account_id !== undefined) {
       data.stripe_account_id = input.stripe_account_id;
+    }
+
+    if (input.address) {
+      const coords = await geocodeAddress(input.address);
+      if (coords) {
+        data.latitude = coords.latitude;
+        data.longitude = coords.longitude;
+      }
     }
 
     return await this.prisma.venues.create({ data });
@@ -971,6 +1592,7 @@ export class VenuesService {
     updates: Partial<{
       name?: string;
       city?: string;
+      address?: string;
       radius_geofence?: number;
       stripe_account_id?: string;
     }>,
@@ -986,13 +1608,107 @@ export class VenuesService {
     if (updates.stripe_account_id !== undefined) {
       data.stripe_account_id = updates.stripe_account_id;
     }
+    if (updates.address !== undefined) {
+      data.address = updates.address;
+      if (updates.address) {
+        const coords = await geocodeAddress(updates.address);
+        if (coords) {
+          data.latitude = coords.latitude;
+          data.longitude = coords.longitude;
+        }
+      }
+    }
 
     return await this.prisma.venues.update({ where: { id }, data });
   }
 
-  async deleteVenue(id: string): Promise<venues> {
-    await this.getVenue(id);
-    return await this.prisma.venues.delete({ where: { id } });
+  async updateVenueImage(
+    id: string,
+    image: string | null | undefined,
+  ): Promise<venues> {
+    if (image === undefined) {
+      throw new BadRequestException('image is required');
+    }
+
+    const venue = await this.prisma.venues.findUnique({
+      where: { id },
+      select: { id: true, image: true },
+    });
+
+    if (!venue) {
+      throw new NotFoundException('Venue not found');
+    }
+
+    const normalizedImage = this.normalizeManagedImagePath(image, 'venues');
+    const updatedVenue = await this.prisma.venues.update({
+      where: { id },
+      data: { image: normalizedImage },
+    });
+
+    if (
+      venue.image &&
+      venue.image !== updatedVenue.image &&
+      this.isManagedImagePath(venue.image, 'venues')
+    ) {
+      void this.storage.deletePublicImage(venue.image).catch(() => undefined);
+    }
+
+    return updatedVenue;
+  }
+
+  async uploadVenueImage(file?: {
+    buffer: Buffer;
+    mimetype: string;
+    originalname: string;
+  }) {
+    if (!file) {
+      throw new BadRequestException('file is required');
+    }
+    if (!file.mimetype?.startsWith('image/')) {
+      throw new BadRequestException('file must be an image');
+    }
+
+    const ext = (() => {
+      const match = /\.(png|jpe?g|webp)$/i.exec(file.originalname || '');
+      if (match) return match[1].toLowerCase();
+      if (file.mimetype === 'image/png') return 'png';
+      if (file.mimetype === 'image/webp') return 'webp';
+      return 'jpg';
+    })();
+
+    const { pathPromise } = this.storage.uploadPublicImageFromBuffer({
+      prefix: 'venues',
+      buffer: file.buffer,
+      contentType: file.mimetype,
+      ext,
+    });
+
+    const path = await pathPromise;
+    return { path };
+  }
+
+  async createVenueImageSignedUpload(params?: {
+    ext?: string;
+    contentType?: string;
+  }) {
+    return this.storage.createSignedUploadForPublicImage({
+      prefix: 'venues',
+      ext: params?.ext,
+      contentType: params?.contentType,
+    });
+  }
+
+  async deleteVenue(id: string, adminId: string): Promise<venues> {
+    const venue = await this.getVenue(id);
+    const deleted = await this.prisma.venues.delete({ where: { id } });
+    this.auditLog.record({
+      adminId,
+      action: 'venue.delete',
+      targetType: 'venue',
+      targetId: id,
+      metadata: { name: venue.name },
+    });
+    return deleted;
   }
 
   async listEvents(venueId: string): Promise<events[]> {
@@ -1002,122 +1718,6 @@ export class VenuesService {
     });
   }
 
-  async createStripeConnectOnboardingLink(params: {
-    venueId: string;
-    refreshUrl?: string;
-    returnUrl?: string;
-    email?: string;
-  }) {
-    /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call */
-    const venue = await this.prisma.venues.findUnique({
-      where: { id: params.venueId },
-      select: {
-        id: true,
-        name: true,
-        stripe_account_id: true,
-      },
-    });
-    if (!venue) throw new NotFoundException('Venue not found');
-
-    const stripe = this.getStripeClient();
-
-    let stripeAccountId = venue.stripe_account_id;
-    if (!stripeAccountId) {
-      const account = await stripe.accounts.create({
-        type: 'express',
-        country: 'IT',
-        email: params.email,
-        capabilities: {
-          card_payments: { requested: true },
-          transfers: { requested: true },
-        },
-        business_profile: {
-          name: venue.name,
-        },
-      });
-      stripeAccountId = account.id;
-
-      await this.prisma.venues.update({
-        where: { id: params.venueId },
-        data: { stripe_account_id: stripeAccountId },
-      });
-    }
-
-    const fallbackBase =
-      process.env.STRIPE_CONNECT_RETURN_URL || 'https://example.com/stripe';
-    const accountLink = await stripe.accountLinks.create({
-      account: stripeAccountId,
-      type: 'account_onboarding',
-      refresh_url:
-        params.refreshUrl ||
-        `${fallbackBase}?refresh=1&venue_id=${params.venueId}`,
-      return_url:
-        params.returnUrl ||
-        `${fallbackBase}?success=1&venue_id=${params.venueId}`,
-    });
-
-    return {
-      venue_id: params.venueId,
-      stripe_account_id: stripeAccountId,
-      onboarding_url: accountLink.url,
-      expires_at: accountLink.expires_at,
-    };
-    /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call */
-  }
-
-  async getStripeConnectStatus(venueId: string) {
-    /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call */
-    const venue = await this.prisma.venues.findUnique({
-      where: { id: venueId },
-      select: {
-        id: true,
-        stripe_account_id: true,
-        stripe_charges_enabled: true,
-        stripe_payouts_enabled: true,
-        stripe_onboarding_completed_at: true,
-      },
-    });
-    if (!venue) throw new NotFoundException('Venue not found');
-
-    if (!venue.stripe_account_id) {
-      return {
-        venue_id: venueId,
-        connected: false,
-        charges_enabled: false,
-        payouts_enabled: false,
-        details_submitted: false,
-      };
-    }
-
-    const stripe = this.getStripeClient();
-    const account = await stripe.accounts.retrieve(venue.stripe_account_id);
-
-    const chargesEnabled = Boolean(account.charges_enabled);
-    const payoutsEnabled = Boolean(account.payouts_enabled);
-    const detailsSubmitted = Boolean(account.details_submitted);
-
-    await this.prisma.venues.update({
-      where: { id: venueId },
-      data: {
-        stripe_charges_enabled: chargesEnabled,
-        stripe_payouts_enabled: payoutsEnabled,
-        stripe_onboarding_completed_at:
-          chargesEnabled && payoutsEnabled ? new Date() : null,
-      },
-    });
-
-    return {
-      venue_id: venueId,
-      connected: true,
-      stripe_account_id: venue.stripe_account_id,
-      charges_enabled: chargesEnabled,
-      payouts_enabled: payoutsEnabled,
-      details_submitted: detailsSubmitted,
-      requirements_due: account.requirements?.currently_due ?? [],
-    };
-    /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call */
-  }
-
   async listPromos(venueId: string): Promise<promos[]> {
     return await this.prisma.promos.findMany({
       where: { venue_id: venueId },
@@ -1125,23 +1725,833 @@ export class VenuesService {
     });
   }
 
-  async listVenueTables(venueId: string): Promise<venue_tables[]> {
-    // Ensure venue exists
-    await this.getVenue(venueId);
+  private normalizeTableBookingPolicy(value: unknown): VenueTableBookingPolicy {
+    const raw = String(value ?? '')
+      .trim()
+      .toLowerCase();
+    return raw === 'shared'
+      ? VenueTableBookingPolicy.shared
+      : VenueTableBookingPolicy.exclusive;
+  }
 
-    return await this.prisma.venue_tables.findMany({
+  private async ensureVenueFloorPlan(
+    venueId: string,
+  ): Promise<venue_floor_plans> {
+    const existing = await this.prisma.venue_floor_plans.findUnique({
       where: { venue_id: venueId },
-      orderBy: [{ zona: 'asc' }, { nome: 'asc' }],
+    });
+    if (existing) return existing;
+
+    return this.prisma.venue_floor_plans.create({
+      data: {
+        venue_id: venueId,
+      },
     });
   }
 
-  async listVenueStations(venueId: string): Promise<venue_stations[]> {
+  async listVenueTableZones(venueId: string): Promise<venue_table_zones[]> {
+    const [, zones] = await Promise.all([
+      this.getVenue(venueId),
+      this.prisma.venue_table_zones.findMany({
+        where: { venue_id: venueId },
+        orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+      }),
+    ]);
+    return zones;
+  }
+
+  async createVenueTableZone(
+    venueId: string,
+    body: {
+      name: string;
+      color?: string;
+      per_testa?: number;
+      costo_minimo?: number;
+      persone_max?: number;
+      booking_policy?: 'exclusive' | 'shared';
+      sort_order?: number;
+      floor_x?: number;
+      floor_y?: number;
+      floor_w?: number;
+      floor_h?: number;
+      is_active?: boolean;
+    },
+  ): Promise<venue_table_zones> {
     await this.getVenue(venueId);
 
-    return this.prisma.venue_stations.findMany({
-      where: { venue_id: venueId },
-      orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+    const name = String(body?.name ?? '').trim();
+    if (!name) {
+      throw new BadRequestException('name is required');
+    }
+
+    const perTesta =
+      body?.per_testa === undefined || body?.per_testa === null
+        ? null
+        : Number(body.per_testa);
+    if (perTesta !== null && (!Number.isFinite(perTesta) || perTesta < 0)) {
+      throw new BadRequestException('per_testa must be >= 0');
+    }
+
+    const costoMinimo =
+      body?.costo_minimo === undefined || body?.costo_minimo === null
+        ? null
+        : Number(body.costo_minimo);
+    if (
+      costoMinimo !== null &&
+      (!Number.isFinite(costoMinimo) || costoMinimo < 0)
+    ) {
+      throw new BadRequestException('costo_minimo must be >= 0');
+    }
+
+    const personeMax =
+      body?.persone_max === undefined || body?.persone_max === null
+        ? null
+        : Number(body.persone_max);
+    if (
+      personeMax !== null &&
+      (!Number.isInteger(personeMax) || personeMax < 1)
+    ) {
+      throw new BadRequestException('persone_max must be an integer >= 1');
+    }
+
+    const sortOrder =
+      body?.sort_order !== undefined && body?.sort_order !== null
+        ? Number(body.sort_order)
+        : await this.prisma.venue_table_zones.count({
+            where: { venue_id: venueId },
+          });
+
+    if (!Number.isInteger(sortOrder) || sortOrder < 0) {
+      throw new BadRequestException('sort_order must be an integer >= 0');
+    }
+
+    const floorX =
+      body?.floor_x === undefined || body?.floor_x === null
+        ? null
+        : Number(body.floor_x);
+    if (floorX !== null && (!Number.isFinite(floorX) || floorX < 0)) {
+      throw new BadRequestException('floor_x must be >= 0');
+    }
+
+    const floorY =
+      body?.floor_y === undefined || body?.floor_y === null
+        ? null
+        : Number(body.floor_y);
+    if (floorY !== null && (!Number.isFinite(floorY) || floorY < 0)) {
+      throw new BadRequestException('floor_y must be >= 0');
+    }
+
+    const floorW =
+      body?.floor_w === undefined || body?.floor_w === null
+        ? null
+        : Number(body.floor_w);
+    if (floorW !== null && (!Number.isFinite(floorW) || floorW <= 0)) {
+      throw new BadRequestException('floor_w must be > 0');
+    }
+
+    const floorH =
+      body?.floor_h === undefined || body?.floor_h === null
+        ? null
+        : Number(body.floor_h);
+    if (floorH !== null && (!Number.isFinite(floorH) || floorH <= 0)) {
+      throw new BadRequestException('floor_h must be > 0');
+    }
+
+    try {
+      return await this.prisma.venue_table_zones.create({
+        data: {
+          venue_id: venueId,
+          name,
+          color: body?.color ? String(body.color).trim() : null,
+          per_testa: perTesta,
+          costo_minimo: costoMinimo,
+          persone_max: personeMax,
+          booking_policy: this.normalizeTableBookingPolicy(
+            body?.booking_policy,
+          ),
+          sort_order: sortOrder,
+          floor_x: floorX,
+          floor_y: floorY,
+          floor_w: floorW,
+          floor_h: floorH,
+          is_active:
+            body?.is_active === undefined ? true : Boolean(body.is_active),
+        },
+      });
+    } catch (error: unknown) {
+      const prismaCode =
+        typeof error === 'object' && error !== null && 'code' in error
+          ? String((error as { code?: unknown }).code)
+          : '';
+      if (prismaCode === 'P2002') {
+        throw new BadRequestException(
+          'Zone name already exists for this venue',
+        );
+      }
+      throw error;
+    }
+  }
+
+  async updateVenueTableZone(
+    venueId: string,
+    zoneId: string,
+    body: {
+      name?: string;
+      color?: string;
+      per_testa?: number | null;
+      costo_minimo?: number | null;
+      persone_max?: number | null;
+      booking_policy?: 'exclusive' | 'shared';
+      sort_order?: number;
+      floor_x?: number | null;
+      floor_y?: number | null;
+      floor_w?: number | null;
+      floor_h?: number | null;
+      is_active?: boolean;
+    },
+  ): Promise<venue_table_zones> {
+    await this.getVenue(venueId);
+
+    const zone = await this.prisma.venue_table_zones.findUnique({
+      where: { id: zoneId },
+      select: { id: true, venue_id: true },
     });
+    if (!zone || zone.venue_id !== venueId) {
+      throw new NotFoundException('Zone not found');
+    }
+
+    const data: Prisma.venue_table_zonesUpdateInput = {};
+
+    if (body?.name !== undefined) {
+      const name = String(body.name).trim();
+      if (!name) throw new BadRequestException('name cannot be empty');
+      data.name = name;
+    }
+
+    if (body?.color !== undefined) {
+      const color = String(body.color ?? '').trim();
+      data.color = color.length ? color : null;
+    }
+
+    if (body?.per_testa !== undefined) {
+      if (body.per_testa === null) {
+        data.per_testa = null;
+      } else {
+        const value = Number(body.per_testa);
+        if (!Number.isFinite(value) || value < 0) {
+          throw new BadRequestException('per_testa must be >= 0');
+        }
+        data.per_testa = value;
+      }
+    }
+
+    if (body?.costo_minimo !== undefined) {
+      if (body.costo_minimo === null) {
+        data.costo_minimo = null;
+      } else {
+        const value = Number(body.costo_minimo);
+        if (!Number.isFinite(value) || value < 0) {
+          throw new BadRequestException('costo_minimo must be >= 0');
+        }
+        data.costo_minimo = value;
+      }
+    }
+
+    if (body?.persone_max !== undefined) {
+      if (body.persone_max === null) {
+        data.persone_max = null;
+      } else {
+        const value = Number(body.persone_max);
+        if (!Number.isInteger(value) || value < 1) {
+          throw new BadRequestException('persone_max must be an integer >= 1');
+        }
+        data.persone_max = value;
+      }
+    }
+
+    if (body?.booking_policy !== undefined) {
+      data.booking_policy = this.normalizeTableBookingPolicy(
+        body.booking_policy,
+      );
+    }
+
+    if (body?.sort_order !== undefined) {
+      const value = Number(body.sort_order);
+      if (!Number.isInteger(value) || value < 0) {
+        throw new BadRequestException('sort_order must be an integer >= 0');
+      }
+      data.sort_order = value;
+    }
+
+    if (body?.floor_x !== undefined) {
+      if (body.floor_x === null) {
+        data.floor_x = null;
+      } else {
+        const value = Number(body.floor_x);
+        if (!Number.isFinite(value) || value < 0) {
+          throw new BadRequestException('floor_x must be >= 0');
+        }
+        data.floor_x = value;
+      }
+    }
+
+    if (body?.floor_y !== undefined) {
+      if (body.floor_y === null) {
+        data.floor_y = null;
+      } else {
+        const value = Number(body.floor_y);
+        if (!Number.isFinite(value) || value < 0) {
+          throw new BadRequestException('floor_y must be >= 0');
+        }
+        data.floor_y = value;
+      }
+    }
+
+    if (body?.floor_w !== undefined) {
+      if (body.floor_w === null) {
+        data.floor_w = null;
+      } else {
+        const value = Number(body.floor_w);
+        if (!Number.isFinite(value) || value <= 0) {
+          throw new BadRequestException('floor_w must be > 0');
+        }
+        data.floor_w = value;
+      }
+    }
+
+    if (body?.floor_h !== undefined) {
+      if (body.floor_h === null) {
+        data.floor_h = null;
+      } else {
+        const value = Number(body.floor_h);
+        if (!Number.isFinite(value) || value <= 0) {
+          throw new BadRequestException('floor_h must be > 0');
+        }
+        data.floor_h = value;
+      }
+    }
+
+    if (body?.is_active !== undefined) {
+      data.is_active = Boolean(body.is_active);
+    }
+
+    try {
+      return await this.prisma.venue_table_zones.update({
+        where: { id: zoneId },
+        data,
+      });
+    } catch (error: unknown) {
+      const prismaCode =
+        typeof error === 'object' && error !== null && 'code' in error
+          ? String((error as { code?: unknown }).code)
+          : '';
+      if (prismaCode === 'P2002') {
+        throw new BadRequestException(
+          'Zone name already exists for this venue',
+        );
+      }
+      throw error;
+    }
+  }
+
+  async deleteVenueTableZone(
+    venueId: string,
+    zoneId: string,
+  ): Promise<venue_table_zones> {
+    await this.getVenue(venueId);
+
+    const zone = await this.prisma.venue_table_zones.findUnique({
+      where: { id: zoneId },
+      select: { id: true, venue_id: true },
+    });
+    if (!zone || zone.venue_id !== venueId) {
+      throw new NotFoundException('Zone not found');
+    }
+
+    const attachedTables = await this.prisma.venue_tables.count({
+      where: { venue_table_zone_id: zoneId },
+    });
+    if (attachedTables > 0) {
+      throw new BadRequestException(
+        'Cannot delete zone: tables are still attached to it',
+      );
+    }
+
+    return this.prisma.venue_table_zones.delete({ where: { id: zoneId } });
+  }
+
+  async getVenueFloorPlan(venueId: string): Promise<VenueFloorPlanPayload> {
+    // Existence check, floor plan + its landmarks, zones and tables are all independent of
+    // each other except for "does the venue exist" - fetched concurrently via `Promise.all`
+    // instead of 3 sequential round trips (getVenue, ensureVenueFloorPlan, then the
+    // Promise.all of the rest). Plain `Promise.all`, not `$transaction`: a batch
+    // `$transaction` holds one connection and runs its queries sequentially over it, which on
+    // a remote pooled DB costs ~N query-durations instead of ~1.
+    const [venueExists, floorPlanWithLandmarks, zones, tables] =
+      await Promise.all([
+        this.prisma.venues.findUnique({
+          where: { id: venueId },
+          select: { id: true },
+        }),
+        this.prisma.venue_floor_plans.findUnique({
+          where: { venue_id: venueId },
+          include: {
+            landmarks: {
+              orderBy: [{ sort_order: 'asc' }, { created_at: 'asc' }],
+            },
+          },
+        }),
+        this.prisma.venue_table_zones.findMany({
+          where: { venue_id: venueId, is_active: true },
+          orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+        }),
+        this.prisma.venue_tables.findMany({
+          where: { venue_id: venueId },
+          orderBy: [
+            { layout_order: 'asc' },
+            { numero: 'asc' },
+            { nome: 'asc' },
+          ],
+        }),
+      ]);
+
+    if (!venueExists) throw new NotFoundException('Venue not found');
+
+    // Floor plan row doesn't exist yet for this venue (first-ever fetch) - create it lazily,
+    // same as before. Rare path, only pays an extra round trip when there truly is no row yet.
+    const { landmarks, ...floorPlan } = floorPlanWithLandmarks ?? {
+      ...(await this.ensureVenueFloorPlan(venueId)),
+      landmarks: [] as venue_floor_landmarks[],
+    };
+
+    return {
+      ...floorPlan,
+      landmarks,
+      zones,
+      tables,
+    };
+  }
+
+  async updateVenueFloorPlan(
+    venueId: string,
+    body: {
+      background_image?: string | null;
+      canvas_width?: number;
+      canvas_height?: number;
+      grid_size?: number;
+      show_grid?: boolean;
+    },
+  ): Promise<VenueFloorPlanPayload> {
+    await this.getVenue(venueId);
+
+    const data: Prisma.venue_floor_plansUpdateInput = {};
+
+    if (body?.background_image !== undefined) {
+      const value = String(body.background_image ?? '').trim();
+      data.background_image = value.length ? value : null;
+    }
+
+    if (body?.canvas_width !== undefined) {
+      const value = Number(body.canvas_width);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new BadRequestException('canvas_width must be > 0');
+      }
+      data.canvas_width = value;
+    }
+
+    if (body?.canvas_height !== undefined) {
+      const value = Number(body.canvas_height);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new BadRequestException('canvas_height must be > 0');
+      }
+      data.canvas_height = value;
+    }
+
+    if (body?.grid_size !== undefined) {
+      const value = Number(body.grid_size);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new BadRequestException('grid_size must be > 0');
+      }
+      data.grid_size = value;
+    }
+
+    if (body?.show_grid !== undefined) {
+      data.show_grid = Boolean(body.show_grid);
+    }
+
+    await this.prisma.venue_floor_plans.upsert({
+      where: { venue_id: venueId },
+      create: {
+        venue_id: venueId,
+        background_image: data.background_image as string | null | undefined,
+        canvas_width: (data.canvas_width as number | undefined) ?? 1000,
+        canvas_height: (data.canvas_height as number | undefined) ?? 700,
+        grid_size: (data.grid_size as number | undefined) ?? 24,
+        show_grid: (data.show_grid as boolean | undefined) ?? true,
+      },
+      update: data,
+    });
+
+    return this.getVenueFloorPlan(venueId);
+  }
+
+  async createVenueFloorLandmark(
+    venueId: string,
+    body: {
+      type?: 'dj_console';
+      label?: string;
+      x?: number;
+      y?: number;
+      width?: number;
+      height?: number;
+      rotation?: number;
+      color?: string;
+      sort_order?: number;
+      metadata?: Record<string, unknown>;
+    },
+  ): Promise<venue_floor_landmarks> {
+    await this.getVenue(venueId);
+    const floorPlan = await this.ensureVenueFloorPlan(venueId);
+
+    const width =
+      body?.width === undefined || body?.width === null
+        ? 120
+        : Number(body.width);
+    const height =
+      body?.height === undefined || body?.height === null
+        ? 48
+        : Number(body.height);
+    if (!Number.isFinite(width) || width <= 0) {
+      throw new BadRequestException('width must be > 0');
+    }
+    if (!Number.isFinite(height) || height <= 0) {
+      throw new BadRequestException('height must be > 0');
+    }
+
+    const sortOrder =
+      body?.sort_order === undefined || body?.sort_order === null
+        ? 0
+        : Number(body.sort_order);
+    if (!Number.isInteger(sortOrder) || sortOrder < 0) {
+      throw new BadRequestException('sort_order must be an integer >= 0');
+    }
+
+    return this.prisma.venue_floor_landmarks.create({
+      data: {
+        floor_plan_id: floorPlan.id,
+        type:
+          body?.type === 'dj_console'
+            ? VenueFloorLandmarkType.dj_console
+            : VenueFloorLandmarkType.dj_console,
+        label: body?.label ? String(body.label).trim() : null,
+        x: body?.x === undefined || body?.x === null ? 0 : Number(body.x),
+        y: body?.y === undefined || body?.y === null ? 0 : Number(body.y),
+        width,
+        height,
+        rotation:
+          body?.rotation === undefined || body?.rotation === null
+            ? 0
+            : Number(body.rotation),
+        color: body?.color ? String(body.color).trim() : null,
+        sort_order: sortOrder,
+        metadata:
+          body?.metadata && typeof body.metadata === 'object'
+            ? (body.metadata as Prisma.InputJsonValue)
+            : undefined,
+      },
+    });
+  }
+
+  async updateVenueFloorLandmark(
+    venueId: string,
+    landmarkId: string,
+    body: {
+      type?: 'dj_console';
+      label?: string;
+      x?: number;
+      y?: number;
+      width?: number;
+      height?: number;
+      rotation?: number;
+      color?: string;
+      sort_order?: number;
+      metadata?: Record<string, unknown>;
+    },
+  ): Promise<venue_floor_landmarks> {
+    await this.getVenue(venueId);
+    const landmark = await this.prisma.venue_floor_landmarks.findUnique({
+      where: { id: landmarkId },
+      select: {
+        id: true,
+        floor_plan: {
+          select: {
+            venue_id: true,
+          },
+        },
+      },
+    });
+    if (!landmark || landmark.floor_plan?.venue_id !== venueId) {
+      throw new NotFoundException('Landmark not found');
+    }
+
+    const data: Prisma.venue_floor_landmarksUpdateInput = {};
+
+    if (body?.type !== undefined) {
+      data.type = VenueFloorLandmarkType.dj_console;
+    }
+    if (body?.label !== undefined) {
+      const value = String(body.label ?? '').trim();
+      data.label = value.length ? value : null;
+    }
+    if (body?.x !== undefined) {
+      const value = Number(body.x);
+      if (!Number.isFinite(value))
+        throw new BadRequestException('x must be numeric');
+      data.x = value;
+    }
+    if (body?.y !== undefined) {
+      const value = Number(body.y);
+      if (!Number.isFinite(value))
+        throw new BadRequestException('y must be numeric');
+      data.y = value;
+    }
+    if (body?.width !== undefined) {
+      const value = Number(body.width);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new BadRequestException('width must be > 0');
+      }
+      data.width = value;
+    }
+    if (body?.height !== undefined) {
+      const value = Number(body.height);
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new BadRequestException('height must be > 0');
+      }
+      data.height = value;
+    }
+    if (body?.rotation !== undefined) {
+      const value = Number(body.rotation);
+      if (!Number.isFinite(value)) {
+        throw new BadRequestException('rotation must be numeric');
+      }
+      data.rotation = value;
+    }
+    if (body?.color !== undefined) {
+      const value = String(body.color ?? '').trim();
+      data.color = value.length ? value : null;
+    }
+    if (body?.sort_order !== undefined) {
+      const value = Number(body.sort_order);
+      if (!Number.isInteger(value) || value < 0) {
+        throw new BadRequestException('sort_order must be an integer >= 0');
+      }
+      data.sort_order = value;
+    }
+    if (body?.metadata !== undefined) {
+      data.metadata =
+        body.metadata && typeof body.metadata === 'object'
+          ? (body.metadata as Prisma.InputJsonValue)
+          : Prisma.DbNull;
+    }
+
+    return this.prisma.venue_floor_landmarks.update({
+      where: { id: landmarkId },
+      data,
+    });
+  }
+
+  async deleteVenueFloorLandmark(
+    venueId: string,
+    landmarkId: string,
+  ): Promise<venue_floor_landmarks> {
+    await this.getVenue(venueId);
+    const landmark = await this.prisma.venue_floor_landmarks.findUnique({
+      where: { id: landmarkId },
+      select: {
+        id: true,
+        floor_plan: {
+          select: {
+            venue_id: true,
+          },
+        },
+      },
+    });
+    if (!landmark || landmark.floor_plan?.venue_id !== venueId) {
+      throw new NotFoundException('Landmark not found');
+    }
+
+    return this.prisma.venue_floor_landmarks.delete({
+      where: { id: landmarkId },
+    });
+  }
+
+  async createZoneTables(
+    venueId: string,
+    zoneId: string,
+    body: {
+      count: number;
+      name_prefix?: string;
+      start_number?: number;
+      columns?: number;
+      floor_w?: number;
+      floor_h?: number;
+      base_x?: number;
+      base_y?: number;
+      gap_x?: number;
+      gap_y?: number;
+    },
+  ): Promise<venue_tables[]> {
+    await this.getVenue(venueId);
+    const zone = await this.prisma.venue_table_zones.findUnique({
+      where: { id: zoneId },
+    });
+    if (!zone || zone.venue_id !== venueId) {
+      throw new NotFoundException('Zone not found');
+    }
+
+    const count = Number(body?.count);
+    if (!Number.isInteger(count) || count < 1 || count > 120) {
+      throw new BadRequestException(
+        'count must be an integer between 1 and 120',
+      );
+    }
+
+    const columns =
+      body?.columns === undefined || body?.columns === null
+        ? 4
+        : Number(body.columns);
+    if (!Number.isInteger(columns) || columns < 1) {
+      throw new BadRequestException('columns must be an integer >= 1');
+    }
+
+    const floorW =
+      body?.floor_w === undefined || body?.floor_w === null
+        ? 92
+        : Number(body.floor_w);
+    const floorH =
+      body?.floor_h === undefined || body?.floor_h === null
+        ? 56
+        : Number(body.floor_h);
+    if (!Number.isFinite(floorW) || floorW <= 0) {
+      throw new BadRequestException('floor_w must be > 0');
+    }
+    if (!Number.isFinite(floorH) || floorH <= 0) {
+      throw new BadRequestException('floor_h must be > 0');
+    }
+
+    const baseX =
+      body?.base_x === undefined || body?.base_x === null
+        ? 64
+        : Number(body.base_x);
+    const baseY =
+      body?.base_y === undefined || body?.base_y === null
+        ? 96
+        : Number(body.base_y);
+    const gapX =
+      body?.gap_x === undefined || body?.gap_x === null
+        ? 120
+        : Number(body.gap_x);
+    const gapY =
+      body?.gap_y === undefined || body?.gap_y === null
+        ? 92
+        : Number(body.gap_y);
+
+    const prefix =
+      String(body?.name_prefix ?? '').trim() ||
+      String(zone.name || 'Tavolo').trim();
+
+    const stats = await this.prisma.venue_tables.aggregate({
+      where: { venue_id: venueId },
+      _max: {
+        numero: true,
+        layout_order: true,
+      },
+      _count: {
+        id: true,
+      },
+    });
+
+    const startNumber =
+      body?.start_number === undefined || body?.start_number === null
+        ? (stats._max.numero ?? 0) + 1
+        : Number(body.start_number);
+    if (!Number.isInteger(startNumber) || startNumber < 1) {
+      throw new BadRequestException('start_number must be an integer >= 1');
+    }
+
+    const firstLayoutOrder = (stats._max.layout_order ?? 0) + 1;
+
+    const rows: Prisma.venue_tablesCreateManyInput[] = Array.from({
+      length: count,
+    }).map((_, index) => {
+      const row = Math.floor(index / columns);
+      const col = index % columns;
+      const number = startNumber + index;
+      const x = baseX + col * gapX;
+      const y = baseY + row * gapY;
+
+      return {
+        venue_id: venueId,
+        venue_table_zone_id: zone.id,
+        nome: `${prefix} ${number}`,
+        zona: zone.name,
+        numero: number,
+        per_testa: zone.per_testa,
+        costo_minimo: zone.costo_minimo,
+        persone_max: zone.persone_max,
+        floor_x: x,
+        floor_y: y,
+        floor_w: floorW,
+        floor_h: floorH,
+        floor_shape: 'rectangle',
+        floor_rotation: 0,
+        layout_order: firstLayoutOrder + index,
+        is_hidden: false,
+      };
+    });
+
+    try {
+      await this.prisma.venue_tables.createMany({
+        data: rows,
+      });
+    } catch (error: unknown) {
+      const prismaCode =
+        typeof error === 'object' && error !== null && 'code' in error
+          ? String((error as { code?: unknown }).code)
+          : '';
+      if (prismaCode === 'P2002') {
+        throw new BadRequestException(
+          'Unable to create tables: one or more table numbers already exist for this venue',
+        );
+      }
+      throw error;
+    }
+
+    return this.listVenueTables(venueId);
+  }
+
+  async listVenueTables(venueId: string): Promise<venue_tables[]> {
+    // Existence check's result isn't otherwise used (only to 404), so it runs alongside the
+    // fetch instead of gating it.
+    const [, tables] = await Promise.all([
+      this.getVenue(venueId),
+      this.prisma.venue_tables.findMany({
+        where: { venue_id: venueId },
+        orderBy: [{ zona: 'asc' }, { nome: 'asc' }],
+      }),
+    ]);
+    return tables;
+  }
+
+  async listVenueStations(venueId: string): Promise<venue_stations[]> {
+    const [, stations] = await Promise.all([
+      this.getVenue(venueId),
+      this.prisma.venue_stations.findMany({
+        where: { venue_id: venueId },
+        orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
+      }),
+    ]);
+    return stations;
   }
 
   async listAssignableUsersForPr(
@@ -1149,9 +2559,6 @@ export class VenuesService {
     searchRaw: string | undefined,
     user?: RequestUser,
   ) {
-    await this.getVenue(venueId);
-    await this.resolvePrActorContext(venueId, user, true);
-
     const search = String(searchRaw ?? '').trim();
     const normalizedSearch = search.slice(0, 80);
     const pattern = `%${normalizedSearch}%`;
@@ -1168,8 +2575,12 @@ export class VenuesService {
       already_assigned: boolean;
     };
 
-    const rows = normalizedSearch.length >= 2
-      ? await this.prisma.$queryRaw<AssignableUserRow[]>(Prisma.sql`
+    // The authorization check is only ever used to throw (its result isn't consulted by the
+    // query below), so it runs alongside the query instead of gating it.
+    const [, rows] = await Promise.all([
+      this.getVenueAndPrActorContext(venueId, user, true),
+      normalizedSearch.length >= 2
+        ? this.prisma.$queryRaw<AssignableUserRow[]>(Prisma.sql`
           SELECT
             u.id,
             u.name,
@@ -1196,7 +2607,7 @@ export class VenuesService {
             COALESCE(u.last_active_at, u.updated_at, u.created_at) DESC
           LIMIT ${limit}
         `)
-      : await this.prisma.$queryRaw<AssignableUserRow[]>(Prisma.sql`
+        : await this.prisma.$queryRaw<AssignableUserRow[]>(Prisma.sql`
           SELECT
             u.id,
             u.name,
@@ -1216,7 +2627,8 @@ export class VenuesService {
             CASE WHEN m.id IS NULL THEN 0 ELSE 1 END,
             COALESCE(u.last_active_at, u.updated_at, u.created_at) DESC
           LIMIT ${limit}
-        `);
+        `),
+    ]);
 
     return rows.map((row) => ({
       id: row.id,
@@ -1232,7 +2644,6 @@ export class VenuesService {
   }
 
   async getMyPrNetworkMembership(venueId: string, user?: RequestUser) {
-    await this.getVenue(venueId);
     if (!user?.id) throw new ForbiddenException('Forbidden');
 
     const appRole = this.normalizeAppRole(user.role);
@@ -1240,8 +2651,14 @@ export class VenuesService {
       throw new ForbiddenException('Forbidden');
     }
 
-    const membership = await this.loadPrMembershipByUser(venueId, user.id);
-    const isOwner = appRole === 'admin' || (appRole === 'venue' && user.venue_id === venueId);
+    // Independent of each other - the membership lookup only needs venueId/userId, not
+    // the venue row itself, so it runs alongside the existence check instead of after it.
+    const [, membership] = await Promise.all([
+      this.getVenue(venueId),
+      this.loadPrMembershipByUser(venueId, user.id),
+    ]);
+    const isOwner =
+      appRole === 'admin' || (appRole === 'venue' && user.venue_id === venueId);
 
     return {
       venue_id: venueId,
@@ -1264,19 +2681,323 @@ export class VenuesService {
     };
   }
 
-  async listVenuePrNetworkMembers(venueId: string, user?: RequestUser) {
-    await this.getVenue(venueId);
-    const actorContext = await this.resolvePrActorContext(venueId, user, false);
+  async getMyPrSeasonPass(
+    venueId: string,
+    user?: RequestUser,
+    options?: { refreshWalletLinks?: boolean },
+  ) {
+    if (!user?.id) throw new ForbiddenException('Forbidden');
 
-    const rows = await this.loadPrMemberRows(venueId);
-    const visibleRows = !actorContext.owner && actorContext.membership
-      ? (() => {
-          const allowed = this.collectPrSubtree(actorContext.membership.id, rows);
-          return rows.filter((row) => allowed.has(row.id));
-        })()
-      : rows;
+    const appRole = this.normalizeAppRole(user.role);
+    if (appRole === 'venue' && (!user.venue_id || user.venue_id !== venueId)) {
+      throw new ForbiddenException('Forbidden');
+    }
+
+    // `venue` (needed below for wallet links) and the membership lookup don't depend on
+    // each other, so they run concurrently instead of sequentially.
+    const [venue, membership] = await Promise.all([
+      this.getVenue(venueId),
+      this.loadPrMembershipByUser(venueId, user.id),
+    ]);
+    if (!membership || !membership.is_active) {
+      throw new ForbiddenException('No active PR membership for this venue');
+    }
+
+    const now = new Date();
+    const defaultValidity = this.buildDefaultSeasonPassValidity(
+      membership.created_at,
+    );
+
+    let passRow = await this.loadPrSeasonPassByMembership(
+      venueId,
+      membership.id,
+    );
+    if (!passRow) {
+      const passId = randomUUID();
+      const qrToken = randomUUID();
+      const serialNumber = `NH-${venueId.slice(0, 6).toUpperCase()}-${membership.id.slice(0, 6).toUpperCase()}-${Date.now().toString(36).toUpperCase()}`;
+      const initialStatus: PrSeasonPassStatusDb =
+        defaultValidity.validUntil.getTime() < now.getTime()
+          ? 'expired'
+          : 'active';
+      const walletLinks = this.buildPrSeasonPassWalletLinks({
+        passId,
+        venueId,
+        membershipId: membership.id,
+        userId: membership.user_id,
+        qrToken,
+        serialNumber,
+        validUntil: defaultValidity.validUntil,
+      });
+
+      const insertedRows = await this.prisma.$queryRaw<
+        PrSeasonPassRow[]
+      >(Prisma.sql`
+        INSERT INTO venue_pr_membership_passes (
+          id,
+          venue_id,
+          pr_membership_id,
+          user_id,
+          status,
+          valid_from,
+          valid_until,
+          qr_token,
+          serial_number,
+          wallet_apple_url,
+          wallet_google_url,
+          wallet_last_issued_at,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          ${passId}::uuid,
+          ${venueId}::uuid,
+          ${membership.id}::uuid,
+          ${membership.user_id}::uuid,
+          ${initialStatus}::"VenuePrMembershipPassStatus",
+          ${defaultValidity.validFrom},
+          ${defaultValidity.validUntil},
+          ${qrToken},
+          ${serialNumber},
+          ${walletLinks.apple},
+          ${walletLinks.google},
+          ${walletLinks.apple || walletLinks.google ? now : null},
+          NOW(),
+          NOW()
+        )
+        RETURNING
+          id,
+          venue_id,
+          pr_membership_id,
+          user_id,
+          status::text AS status,
+          valid_from,
+          valid_until,
+          qr_token,
+          serial_number,
+          wallet_apple_url,
+          wallet_google_url,
+          wallet_last_issued_at,
+          revoked_at,
+          metadata,
+          created_at,
+          updated_at,
+          ${membership.role}::text AS membership_role,
+          ${membership.is_active} AS membership_is_active
+      `);
+
+      passRow = insertedRows[0] ?? null;
+    }
+
+    if (!passRow) {
+      throw new BadRequestException('Unable to issue PR season pass');
+    }
+
+    const isExpired = passRow.valid_until.getTime() < now.getTime();
+    const computedStatus: PrSeasonPassStatusDb = passRow.revoked_at
+      ? 'revoked'
+      : isExpired
+        ? 'expired'
+        : 'active';
+    const shouldRefreshWalletLinks =
+      Boolean(options?.refreshWalletLinks) ||
+      !passRow.wallet_apple_url ||
+      !passRow.wallet_google_url;
+
+    let nextAppleUrl = passRow.wallet_apple_url;
+    let nextGoogleUrl = passRow.wallet_google_url;
+    let nextIssuedAt = passRow.wallet_last_issued_at;
+
+    if (shouldRefreshWalletLinks) {
+      const links = this.buildPrSeasonPassWalletLinks({
+        passId: passRow.id,
+        venueId: passRow.venue_id,
+        membershipId: passRow.pr_membership_id,
+        userId: passRow.user_id,
+        qrToken: passRow.qr_token,
+        serialNumber: passRow.serial_number,
+        validUntil: passRow.valid_until,
+      });
+      nextAppleUrl = links.apple ?? passRow.wallet_apple_url;
+      nextGoogleUrl = links.google ?? passRow.wallet_google_url;
+      if (links.apple || links.google) {
+        nextIssuedAt = now;
+      }
+    }
+
+    const shouldUpdateRow =
+      (passRow.status !== 'revoked' && passRow.status !== computedStatus) ||
+      nextAppleUrl !== passRow.wallet_apple_url ||
+      nextGoogleUrl !== passRow.wallet_google_url ||
+      nextIssuedAt?.getTime() !== passRow.wallet_last_issued_at?.getTime();
+
+    if (shouldUpdateRow) {
+      const updatedRows = await this.prisma.$queryRaw<
+        PrSeasonPassRow[]
+      >(Prisma.sql`
+        UPDATE venue_pr_membership_passes
+        SET
+          status = ${
+            passRow.status === 'revoked' ? 'revoked' : computedStatus
+          }::"VenuePrMembershipPassStatus",
+          wallet_apple_url = ${nextAppleUrl},
+          wallet_google_url = ${nextGoogleUrl},
+          wallet_last_issued_at = ${nextIssuedAt},
+          updated_at = NOW()
+        WHERE id = ${passRow.id}::uuid
+        RETURNING
+          id,
+          venue_id,
+          pr_membership_id,
+          user_id,
+          status::text AS status,
+          valid_from,
+          valid_until,
+          qr_token,
+          serial_number,
+          wallet_apple_url,
+          wallet_google_url,
+          wallet_last_issued_at,
+          revoked_at,
+          metadata,
+          created_at,
+          updated_at,
+          ${membership.role}::text AS membership_role,
+          ${membership.is_active} AS membership_is_active
+      `);
+      passRow = updatedRows[0] ?? passRow;
+    }
+
+    return {
+      venue_id: venueId,
+      venue_name: venue.name,
+      membership_id: membership.id,
+      pass: this.mapPrSeasonPass(passRow),
+      generated_at: now.toISOString(),
+    };
+  }
+
+  async getPrSeasonPassApplePkpass(passId: string, token?: string) {
+    const normalizedPassId = String(passId || '').trim();
+    const normalizedToken = String(token || '').trim();
+
+    if (!this.isUuid(normalizedPassId)) {
+      throw new BadRequestException('Invalid pass id');
+    }
+    if (!normalizedToken) {
+      throw new ForbiddenException('Invalid pass token');
+    }
+
+    const rows = await this.prisma.$queryRaw<
+      PrSeasonPassAppleDownloadRow[]
+    >(Prisma.sql`
+      SELECT
+        p.id,
+        p.venue_id,
+        p.pr_membership_id,
+        p.user_id,
+        p.status::text AS status,
+        p.valid_from,
+        p.valid_until,
+        p.qr_token,
+        p.serial_number,
+        p.revoked_at,
+        v.name AS venue_name,
+        v.city AS venue_city,
+        u.name AS user_name,
+        u.username AS user_username,
+        u.email AS user_email,
+        m.role::text AS membership_role,
+        m.is_active AS membership_is_active
+      FROM venue_pr_membership_passes p
+      JOIN venue_pr_memberships m ON m.id = p.pr_membership_id
+      JOIN venues v ON v.id = p.venue_id
+      JOIN users u ON u.id = p.user_id
+      WHERE p.id = ${normalizedPassId}::uuid
+        AND p.qr_token = ${normalizedToken}
+      LIMIT 1
+    `);
+
+    const row = rows[0] ?? null;
+    if (!row) {
+      throw new NotFoundException('Pass not found');
+    }
+    if (!row.membership_is_active) {
+      throw new ForbiddenException('Membership is not active');
+    }
+
+    const status = this.resolvePrSeasonPassStatus(
+      row.status,
+      row.valid_until,
+      row.revoked_at,
+    );
+    if (status !== 'ACTIVE') {
+      throw new ForbiddenException('Pass is not active');
+    }
+
+    const buffer = this.buildPrSeasonPassApplePkpass(row);
+    const safeSerial = row.serial_number
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-');
+
+    return {
+      filename: `nighthub-pr-${safeSerial}.pkpass`,
+      buffer,
+    };
+  }
+
+  async listVenuePrNetworkMembers(venueId: string, user?: RequestUser) {
+    // `loadPrMemberRows` doesn't depend on the actor-context check (only used afterward to
+    // filter `visibleRows`), so it runs alongside it instead of after - same fix as
+    // `getPrDashboardStats` (PERFORMANCE_CHANGES.md #24).
+    const [actorContext, rows] = await Promise.all([
+      this.getVenueAndPrActorContext(venueId, user, false),
+      this.loadPrMemberRows(venueId),
+    ]);
+    const visibleRows =
+      !actorContext.owner && actorContext.membership
+        ? (() => {
+            const allowed = this.collectPrSubtree(
+              actorContext.membership.id,
+              rows,
+            );
+            return rows.filter((row) => allowed.has(row.id));
+          })()
+        : rows;
 
     return visibleRows.map((row) => this.mapPrMember(row));
+  }
+
+  // Supports the venue-side "invite" form: CreateVenuePrMemberDto only accepts a raw
+  // `user_id`, so this resolves an id/email/username into one first. Only returns the
+  // minimal fields the invite form needs to confirm it found the right person - never the
+  // full user row.
+  async lookupUserForPrInvite(identifier: string) {
+    const value = String(identifier || '').trim();
+    if (!value) throw new BadRequestException('identifier is required');
+
+    const isUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        value,
+      );
+
+    const user = isUuid
+      ? await this.prisma.users.findUnique({ where: { id: value } })
+      : value.includes('@')
+        ? await this.prisma.users.findUnique({
+            where: { email: value.toLowerCase() },
+          })
+        : await this.prisma.users.findUnique({ where: { username: value } });
+
+    if (!user) throw new NotFoundException('User not found');
+
+    return {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      username: user.username,
+      role: user.role,
+    };
   }
 
   async createVenuePrNetworkMember(
@@ -1309,9 +3030,14 @@ export class VenuesService {
     });
     if (!targetUser) throw new NotFoundException('User not found');
 
-    const existingMembership = await this.loadPrMembershipByUser(venueId, payload.user_id);
+    const existingMembership = await this.loadPrMembershipByUser(
+      venueId,
+      payload.user_id,
+    );
     if (existingMembership) {
-      throw new BadRequestException('User already assigned to this venue PR network');
+      throw new BadRequestException(
+        'User already assigned to this venue PR network',
+      );
     }
 
     let resolvedParentId: string | null = payload.parent_membership_id ?? null;
@@ -1325,7 +3051,9 @@ export class VenuesService {
       }
 
       if (resolvedParentId && resolvedParentId !== actorMembership.id) {
-        throw new ForbiddenException('Puoi assegnare solo membri nel tuo team diretto');
+        throw new ForbiddenException(
+          'Puoi assegnare solo membri nel tuo team diretto',
+        );
       }
 
       resolvedParentId = actorMembership.id;
@@ -1348,7 +3076,9 @@ export class VenuesService {
       targetUser.email;
     const refCode = await this.buildUniquePrRefCode(venueId, refSeed);
 
-    const inserted = await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    const inserted = await this.prisma.$queryRaw<
+      Array<{ id: string }>
+    >(Prisma.sql`
       INSERT INTO venue_pr_memberships (
         venue_id,
         user_id,
@@ -1405,8 +3135,13 @@ export class VenuesService {
       const actorMembership = actorContext.membership;
       if (!actorMembership) throw new ForbiddenException('Forbidden');
 
-      if (existing.parent_membership_id !== actorMembership.id || existing.role !== 'pr') {
-        throw new ForbiddenException('Puoi gestire solo PR diretti del tuo team');
+      if (
+        existing.parent_membership_id !== actorMembership.id ||
+        existing.role !== 'pr'
+      ) {
+        throw new ForbiddenException(
+          'Puoi gestire solo PR diretti del tuo team',
+        );
       }
 
       const onlyToggleActive =
@@ -1416,7 +3151,9 @@ export class VenuesService {
         payload.ref_code === undefined;
 
       if (!onlyToggleActive) {
-        throw new ForbiddenException('Non hai permessi per modificare questi campi');
+        throw new ForbiddenException(
+          'Non hai permessi per modificare questi campi',
+        );
       }
     }
 
@@ -1448,7 +3185,9 @@ export class VenuesService {
     }
 
     if (nextParentId && nextParentId === existing.id) {
-      throw new BadRequestException('Un membro non puo essere il proprio superiore');
+      throw new BadRequestException(
+        'Un membro non puo essere il proprio superiore',
+      );
     }
 
     const parent = nextParentId
@@ -1529,12 +3268,19 @@ export class VenuesService {
       const actorMembership = actorContext.membership;
       if (!actorMembership) throw new ForbiddenException('Forbidden');
 
-      if (existing.parent_membership_id !== actorMembership.id || existing.role !== 'pr') {
-        throw new ForbiddenException('Puoi eliminare solo PR diretti del tuo team');
+      if (
+        existing.parent_membership_id !== actorMembership.id ||
+        existing.role !== 'pr'
+      ) {
+        throw new ForbiddenException(
+          'Puoi eliminare solo PR diretti del tuo team',
+        );
       }
     }
 
-    const children = await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    const children = await this.prisma.$queryRaw<
+      Array<{ id: string }>
+    >(Prisma.sql`
       SELECT id
       FROM venue_pr_memberships
       WHERE venue_id = ${venueId}::uuid
@@ -1626,7 +3372,10 @@ export class VenuesService {
         FROM venue_pr_memberships
         WHERE venue_id = ${venueId}::uuid
       `);
-      const allowed = this.collectPrSubtree(actorContext.membership.id, treeRows);
+      const allowed = this.collectPrSubtree(
+        actorContext.membership.id,
+        treeRows,
+      );
       if (!allowed.has(membership.id)) {
         throw new ForbiddenException('Forbidden');
       }
@@ -1694,11 +3443,27 @@ export class VenuesService {
     eventId: string,
     user?: RequestUser,
   ) {
-    await this.getVenue(venueId);
-    await this.ensureEventBelongsToVenue(eventId, venueId);
-
-    const actorContext = await this.resolvePrActorContext(venueId, user, false);
-    const rows = await this.prisma.$queryRaw<PrEventAssignmentRow[]>(Prisma.sql`
+    // Three independent checks (venue exists, event belongs to this venue, actor has PR
+    // access) plus the assignments query itself (which only needs venueId/eventId, not the
+    // checks' results - actorContext is only consulted afterward to filter rows) all run
+    // concurrently. `allSettled` (not `all`) preserves the original error priority
+    // (venue > event > forbidden) for the three checks regardless of which settles first; the
+    // rows query's own errors (if any) surface naturally since it isn't wrapped.
+    const [venueResult, eventResult, actorContextResult, rows] =
+      await Promise.all([
+        this.getVenue(venueId).then(
+          (value) => ({ status: 'fulfilled' as const, value }),
+          (reason: unknown) => ({ status: 'rejected' as const, reason }),
+        ),
+        this.ensureEventBelongsToVenue(eventId, venueId).then(
+          (value) => ({ status: 'fulfilled' as const, value }),
+          (reason: unknown) => ({ status: 'rejected' as const, reason }),
+        ),
+        this.resolvePrActorContext(venueId, user, false).then(
+          (value) => ({ status: 'fulfilled' as const, value }),
+          (reason: unknown) => ({ status: 'rejected' as const, reason }),
+        ),
+        this.prisma.$queryRaw<PrEventAssignmentRow[]>(Prisma.sql`
       SELECT
         a.id,
         a.venue_id,
@@ -1726,7 +3491,13 @@ export class VenuesService {
           ELSE 2
         END,
         COALESCE(u.name, u.username, u.email) ASC
-    `);
+    `),
+      ]);
+    if (venueResult.status === 'rejected') throw venueResult.reason;
+    if (eventResult.status === 'rejected') throw eventResult.reason;
+    if (actorContextResult.status === 'rejected')
+      throw actorContextResult.reason;
+    const actorContext = actorContextResult.value;
 
     if (actorContext.owner) {
       return rows.map((row) => this.mapPrEventAssignment(row));
@@ -1782,13 +3553,18 @@ export class VenuesService {
 
     if (!actorContext.owner && actorContext.membership) {
       const allMembers = await this.loadPrMemberRows(venueId);
-      const allowed = this.collectPrSubtree(actorContext.membership.id, allMembers);
+      const allowed = this.collectPrSubtree(
+        actorContext.membership.id,
+        allMembers,
+      );
       if (!allowed.has(targetMembership.id)) {
         throw new ForbiddenException('Forbidden');
       }
     }
 
-    const assignmentRows = await this.prisma.$queryRaw<Array<{ is_active: boolean }>>(
+    const assignmentRows = await this.prisma.$queryRaw<
+      Array<{ is_active: boolean }>
+    >(
       Prisma.sql`
         SELECT is_active
         FROM venue_pr_event_assignments
@@ -1807,7 +3583,9 @@ export class VenuesService {
       throw new BadRequestException('PR is not active for this event');
     }
 
-    const metadataJson = payload.metadata ? JSON.stringify(payload.metadata) : null;
+    const metadataJson = payload.metadata
+      ? JSON.stringify(payload.metadata)
+      : null;
     const rows = await this.prisma.$queryRaw<PrScanRow[]>(Prisma.sql`
       INSERT INTO venue_pr_qr_scans (
         venue_id,
@@ -1869,8 +3647,11 @@ export class VenuesService {
     },
     user?: RequestUser,
   ) {
-    await this.getVenue(venueId);
-    const actorContext = await this.resolvePrActorContext(venueId, user, false);
+    const actorContext = await this.getVenueAndPrActorContext(
+      venueId,
+      user,
+      false,
+    );
 
     const scanRows = await this.prisma.$queryRaw<PrScanRow[]>(Prisma.sql`
       SELECT
@@ -1898,7 +3679,10 @@ export class VenuesService {
 
     if (!actorContext.owner && actorContext.membership) {
       const allMembers = await this.loadPrMemberRows(venueId);
-      const allowed = this.collectPrSubtree(actorContext.membership.id, allMembers);
+      const allowed = this.collectPrSubtree(
+        actorContext.membership.id,
+        allMembers,
+      );
       if (!allowed.has(scan.pr_membership_id)) {
         throw new ForbiddenException('Forbidden');
       }
@@ -1936,7 +3720,8 @@ export class VenuesService {
 
     const entryType = payload.entry_type;
     const explicitGender = this.normalizeManualGenderInput(payload.gender);
-    const gender = explicitGender ??
+    const gender =
+      explicitGender ??
       (entryType ? this.entryTypeToGender(entryType) : Gender.ALTRO);
     const isComplimentary =
       payload.is_complimentary ?? (entryType ? entryType === 'free' : false);
@@ -2012,6 +3797,8 @@ export class VenuesService {
       },
     });
 
+    this.evaluateBadges(guestUserId);
+
     const updatedRows = await this.prisma.$queryRaw<PrScanRow[]>(Prisma.sql`
       UPDATE venue_pr_qr_scans
       SET
@@ -2055,42 +3842,50 @@ export class VenuesService {
       membership_id?: string;
     },
   ) {
-    await this.getVenue(venueId);
-
     const eventId = filters?.event_id ?? undefined;
-    if (eventId) {
-      await this.ensureEventBelongsToVenue(eventId, venueId);
-    }
-
-    const actorContext = await this.resolvePrActorContext(venueId, user, false);
-    const memberRows = await this.loadPrMemberRows(venueId);
+    // `memberRows` and `scanRows` don't depend on `actorContext`/the event-ownership check at
+    // all (they're only filtered by `visibleIds` afterward) - all four run together instead of
+    // 3 sequential round trips.
+    const [actorContext, , memberRows, scanRows] = await Promise.all([
+      this.getVenueAndPrActorContext(venueId, user, false),
+      eventId ? this.ensureEventBelongsToVenue(eventId, venueId) : undefined,
+      this.loadPrMemberRows(venueId),
+      this.prisma.$queryRaw<
+        Array<{
+          pr_membership_id: string;
+          scans_count: number;
+          entries_count: number;
+        }>
+      >(Prisma.sql`
+        SELECT
+          pr_membership_id,
+          COUNT(*)::int AS scans_count,
+          COUNT(entry_id)::int AS entries_count
+        FROM venue_pr_qr_scans
+        WHERE venue_id = ${venueId}::uuid
+          ${eventId ? Prisma.sql`AND event_id = ${eventId}::uuid` : Prisma.empty}
+        GROUP BY pr_membership_id
+      `),
+    ]);
 
     let visibleRows = memberRows;
     if (!actorContext.owner && actorContext.membership) {
-      const allowed = this.collectPrSubtree(actorContext.membership.id, memberRows);
+      const allowed = this.collectPrSubtree(
+        actorContext.membership.id,
+        memberRows,
+      );
       visibleRows = memberRows.filter((row) => allowed.has(row.id));
     }
 
     if (filters?.membership_id) {
-      const target = visibleRows.find((row) => row.id === filters.membership_id);
+      const target = visibleRows.find(
+        (row) => row.id === filters.membership_id,
+      );
       if (!target) throw new ForbiddenException('Forbidden');
       visibleRows = [target];
     }
 
     const visibleIds = new Set(visibleRows.map((row) => row.id));
-
-    const scanRows = await this.prisma.$queryRaw<
-      Array<{ pr_membership_id: string; scans_count: number; entries_count: number }>
-    >(Prisma.sql`
-      SELECT
-        pr_membership_id,
-        COUNT(*)::int AS scans_count,
-        COUNT(entry_id)::int AS entries_count
-      FROM venue_pr_qr_scans
-      WHERE venue_id = ${venueId}::uuid
-        ${eventId ? Prisma.sql`AND event_id = ${eventId}::uuid` : Prisma.empty}
-      GROUP BY pr_membership_id
-    `);
 
     const statsByMember = new Map<string, { scans: number; entries: number }>();
     for (const row of scanRows) {
@@ -2103,7 +3898,10 @@ export class VenuesService {
 
     const childrenMap = new Map<string, string[]>();
     for (const row of visibleRows) {
-      if (!row.parent_membership_id || !visibleIds.has(row.parent_membership_id)) {
+      if (
+        !row.parent_membership_id ||
+        !visibleIds.has(row.parent_membership_id)
+      ) {
         continue;
       }
       const siblings = childrenMap.get(row.parent_membership_id) ?? [];
@@ -2112,7 +3910,9 @@ export class VenuesService {
     }
 
     const rollupCache = new Map<string, { scans: number; entries: number }>();
-    const rollup = (membershipId: string): { scans: number; entries: number } => {
+    const rollup = (
+      membershipId: string,
+    ): { scans: number; entries: number } => {
       const cached = rollupCache.get(membershipId);
       if (cached) return cached;
 
@@ -2203,42 +4003,65 @@ export class VenuesService {
       throw new BadRequestException('Too many stations (max 50 per request)');
     }
 
+    const normalized = stations.map((station) => {
+      const name = String(station.name || '').trim();
+      if (!name) {
+        throw new BadRequestException('station name cannot be empty');
+      }
+      return {
+        name,
+        station_type: station.station_type as VenueStationType,
+        is_active: station.is_active ?? true,
+        sort_order: station.sort_order ?? 0,
+      };
+    });
+
+    // Dedupe by name within the request itself (last one wins, matching the previous
+    // sequential-loop behavior) before splitting into create/update, since
+    // `@@unique([venue_id, name])` would otherwise reject a batched createMany with
+    // duplicate names.
+    const byName = new Map<string, (typeof normalized)[number]>();
+    for (const payload of normalized)
+      byName.set(payload.name.toLowerCase(), payload);
+    const deduped = Array.from(byName.values());
+
     await this.prisma.$transaction(async (tx) => {
-      for (const station of stations) {
-        const name = String(station.name || '').trim();
-        if (!name) {
-          throw new BadRequestException('station name cannot be empty');
-        }
+      // One lookup for the whole batch instead of one `findFirst` per row.
+      const existingRows = await tx.venue_stations.findMany({
+        where: { venue_id: venueId },
+        select: { id: true, name: true },
+      });
+      const existingIdByLowerName = new Map(
+        existingRows.map((r) => [r.name.toLowerCase(), r.id]),
+      );
 
-        const existing = await tx.venue_stations.findFirst({
-          where: {
-            venue_id: venueId,
-            name: { equals: name, mode: 'insensitive' },
-          },
-          select: { id: true },
-        });
+      const toCreate: (typeof deduped)[number][] = [];
+      const toUpdate: { id: string; payload: (typeof deduped)[number] }[] = [];
 
-        const payload = {
-          name,
-          station_type: station.station_type as VenueStationType,
-          is_active: station.is_active ?? true,
-          sort_order: station.sort_order ?? 0,
-        };
-
-        if (existing) {
-          await tx.venue_stations.update({
-            where: { id: existing.id },
-            data: payload,
-          });
+      for (const payload of deduped) {
+        const existingId = existingIdByLowerName.get(
+          payload.name.toLowerCase(),
+        );
+        if (existingId) {
+          toUpdate.push({ id: existingId, payload });
         } else {
-          await tx.venue_stations.create({
-            data: {
-              venue_id: venueId,
-              ...payload,
-            },
-          });
+          toCreate.push(payload);
         }
       }
+
+      if (toCreate.length) {
+        await tx.venue_stations.createMany({
+          data: toCreate.map((payload) => ({ venue_id: venueId, ...payload })),
+        });
+      }
+
+      // Each existing station gets different data, so updates still have to be per-row —
+      // but they're now independent writes (no interleaved reads) and can run concurrently.
+      await Promise.all(
+        toUpdate.map(({ id, payload }) =>
+          tx.venue_stations.update({ where: { id }, data: payload }),
+        ),
+      );
     });
 
     return this.listVenueStations(venueId);
@@ -2316,7 +4139,10 @@ export class VenuesService {
         this.prisma.table_sales.count({ where: { station_id: stationId } }),
       ]);
 
-    if (entriesCount + barSalesCount + cloakroomSalesCount + tableSalesCount > 0) {
+    if (
+      entriesCount + barSalesCount + cloakroomSalesCount + tableSalesCount >
+      0
+    ) {
       throw new BadRequestException(
         'Cannot delete station: operational records are already linked to it',
       );
@@ -2341,101 +4167,201 @@ export class VenuesService {
       throw new BadRequestException('Too many tables (max 300 per request)');
     }
 
+    // Parse/validate every row up front (was previously interleaved with the writes,
+    // one row at a time). This endpoint manages at most one venue_table per zone — a
+    // later row targeting the same `zona` overwrites the same underlying row — so, like
+    // the stations bulk endpoint, rows sharing a zone are deduped here (last one wins),
+    // collapsing what used to be up to 4 sequential queries per *row* into a handful of
+    // queries per *distinct zone* instead.
+    type ParsedTableRow = {
+      zonaRaw: string;
+      normalizedNome: string;
+      perTesta: number | undefined;
+      costoMinimo: number | undefined;
+      personeMax: number | undefined;
+    };
+
+    const byZone = new Map<string, ParsedTableRow>();
+
+    for (const t of tables) {
+      if (!t?.nome || typeof t.nome !== 'string') {
+        throw new BadRequestException('Each table must have nome');
+      }
+
+      const zonaRaw =
+        t.zona === null || t.zona === undefined ? '' : String(t.zona).trim();
+      const nomeRaw = String(t.nome).trim();
+      const zoneMode = zonaRaw.length > 0;
+      const normalizedNome = zoneMode ? nomeRaw || zonaRaw : nomeRaw;
+
+      if (!normalizedNome) {
+        throw new BadRequestException('nome cannot be empty');
+      }
+      if (!zoneMode) {
+        throw new BadRequestException('zona is required');
+      }
+
+      const perTesta =
+        t.per_testa === null || t.per_testa === undefined
+          ? undefined
+          : Number(t.per_testa);
+      if (
+        perTesta !== undefined &&
+        (!Number.isFinite(perTesta) || perTesta < 0)
+      ) {
+        throw new BadRequestException('per_testa must be a number >= 0');
+      }
+
+      const costoMinimo =
+        t.costo_minimo === null || t.costo_minimo === undefined
+          ? undefined
+          : Number(t.costo_minimo);
+      if (
+        costoMinimo !== undefined &&
+        (!Number.isFinite(costoMinimo) || costoMinimo < 0)
+      ) {
+        throw new BadRequestException('costo_minimo must be a number >= 0');
+      }
+
+      const personeMax =
+        t.persone_max === null || t.persone_max === undefined
+          ? undefined
+          : Number(t.persone_max);
+      if (
+        personeMax !== undefined &&
+        (!Number.isInteger(personeMax) || personeMax < 1)
+      ) {
+        throw new BadRequestException('persone_max must be an integer >= 1');
+      }
+
+      // Map key is case-insensitive to match the zone's unique constraint semantics.
+      byZone.set(zonaRaw.toLowerCase(), {
+        zonaRaw,
+        normalizedNome,
+        perTesta,
+        costoMinimo,
+        personeMax,
+      });
+    }
+
+    const zoneRows = Array.from(byZone.values());
+
     await this.prisma.$transaction(async (tx) => {
-      for (const t of tables) {
-        if (!t?.nome || typeof t.nome !== 'string') {
-          throw new BadRequestException('Each table must have nome');
-        }
+      const [zoneCountAtStart, existingZones] = await Promise.all([
+        tx.venue_table_zones.count({ where: { venue_id: venueId } }),
+        tx.venue_table_zones.findMany({
+          where: { venue_id: venueId },
+          select: { id: true, name: true },
+        }),
+      ]);
+      const existingZoneIdByLowerName = new Map(
+        existingZones.map((z) => [z.name.toLowerCase(), z.id]),
+      );
 
-        const zonaRaw =
-          t.zona === null || t.zona === undefined ? '' : String(t.zona).trim();
-        const nomeRaw = String(t.nome).trim();
-        const zoneMode = zonaRaw.length > 0;
-        const normalizedNome = zoneMode
-          ? (nomeRaw || zonaRaw)
-          : nomeRaw;
-        const normalizedZona = zoneMode ? zonaRaw : undefined;
+      // Only zones that don't exist yet consume a new sort_order slot, counted locally
+      // instead of re-querying `count()` after every insert.
+      let nextSortOrder = zoneCountAtStart;
 
-        if (!normalizedNome) {
-          throw new BadRequestException('nome cannot be empty');
-        }
+      const zoneRecords = await Promise.all(
+        zoneRows.map(async (row) => {
+          const isNew = !existingZoneIdByLowerName.has(
+            row.zonaRaw.toLowerCase(),
+          );
+          const sortOrder = isNew ? nextSortOrder++ : undefined;
 
-        const perTesta =
-          t.per_testa === null || t.per_testa === undefined
-            ? undefined
-            : Number(t.per_testa);
-        if (
-          perTesta !== undefined &&
-          (!Number.isFinite(perTesta) || perTesta < 0)
-        ) {
-          throw new BadRequestException('per_testa must be a number >= 0');
-        }
-
-        const costoMinimo =
-          t.costo_minimo === null || t.costo_minimo === undefined
-            ? undefined
-            : Number(t.costo_minimo);
-        if (
-          costoMinimo !== undefined &&
-          (!Number.isFinite(costoMinimo) || costoMinimo < 0)
-        ) {
-          throw new BadRequestException('costo_minimo must be a number >= 0');
-        }
-
-        const personeMax =
-          t.persone_max === null || t.persone_max === undefined
-            ? undefined
-            : Number(t.persone_max);
-        if (
-          personeMax !== undefined &&
-          (!Number.isInteger(personeMax) || personeMax < 1)
-        ) {
-          throw new BadRequestException('persone_max must be an integer >= 1');
-        }
-
-        if (!zoneMode) {
-          throw new BadRequestException('zona is required');
-        }
-
-        const existingZone = (await tx.venue_tables.findFirst({
-          where: {
-            venue_id: venueId,
-            zona: { equals: zonaRaw, mode: 'insensitive' },
-          },
-          select: { id: true },
-        })) as { id: string } | null;
-
-        if (existingZone) {
-          await tx.venue_tables.update({
-            where: { id: existingZone.id },
-            data: {
-              nome: normalizedNome,
-              zona: normalizedZona,
-              numero: null,
-              per_testa: perTesta,
-              costo_minimo: costoMinimo,
-              persone_max: personeMax,
+          const zoneRecord = await tx.venue_table_zones.upsert({
+            where: { venue_id_name: { venue_id: venueId, name: row.zonaRaw } },
+            update: {
+              per_testa: row.perTesta ?? null,
+              costo_minimo: row.costoMinimo ?? null,
+              persone_max: row.personeMax ?? null,
+              is_active: true,
             },
-          });
-        } else {
-          await tx.venue_tables.create({
-            data: {
+            create: {
               venue_id: venueId,
-              nome: normalizedNome,
-              zona: normalizedZona,
-              numero: null,
-              per_testa: perTesta,
-              costo_minimo: costoMinimo,
-              persone_max: personeMax,
+              name: row.zonaRaw,
+              per_testa: row.perTesta ?? null,
+              costo_minimo: row.costoMinimo ?? null,
+              persone_max: row.personeMax ?? null,
+              booking_policy: VenueTableBookingPolicy.exclusive,
+              sort_order: sortOrder ?? 0,
+              is_active: true,
             },
+            select: { id: true, name: true },
           });
+
+          return { row, zoneRecord };
+        }),
+      );
+
+      const zoneIds = zoneRecords.map(({ zoneRecord }) => zoneRecord.id);
+      const zoneNames = zoneRecords.map(({ row }) => row.zonaRaw);
+
+      // One lookup for every zone touched by this batch instead of one `findFirst` per row.
+      const existingTableRows = await tx.venue_tables.findMany({
+        where: {
+          venue_id: venueId,
+          OR: [
+            { venue_table_zone_id: { in: zoneIds } },
+            { zona: { in: zoneNames, mode: 'insensitive' } },
+          ],
+        },
+        select: { id: true, venue_table_zone_id: true, zona: true },
+      });
+      const existingTableIdByZoneId = new Map(
+        existingTableRows
+          .filter((r) => r.venue_table_zone_id)
+          .map((r) => [r.venue_table_zone_id as string, r.id]),
+      );
+      const existingTableIdByZonaName = new Map(
+        existingTableRows.map((r) => [r.zona?.toLowerCase() ?? '', r.id]),
+      );
+
+      const toCreate: Prisma.venue_tablesCreateManyInput[] = [];
+      const toUpdate: { id: string; data: Prisma.venue_tablesUpdateInput }[] =
+        [];
+
+      for (const { row, zoneRecord } of zoneRecords) {
+        const existingId =
+          existingTableIdByZoneId.get(zoneRecord.id) ??
+          existingTableIdByZonaName.get(row.zonaRaw.toLowerCase());
+
+        const data = {
+          venue_table_zone_id: zoneRecord.id,
+          nome: row.normalizedNome,
+          zona: zoneRecord.name,
+          numero: null,
+          per_testa: row.perTesta,
+          costo_minimo: row.costoMinimo,
+          persone_max: row.personeMax,
+        };
+
+        if (existingId) {
+          toUpdate.push({ id: existingId, data });
+        } else {
+          toCreate.push({ venue_id: venueId, ...data });
         }
       }
+
+      if (toCreate.length) {
+        await tx.venue_tables.createMany({ data: toCreate });
+      }
+
+      // Different data per row, so still one statement per row - but independent writes
+      // that can run concurrently instead of the previous read-then-write-per-row loop.
+      await Promise.all(
+        toUpdate.map(({ id, data }) =>
+          tx.venue_tables.update({ where: { id }, data }),
+        ),
+      );
     });
 
     return this.listVenueTables(venueId);
   }
 
+  // venue_tables is purely a floor-plan visual element now (numbered table icon on the
+  // map) - it has no FK from reservations/event_tables/sales anymore (those all key off
+  // venue_table_zones), so deleting one has no dependent booking/sales data to clean up.
   async deleteVenueTable(
     venueId: string,
     tableId: string,
@@ -2450,49 +4376,7 @@ export class VenuesService {
       throw new NotFoundException('Table not found');
     }
 
-    try {
-      return await this.prisma.$transaction(async (tx) => {
-        const salesCount = await tx.table_sales.count({
-          where: {
-            event_table: {
-              venue_table_id: tableId,
-            },
-          },
-        });
-
-        if (salesCount > 0) {
-          throw new BadRequestException(
-            'Cannot delete table: sales are associated with this table',
-          );
-        }
-
-        await tx.reservations.updateMany({
-          where: { venue_table_id: tableId },
-          data: { venue_table_id: null },
-        });
-
-        await tx.event_tables.deleteMany({
-          where: { venue_table_id: tableId },
-        });
-
-        return await tx.venue_tables.delete({ where: { id: tableId } });
-      });
-    } catch (error: unknown) {
-      if (error instanceof BadRequestException) throw error;
-
-      const prismaCode =
-        typeof error === 'object' && error !== null && 'code' in error
-          ? String((error as { code?: unknown }).code)
-          : '';
-
-      if (prismaCode === 'P2003') {
-        throw new BadRequestException(
-          'Cannot delete table: it is still linked to event data',
-        );
-      }
-
-      throw error;
-    }
+    return this.prisma.venue_tables.delete({ where: { id: tableId } });
   }
 
   async updateVenueTable(
@@ -2511,6 +4395,7 @@ export class VenuesService {
     }
 
     const data: Prisma.venue_tablesUpdateInput = {};
+    let zoneIdFromZona: string | undefined;
 
     if (body?.nome !== undefined) {
       const trimmed = String(body.nome).trim();
@@ -2524,23 +4409,63 @@ export class VenuesService {
         throw new BadRequestException('zona cannot be empty');
       }
 
-      data.zona = trimmed;
-
-      const clashByZone = (await this.prisma.venue_tables.findFirst({
+      const zoneSortOrder = await this.prisma.venue_table_zones.count({
+        where: { venue_id: venueId },
+      });
+      const zoneRecord = await this.prisma.venue_table_zones.upsert({
         where: {
-          venue_id: venueId,
-          id: { not: tableId },
-          zona: { equals: trimmed, mode: 'insensitive' },
+          venue_id_name: {
+            venue_id: venueId,
+            name: trimmed,
+          },
         },
-        select: { id: true },
-      })) as { id: string } | null;
-      if (clashByZone) {
-        throw new BadRequestException('zona already exists for this venue');
-      }
+        update: {
+          is_active: true,
+        },
+        create: {
+          venue_id: venueId,
+          name: trimmed,
+          booking_policy: VenueTableBookingPolicy.exclusive,
+          sort_order: zoneSortOrder,
+          is_active: true,
+        },
+        select: { id: true, name: true },
+      });
+
+      zoneIdFromZona = zoneRecord.id;
+      data.zona = zoneRecord.name;
 
       if (!body?.nome) {
-        data.nome = trimmed;
+        data.nome = zoneRecord.name;
       }
+    }
+
+    if (body?.venue_table_zone_id !== undefined) {
+      const zoneId =
+        body.venue_table_zone_id === null
+          ? null
+          : String(body.venue_table_zone_id).trim();
+
+      if (!zoneId) {
+        data.zone = { disconnect: true };
+      } else {
+        const zone = await this.prisma.venue_table_zones.findUnique({
+          where: { id: zoneId },
+          select: { id: true, venue_id: true, name: true },
+        });
+        if (!zone || zone.venue_id !== venueId) {
+          throw new BadRequestException(
+            'venue_table_zone_id is invalid for this venue',
+          );
+        }
+
+        data.zone = { connect: { id: zone.id } };
+        if (body?.zona === undefined) {
+          data.zona = zone.name;
+        }
+      }
+    } else if (zoneIdFromZona) {
+      data.zone = { connect: { id: zoneIdFromZona } };
     }
 
     if (body?.per_testa !== undefined && body.per_testa !== null) {
@@ -2567,15 +4492,93 @@ export class VenuesService {
       data.persone_max = v;
     }
 
+    if (body?.numero !== undefined) {
+      if (body.numero === null) {
+        data.numero = null;
+      } else {
+        const v = Number(body.numero);
+        if (!Number.isInteger(v) || v < 1) {
+          throw new BadRequestException('numero must be an integer >= 1');
+        }
+        data.numero = v;
+      }
+    }
+
     if (body?.per_testa === null) data.per_testa = null;
     if (body?.costo_minimo === null) data.costo_minimo = null;
     if (body?.persone_max === null) data.persone_max = null;
-    data.numero = null;
 
-    return await this.prisma.venue_tables.update({
-      where: { id: tableId },
-      data,
-    });
+    if (body?.floor_x !== undefined) {
+      data.floor_x = body.floor_x === null ? null : Number(body.floor_x);
+    }
+    if (body?.floor_y !== undefined) {
+      data.floor_y = body.floor_y === null ? null : Number(body.floor_y);
+    }
+    if (body?.floor_w !== undefined) {
+      if (body.floor_w === null) {
+        data.floor_w = null;
+      } else {
+        const v = Number(body.floor_w);
+        if (!Number.isFinite(v) || v <= 0) {
+          throw new BadRequestException('floor_w must be > 0');
+        }
+        data.floor_w = v;
+      }
+    }
+    if (body?.floor_h !== undefined) {
+      if (body.floor_h === null) {
+        data.floor_h = null;
+      } else {
+        const v = Number(body.floor_h);
+        if (!Number.isFinite(v) || v <= 0) {
+          throw new BadRequestException('floor_h must be > 0');
+        }
+        data.floor_h = v;
+      }
+    }
+    if (body?.floor_shape !== undefined) {
+      const shape = String(body.floor_shape ?? '').trim();
+      data.floor_shape = shape.length ? shape : null;
+    }
+    if (body?.floor_rotation !== undefined) {
+      if (body.floor_rotation === null) {
+        data.floor_rotation = null;
+      } else {
+        const v = Number(body.floor_rotation);
+        if (!Number.isFinite(v)) {
+          throw new BadRequestException('floor_rotation must be numeric');
+        }
+        data.floor_rotation = v;
+      }
+    }
+    if (body?.layout_order !== undefined && body.layout_order !== null) {
+      const v = Number(body.layout_order);
+      if (!Number.isInteger(v) || v < 0) {
+        throw new BadRequestException('layout_order must be an integer >= 0');
+      }
+      data.layout_order = v;
+    }
+    if (body?.is_hidden !== undefined) {
+      data.is_hidden = Boolean(body.is_hidden);
+    }
+
+    try {
+      return await this.prisma.venue_tables.update({
+        where: { id: tableId },
+        data,
+      });
+    } catch (error: unknown) {
+      const prismaCode =
+        typeof error === 'object' && error !== null && 'code' in error
+          ? String((error as { code?: unknown }).code)
+          : '';
+      if (prismaCode === 'P2002') {
+        throw new BadRequestException(
+          'Table number already exists for this venue',
+        );
+      }
+      throw error;
+    }
   }
 
   async getStats(venueId: string): Promise<{
@@ -2584,8 +4587,12 @@ export class VenuesService {
     reservationsCount: number;
     totalReservationAmount: number;
   }> {
+    // Plain `Promise.all` (not `$transaction`) so these 4 independent counts run concurrently
+    // on separate pooled connections instead of sequentially over one - see
+    // PERFORMANCE_CHANGES.md #24 for why a batch `$transaction` doesn't parallelize on a
+    // remote pooled DB.
     const [eventsCount, promosCount, reservationsCount, reservationsSum] =
-      await this.prisma.$transaction([
+      await Promise.all([
         this.prisma.events.count({ where: { venue_id: venueId } }),
         this.prisma.promos.count({ where: { venue_id: venueId } }),
         this.prisma.reservations.count({
@@ -2624,11 +4631,17 @@ export class VenuesService {
   }
 
   async getAnalyticsOverview(venueId: string, eventId?: string) {
-    await this.getVenue(venueId);
-    if (eventId) {
-      await this.ensureEventBelongsToVenue(eventId, venueId);
-    }
+    return this.analyticsCache.getOrCompute(
+      `analytics-overview:${venueId}:${eventId ?? 'all'}`,
+      VenuesService.ANALYTICS_CACHE_TTL_MS,
+      () => this.getAnalyticsOverviewUncached(venueId, eventId),
+    );
+  }
 
+  private async getAnalyticsOverviewUncached(
+    venueId: string,
+    eventId?: string,
+  ) {
     const eventFilter = eventId ? { id: eventId } : { venue_id: venueId };
     const reservationFilter = eventId
       ? { event_id: eventId }
@@ -2637,22 +4650,43 @@ export class VenuesService {
       ? { venue_id: venueId, event_id: eventId, duration_ms: { not: null } }
       : { venue_id: venueId, duration_ms: { not: null } };
 
-    const [eventsCount, reservationsCount, entriesCount, ticketOrdersCount, stayAgg, revenue] =
-      await Promise.all([
-        this.prisma.events.count({ where: eventFilter }),
-        this.prisma.reservations.count({ where: reservationFilter }),
-        this.prisma.entries.count({
-          where: eventId ? { event_id: eventId } : { event: { venue_id: venueId } },
-        }),
-        this.prisma.ticket_orders.count({
-          where: eventId ? { event_id: eventId } : { event: { venue_id: venueId } },
-        }),
-        this.prisma.venue_stays.aggregate({
-          where: stayFilter,
-          _avg: { duration_ms: true },
-        }),
-        this.getRevenueBreakdown(venueId, eventId),
-      ]);
+    // The existence/ownership checks don't gate what the counts below need to run (a bad
+    // venueId/eventId just yields zero-row counts, not an error) - they run in the same
+    // `Promise.all` instead of sequentially before it, and are validated once everything
+    // settles. This also means a cache-warm `getRevenueBreakdown` call below doesn't silently
+    // skip validation, since these checks are independent of it.
+    const [
+      venueRow,
+      eventOk,
+      eventsCount,
+      reservationsCount,
+      entriesCount,
+      ticketOrdersCount,
+      stayAgg,
+      revenue,
+    ] = await Promise.all([
+      this.getVenue(venueId),
+      eventId ? this.ensureEventBelongsToVenue(eventId, venueId) : undefined,
+      this.prisma.events.count({ where: eventFilter }),
+      this.prisma.reservations.count({ where: reservationFilter }),
+      this.prisma.entries.count({
+        where: eventId
+          ? { event_id: eventId }
+          : { event: { venue_id: venueId } },
+      }),
+      this.prisma.ticket_orders.count({
+        where: eventId
+          ? { event_id: eventId }
+          : { event: { venue_id: venueId } },
+      }),
+      this.prisma.venue_stays.aggregate({
+        where: stayFilter,
+        _avg: { duration_ms: true },
+      }),
+      this.getRevenueBreakdown(venueId, eventId),
+    ]);
+    void venueRow;
+    void eventOk;
 
     return {
       venue_id: venueId,
@@ -2677,12 +4711,14 @@ export class VenuesService {
   }
 
   async getAnalyticsDemographics(venueId: string, eventId?: string) {
-    await this.getVenue(venueId);
-    if (eventId) {
-      await this.ensureEventBelongsToVenue(eventId, venueId);
-    }
-
-    const analytics = await this.getAnalytics(venueId);
+    // Existence/ownership checks run alongside the (possibly cache-warm) analytics fetch
+    // instead of gating it - on a cache hit this removes what used to be 1-2 full sequential
+    // round trips before returning an already-computed result.
+    const [, , analytics] = await Promise.all([
+      this.getVenue(venueId),
+      eventId ? this.ensureEventBelongsToVenue(eventId, venueId) : undefined,
+      this.getAnalytics(venueId),
+    ]);
     if (!eventId) {
       return {
         venue_id: venueId,
@@ -2709,34 +4745,51 @@ export class VenuesService {
         ],
         ageBuckets: analytics.audience.ageBuckets,
       },
-      note:
-        'Le fasce eta sono aggregate a livello venue finche venue_stays/event_presence_events non vengono materializzati per singolo evento.',
+      note: 'Le fasce eta sono aggregate a livello venue finche venue_stays/event_presence_events non vengono materializzati per singolo evento.',
     };
   }
 
   async getRevenueBreakdown(venueId: string, eventId?: string) {
-    await this.getVenue(venueId);
-    if (eventId) {
-      await this.ensureEventBelongsToVenue(eventId, venueId);
-    }
+    return this.analyticsCache.getOrCompute(
+      `revenue-breakdown:${venueId}:${eventId ?? 'all'}`,
+      VenuesService.ANALYTICS_CACHE_TTL_MS,
+      () => this.getRevenueBreakdownUncached(venueId, eventId),
+    );
+  }
 
+  private async getRevenueBreakdownUncached(venueId: string, eventId?: string) {
     const eventIdSql = eventId ?? null;
 
-    const [paidEntryReservationsAgg, directEntriesAgg, barAgg, cloakAgg, tableAgg, stationRows] =
-      await Promise.all([
-        this.prisma.reservations.aggregate({
-          where: {
-            ...(eventId
-              ? { event_id: eventId }
-              : { event: { venue_id: venueId } }),
-            type: ReservationType.entry,
-            status: { in: [ReservationStatus.confirmed, ReservationStatus.completed] },
-            total_amount: { not: null },
+    // Same reasoning as `getAnalyticsOverviewUncached`: existence/ownership checks run
+    // alongside the aggregates instead of gating them, since a bad venueId/eventId here just
+    // yields zero-row aggregates rather than an error.
+    const [
+      venueRow,
+      eventOk,
+      paidEntryReservationsAgg,
+      directEntriesAgg,
+      barAgg,
+      cloakAgg,
+      tableAgg,
+      stationRows,
+    ] = await Promise.all([
+      this.getVenue(venueId),
+      eventId ? this.ensureEventBelongsToVenue(eventId, venueId) : undefined,
+      this.prisma.reservations.aggregate({
+        where: {
+          ...(eventId
+            ? { event_id: eventId }
+            : { event: { venue_id: venueId } }),
+          type: ReservationType.entry,
+          status: {
+            in: [ReservationStatus.confirmed, ReservationStatus.completed],
           },
-          _sum: { total_amount: true },
-        }),
-        this.prisma.$queryRaw<Array<{ total: Prisma.Decimal | null }>>(
-          Prisma.sql`
+          total_amount: { not: null },
+        },
+        _sum: { total_amount: true },
+      }),
+      this.prisma.$queryRaw<Array<{ total: Prisma.Decimal | null }>>(
+        Prisma.sql`
             SELECT COALESCE(SUM(e."price"), 0) AS total
             FROM "entries" e
             JOIN "events" ev ON ev."id" = e."event_id"
@@ -2745,36 +4798,36 @@ export class VenuesService {
               AND (${eventIdSql}::uuid IS NULL OR e."event_id" = ${eventIdSql}::uuid)
               AND (r."id" IS NULL OR r."total_amount" IS NULL)
           `,
-        ),
-        this.prisma.bar_sales.aggregate({
-          where: eventId
-            ? { event_id: eventId }
-            : { event: { venue_id: venueId } },
-          _sum: { amount: true },
-        }),
-        this.prisma.cloakroom_sales.aggregate({
-          where: eventId
-            ? { event_id: eventId }
-            : { event: { venue_id: venueId } },
-          _sum: { amount: true },
-        }),
-        this.prisma.event_tables.aggregate({
-          where: eventId
-            ? { event_id: eventId }
-            : { event: { venue_id: venueId } },
-          _sum: { pagato_totale: true },
-        }),
-        this.prisma.$queryRaw<
-          Array<{
-            channel: string;
-            station_id: string | null;
-            station_name: string;
-            station_type: string;
-            total_amount: Prisma.Decimal | null;
-            transaction_count: bigint | number;
-            last_activity_at: Date | null;
-          }>
-        >(Prisma.sql`
+      ),
+      this.prisma.bar_sales.aggregate({
+        where: eventId
+          ? { event_id: eventId }
+          : { event: { venue_id: venueId } },
+        _sum: { amount: true },
+      }),
+      this.prisma.cloakroom_sales.aggregate({
+        where: eventId
+          ? { event_id: eventId }
+          : { event: { venue_id: venueId } },
+        _sum: { amount: true },
+      }),
+      this.prisma.event_tables.aggregate({
+        where: eventId
+          ? { event_id: eventId }
+          : { event: { venue_id: venueId } },
+        _sum: { pagato_totale: true },
+      }),
+      this.prisma.$queryRaw<
+        Array<{
+          channel: string;
+          station_id: string | null;
+          station_name: string;
+          station_type: string;
+          total_amount: Prisma.Decimal | null;
+          transaction_count: bigint | number;
+          last_activity_at: Date | null;
+        }>
+      >(Prisma.sql`
           SELECT
             rows.channel,
             rows.station_id,
@@ -2854,17 +4907,22 @@ export class VenuesService {
           GROUP BY rows.channel, rows.station_id, rows.station_name, rows.station_type
           ORDER BY SUM(rows.total_amount) DESC, SUM(rows.transaction_count) DESC
         `),
-      ]);
+    ]);
+    void venueRow;
+    void eventOk;
 
     const reservationEntryRevenue = this.decimalToNumber(
       paidEntryReservationsAgg._sum.total_amount,
     );
-    const directEntryRevenue = this.decimalToNumber(directEntriesAgg[0]?.total ?? null);
+    const directEntryRevenue = this.decimalToNumber(
+      directEntriesAgg[0]?.total ?? null,
+    );
     const entryRevenue = reservationEntryRevenue + directEntryRevenue;
     const barRevenue = this.decimalToNumber(barAgg._sum.amount);
     const cloakroomRevenue = this.decimalToNumber(cloakAgg._sum.amount);
     const tableRevenue = this.decimalToNumber(tableAgg._sum.pagato_totale);
-    const totalRevenue = entryRevenue + barRevenue + cloakroomRevenue + tableRevenue;
+    const totalRevenue =
+      entryRevenue + barRevenue + cloakroomRevenue + tableRevenue;
 
     const stations = stationRows.map((row) => ({
       channel: row.channel,
@@ -2898,25 +4956,125 @@ export class VenuesService {
   }
 
   async getAnalytics(venueId: string) {
-    const venue = await this.prisma.venues.findUnique({
-      where: { id: venueId },
-      select: { id: true, name: true },
-    });
+    return this.analyticsCache.getOrCompute(
+      `analytics:${venueId}`,
+      VenuesService.ANALYTICS_CACHE_TTL_MS,
+      () => this.getAnalyticsUncached(venueId),
+    );
+  }
+
+  private async getAnalyticsUncached(venueId: string) {
+    // Every query below only ever needs `venueId` - `entries`/`reservations`/the sales
+    // groupBys used to filter by `event_id: { in: eventIds } }`, which forced them to wait
+    // for `rawEvents` to resolve first just to get that id list. Filtering through the
+    // `event.venue_id` relation instead means they don't need `rawEvents` at all, so every
+    // query here (venue existence, the event list, and all the aggregates) runs in a single
+    // `Promise.all` instead of 2 sequential round trips. On the rare "brand new venue, zero
+    // events" path this wastes a handful of aggregate queries that return empty results - a
+    // fine trade for one fewer round trip on every normal call.
+    const [
+      venue,
+      rawEvents,
+      entries,
+      reservations,
+      barTotals,
+      cloakTotals,
+      tableTotals,
+      directEntryRevenueRows,
+      stayAggregate,
+    ] = await Promise.all([
+      this.prisma.venues.findUnique({
+        where: { id: venueId },
+        select: { id: true, name: true },
+      }),
+      this.prisma.events.findMany({
+        where: { venue_id: venueId },
+        orderBy: [{ date: 'desc' }, { start_time: 'desc' }],
+        select: {
+          id: true,
+          name: true,
+          date: true,
+          status: true,
+          start_time: true,
+          end_time: true,
+        },
+      }),
+      this.prisma.entries.findMany({
+        where: { event: { venue_id: venueId } },
+        select: {
+          id: true,
+          event_id: true,
+          user_id: true,
+          sesso: true,
+          age_bucket: true,
+          price: true,
+          created_at: true,
+          user: {
+            select: {
+              id: true,
+              sesso: true,
+              birth_date: true,
+            },
+          },
+        },
+      }),
+      this.prisma.reservations.findMany({
+        where: { event: { venue_id: venueId } },
+        select: {
+          id: true,
+          event_id: true,
+          user_id: true,
+          type: true,
+          status: true,
+          guests: true,
+          total_amount: true,
+          created_at: true,
+          checked_in_at: true,
+          checkin_entry_id: true,
+          user: {
+            select: {
+              id: true,
+              sesso: true,
+              birth_date: true,
+            },
+          },
+        },
+      }),
+      this.prisma.bar_sales.groupBy({
+        by: ['event_id'],
+        where: { event: { venue_id: venueId } },
+        _sum: { amount: true },
+      }),
+      this.prisma.cloakroom_sales.groupBy({
+        by: ['event_id'],
+        where: { event: { venue_id: venueId } },
+        _sum: { amount: true },
+      }),
+      this.prisma.event_tables.groupBy({
+        by: ['event_id'],
+        where: { event: { venue_id: venueId } },
+        _sum: { pagato_totale: true, prenotati: true },
+      }),
+      this.prisma.$queryRaw<
+        Array<{ event_id: string; total: Prisma.Decimal | null }>
+      >(
+        Prisma.sql`
+          SELECT e."event_id", COALESCE(SUM(e."price"), 0) AS total
+          FROM "entries" e
+          JOIN "events" ev ON ev."id" = e."event_id"
+          LEFT JOIN "reservations" r ON r."checkin_entry_id" = e."id"
+          WHERE ev."venue_id" = ${venueId}::uuid
+            AND (r."id" IS NULL OR r."total_amount" IS NULL)
+          GROUP BY e."event_id"
+        `,
+      ),
+      this.prisma.venue_stays.aggregate({
+        where: { venue_id: venueId, duration_ms: { not: null } },
+        _avg: { duration_ms: true },
+      }),
+    ]);
 
     if (!venue) throw new NotFoundException('Venue not found');
-
-    const rawEvents = await this.prisma.events.findMany({
-      where: { venue_id: venueId },
-      orderBy: [{ date: 'desc' }, { start_time: 'desc' }],
-      select: {
-        id: true,
-        name: true,
-        date: true,
-        status: true,
-        start_time: true,
-        end_time: true,
-      },
-    });
 
     if (rawEvents.length === 0) {
       return {
@@ -2974,89 +5132,6 @@ export class VenuesService {
         events: [],
       };
     }
-
-    const eventIds = rawEvents.map((event) => event.id);
-
-    const [
-      entries,
-      reservations,
-      barTotals,
-      cloakTotals,
-      tableTotals,
-      directEntryRevenueRows,
-      stayAggregate,
-    ] = await Promise.all([
-      this.prisma.entries.findMany({
-        where: { event_id: { in: eventIds } },
-        select: {
-          id: true,
-          event_id: true,
-          user_id: true,
-          sesso: true,
-          age_bucket: true,
-          price: true,
-          created_at: true,
-          user: {
-            select: {
-              id: true,
-              sesso: true,
-              birth_date: true,
-            },
-          },
-        },
-      }),
-      this.prisma.reservations.findMany({
-        where: { event_id: { in: eventIds } },
-        select: {
-          id: true,
-          event_id: true,
-          user_id: true,
-          type: true,
-          status: true,
-          guests: true,
-          total_amount: true,
-          created_at: true,
-          checked_in_at: true,
-          checkin_entry_id: true,
-          user: {
-            select: {
-              id: true,
-              sesso: true,
-              birth_date: true,
-            },
-          },
-        },
-      }),
-      this.prisma.bar_sales.groupBy({
-        by: ['event_id'],
-        where: { event_id: { in: eventIds } },
-        _sum: { amount: true },
-      }),
-      this.prisma.cloakroom_sales.groupBy({
-        by: ['event_id'],
-        where: { event_id: { in: eventIds } },
-        _sum: { amount: true },
-      }),
-      this.prisma.event_tables.groupBy({
-        by: ['event_id'],
-        where: { event_id: { in: eventIds } },
-        _sum: { pagato_totale: true, prenotati: true },
-      }),
-      this.prisma.$queryRaw<Array<{ event_id: string; total: Prisma.Decimal | null }>>(
-        Prisma.sql`
-          SELECT e."event_id", COALESCE(SUM(e."price"), 0) AS total
-          FROM "entries" e
-          LEFT JOIN "reservations" r ON r."checkin_entry_id" = e."id"
-          WHERE e."event_id" IN (${Prisma.join(eventIds.map((id) => Prisma.sql`${id}::uuid`))})
-            AND (r."id" IS NULL OR r."total_amount" IS NULL)
-          GROUP BY e."event_id"
-        `,
-      ),
-      this.prisma.venue_stays.aggregate({
-        where: { venue_id: venueId, duration_ms: { not: null } },
-        _avg: { duration_ms: true },
-      }),
-    ]);
 
     const eventMeta = new Map(
       rawEvents.map((event) => [
@@ -3133,7 +5208,8 @@ export class VenuesService {
 
     for (const row of cloakTotals) {
       const current = eventMetrics.get(row.event_id);
-      if (current) current.cloakroomRevenue = this.decimalToNumber(row._sum.amount);
+      if (current)
+        current.cloakroomRevenue = this.decimalToNumber(row._sum.amount);
     }
 
     for (const row of tableTotals) {
@@ -3186,29 +5262,36 @@ export class VenuesService {
     const entryHourCounts = new Map<string, number>();
 
     const addGender = (
-      metrics:
-        | {
-            women: number;
-            men: number;
-            other: number;
-            unknown: number;
-          }
-        | null,
+      metrics: {
+        women: number;
+        men: number;
+        other: number;
+        unknown: number;
+      } | null,
       gender?: Gender | null,
     ) => {
       if (gender === Gender.F) {
         if (metrics) metrics.women += 1;
-        globalGenderCounts.set('Donna', (globalGenderCounts.get('Donna') ?? 0) + 1);
+        globalGenderCounts.set(
+          'Donna',
+          (globalGenderCounts.get('Donna') ?? 0) + 1,
+        );
         return;
       }
       if (gender === Gender.M) {
         if (metrics) metrics.men += 1;
-        globalGenderCounts.set('Uomo', (globalGenderCounts.get('Uomo') ?? 0) + 1);
+        globalGenderCounts.set(
+          'Uomo',
+          (globalGenderCounts.get('Uomo') ?? 0) + 1,
+        );
         return;
       }
       if (gender === Gender.ALTRO) {
         if (metrics) metrics.other += 1;
-        globalGenderCounts.set('Altro', (globalGenderCounts.get('Altro') ?? 0) + 1);
+        globalGenderCounts.set(
+          'Altro',
+          (globalGenderCounts.get('Altro') ?? 0) + 1,
+        );
         return;
       }
       if (metrics) metrics.unknown += 1;
@@ -3291,8 +5374,14 @@ export class VenuesService {
 
       const hourLabel = this.hourLabelFromDate(entry.created_at);
       if (hourLabel) {
-        metrics.hourCounts.set(hourLabel, (metrics.hourCounts.get(hourLabel) ?? 0) + 1);
-        entryHourCounts.set(hourLabel, (entryHourCounts.get(hourLabel) ?? 0) + 1);
+        metrics.hourCounts.set(
+          hourLabel,
+          (metrics.hourCounts.get(hourLabel) ?? 0) + 1,
+        );
+        entryHourCounts.set(
+          hourLabel,
+          (entryHourCounts.get(hourLabel) ?? 0) + 1,
+        );
       }
 
       registerVisit({
@@ -3319,7 +5408,8 @@ export class VenuesService {
 
       currentBucket.count += 1;
       if (entry.created_at) {
-        const hourValue = entry.created_at.getHours() + entry.created_at.getMinutes() / 60;
+        const hourValue =
+          entry.created_at.getHours() + entry.created_at.getMinutes() / 60;
         currentBucket.hours.push(hourValue);
       }
       if (hourLabel) {
@@ -3335,10 +5425,7 @@ export class VenuesService {
           computedAge != null
             ? this.ageBucket(computedAge)
             : this.ageBucketFromStored(entry.age_bucket);
-        ageBucketCounts.set(
-          bucketKey,
-          ageBucketCounts.get(bucketKey) ?? 0,
-        );
+        ageBucketCounts.set(bucketKey, ageBucketCounts.get(bucketKey) ?? 0);
       }
     }
 
@@ -3351,8 +5438,10 @@ export class VenuesService {
         metrics.totalReservations += 1;
 
         const eventWeekday = this.weekdayLabels[meta.date.getDay()] ?? 'N/D';
-        const bookingWeekday = this.weekdayLabels[reservation.created_at.getDay()] ?? 'N/D';
-        const bookingHour = this.hourLabelFromDate(reservation.created_at) ?? 'N/D';
+        const bookingWeekday =
+          this.weekdayLabels[reservation.created_at.getDay()] ?? 'N/D';
+        const bookingHour =
+          this.hourLabelFromDate(reservation.created_at) ?? 'N/D';
 
         bookingByEventWeekday.set(
           eventWeekday,
@@ -3362,21 +5451,41 @@ export class VenuesService {
           bookingWeekday,
           (bookingByCreatedWeekday.get(bookingWeekday) ?? 0) + 1,
         );
-        bookingByHour.set(bookingHour, (bookingByHour.get(bookingHour) ?? 0) + 1);
+        bookingByHour.set(
+          bookingHour,
+          (bookingByHour.get(bookingHour) ?? 0) + 1,
+        );
 
         const leadDaysValue = Math.max(
           0,
           Math.round(
-            (this.startOfDay(meta.date).getTime() - this.startOfDay(reservation.created_at).getTime()) /
+            (this.startOfDay(meta.date).getTime() -
+              this.startOfDay(reservation.created_at).getTime()) /
               (1000 * 60 * 60 * 24),
           ),
         );
         leadDays.push(leadDaysValue);
 
-        if (leadDaysValue <= 2) leadTimeBuckets.set('0-2 gg', (leadTimeBuckets.get('0-2 gg') ?? 0) + 1);
-        else if (leadDaysValue <= 7) leadTimeBuckets.set('3-7 gg', (leadTimeBuckets.get('3-7 gg') ?? 0) + 1);
-        else if (leadDaysValue <= 14) leadTimeBuckets.set('8-14 gg', (leadTimeBuckets.get('8-14 gg') ?? 0) + 1);
-        else leadTimeBuckets.set('15+ gg', (leadTimeBuckets.get('15+ gg') ?? 0) + 1);
+        if (leadDaysValue <= 2)
+          leadTimeBuckets.set(
+            '0-2 gg',
+            (leadTimeBuckets.get('0-2 gg') ?? 0) + 1,
+          );
+        else if (leadDaysValue <= 7)
+          leadTimeBuckets.set(
+            '3-7 gg',
+            (leadTimeBuckets.get('3-7 gg') ?? 0) + 1,
+          );
+        else if (leadDaysValue <= 14)
+          leadTimeBuckets.set(
+            '8-14 gg',
+            (leadTimeBuckets.get('8-14 gg') ?? 0) + 1,
+          );
+        else
+          leadTimeBuckets.set(
+            '15+ gg',
+            (leadTimeBuckets.get('15+ gg') ?? 0) + 1,
+          );
 
         registerVisit({
           eventId: reservation.event_id,
@@ -3392,7 +5501,9 @@ export class VenuesService {
           reservation.status === ReservationStatus.completed) &&
         reservation.total_amount != null
       ) {
-        metrics.entriesRevenue += this.decimalToNumber(reservation.total_amount);
+        metrics.entriesRevenue += this.decimalToNumber(
+          reservation.total_amount,
+        );
       }
     }
 
@@ -3401,7 +5512,9 @@ export class VenuesService {
       if (metrics) metrics.entriesRevenue += revenue;
     }
 
-    const eventSummaries: AnalyticsEventSummary[] = Array.from(eventMetrics.values())
+    const eventSummaries: AnalyticsEventSummary[] = Array.from(
+      eventMetrics.values(),
+    )
       .map((metrics) => {
         const totalRevenue =
           metrics.entriesRevenue +
@@ -3409,7 +5522,8 @@ export class VenuesService {
           metrics.cloakroomRevenue +
           metrics.tablesRevenue;
         const totalPresences = metrics.totalEntries + metrics.totalTableGuests;
-        const topEntryHour = this.topCountItem(metrics.hourCounts)?.label ?? null;
+        const topEntryHour =
+          this.topCountItem(metrics.hourCounts)?.label ?? null;
 
         return {
           event_id: metrics.event_id,
@@ -3426,9 +5540,13 @@ export class VenuesService {
           totalTableGuests: metrics.totalTableGuests,
           totalPresences,
           avgSpendPerPresence:
-            totalPresences > 0 ? this.round(totalRevenue / totalPresences, 2) : 0,
+            totalPresences > 0
+              ? this.round(totalRevenue / totalPresences, 2)
+              : 0,
           averageAge:
-            metrics.ageValues.length > 0 ? this.average(metrics.ageValues, 1) : null,
+            metrics.ageValues.length > 0
+              ? this.average(metrics.ageValues, 1)
+              : null,
           topEntryHour,
           women: metrics.women,
           men: metrics.men,
@@ -3438,8 +5556,11 @@ export class VenuesService {
       })
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
-    const closedEvents = eventSummaries.filter((event) => event.status === String(EventStatus.CLOSED));
-    const comparisonBase = closedEvents.length > 0 ? closedEvents : eventSummaries;
+    const closedEvents = eventSummaries.filter(
+      (event) => event.status === String(EventStatus.CLOSED),
+    );
+    const comparisonBase =
+      closedEvents.length > 0 ? closedEvents : eventSummaries;
 
     const overviewTotals = eventSummaries.reduce(
       (acc, event) => {
@@ -3477,7 +5598,8 @@ export class VenuesService {
     >();
 
     for (const event of closedEvents) {
-      const weekday = this.weekdayLabels[new Date(event.date).getDay()] ?? 'N/D';
+      const weekday =
+        this.weekdayLabels[new Date(event.date).getDay()] ?? 'N/D';
       const current = weekdayBenchmarksMap.get(weekday) ?? {
         revenue: [],
         entries: [],
@@ -3533,7 +5655,10 @@ export class VenuesService {
         avgStayMinutes:
           stayAggregate._avg.duration_ms == null
             ? 0
-            : this.round(this.decimalToNumber(stayAggregate._avg.duration_ms) / 60000, 1),
+            : this.round(
+                this.decimalToNumber(stayAggregate._avg.duration_ms) / 60000,
+                1,
+              ),
       },
       audience: {
         uniqueCustomers,
@@ -3543,8 +5668,13 @@ export class VenuesService {
             ? this.round((repeatCustomers / uniqueCustomers) * 100, 1)
             : 0,
         averageAge:
-          audienceAgeValues.length > 0 ? this.average(audienceAgeValues, 1) : null,
-        genderSplit: this.distributionFromMap(globalGenderCounts, totalGenderCount),
+          audienceAgeValues.length > 0
+            ? this.average(audienceAgeValues, 1)
+            : null,
+        genderSplit: this.distributionFromMap(
+          globalGenderCounts,
+          totalGenderCount,
+        ),
         ageBuckets: this.distributionFromMap(ageBucketCounts).filter(
           (item) => item.count > 0,
         ),
@@ -3570,26 +5700,44 @@ export class VenuesService {
       },
       revenue: {
         channelMix: [
-          { label: 'Ingressi', value: this.round(overviewTotals.entriesRevenue, 2) },
+          {
+            label: 'Ingressi',
+            value: this.round(overviewTotals.entriesRevenue, 2),
+          },
           { label: 'Bar', value: this.round(overviewTotals.barRevenue, 2) },
-          { label: 'Guardaroba', value: this.round(overviewTotals.cloakroomRevenue, 2) },
-          { label: 'Tavoli', value: this.round(overviewTotals.tablesRevenue, 2) },
+          {
+            label: 'Guardaroba',
+            value: this.round(overviewTotals.cloakroomRevenue, 2),
+          },
+          {
+            label: 'Tavoli',
+            value: this.round(overviewTotals.tablesRevenue, 2),
+          },
         ]
           .map((item) => ({
             ...item,
             share:
               overviewTotals.totalRevenue > 0
-                ? this.round((item.value / overviewTotals.totalRevenue) * 100, 1)
+                ? this.round(
+                    (item.value / overviewTotals.totalRevenue) * 100,
+                    1,
+                  )
                 : 0,
           }))
           .sort((a, b) => b.value - a.value),
         averagePerClosedEvent: {
-          revenue: this.average(comparisonBase.map((event) => event.totalRevenue), 2),
+          revenue: this.average(
+            comparisonBase.map((event) => event.totalRevenue),
+            2,
+          ),
           entriesRevenue: this.average(
             comparisonBase.map((event) => event.entriesRevenue),
             2,
           ),
-          barRevenue: this.average(comparisonBase.map((event) => event.barRevenue), 2),
+          barRevenue: this.average(
+            comparisonBase.map((event) => event.barRevenue),
+            2,
+          ),
           cloakroomRevenue: this.average(
             comparisonBase.map((event) => event.cloakroomRevenue),
             2,
@@ -3598,7 +5746,10 @@ export class VenuesService {
             comparisonBase.map((event) => event.tablesRevenue),
             2,
           ),
-          entries: this.average(comparisonBase.map((event) => event.totalEntries), 1),
+          entries: this.average(
+            comparisonBase.map((event) => event.totalEntries),
+            1,
+          ),
           presences: this.average(
             comparisonBase.map((event) => event.totalPresences),
             1,
@@ -3610,7 +5761,9 @@ export class VenuesService {
         totalEvents: eventSummaries.length,
         closedEvents: closedEvents.length,
         topEvent:
-          [...eventSummaries].sort((a, b) => b.totalRevenue - a.totalRevenue)[0] ?? null,
+          [...eventSummaries].sort(
+            (a, b) => b.totalRevenue - a.totalRevenue,
+          )[0] ?? null,
       },
       events: eventSummaries,
     };

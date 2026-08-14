@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  Prisma,
   ReservationStatus,
   ReservationType,
   TicketOrderStatus,
@@ -13,6 +14,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateAdminVenueDto } from './dto/create-admin-venue.dto';
 import { UpdateVenueContractDto } from './dto/update-venue-contract.dto';
 import { UpdateUserAssignmentDto } from './dto/update-user-assignment.dto';
+import { CreatePlanDto } from './dto/create-plan.dto';
+import { UpdatePlanDto } from './dto/update-plan.dto';
+import { AssignVenuePlanDto } from './dto/assign-venue-plan.dto';
+import { TtlCache } from '../common/ttl-cache';
+import { geocodeAddress } from '../common/geocoding';
+import { AuditLogService } from '../common/audit/audit-log.service';
 
 type RevenuePoint = { label: string; value: number };
 
@@ -28,6 +35,8 @@ type DashboardMetrics = {
   contractsExpiringIn30d: number;
   contractsMissingData: number;
   revenueMonth: number;
+  platformRevenueMonth: number;
+  platformOverageRevenueMonth: number;
   reservationsToday: number;
   newUsers30d: number;
   avgOrderValue: number;
@@ -50,7 +59,17 @@ type ContractSnapshot = {
 
 @Injectable()
 export class AdminService {
-  constructor(private readonly prisma: PrismaService) {}
+  // Same short-TTL stopgap as VenuesService's analytics cache (see PERFORMANCE_AUDIT.md §6):
+  // the dashboard's ~20-query fan-out is expensive but tolerant of a few seconds of
+  // staleness, and this endpoint is admin-only/low-concurrency, so a tiny in-process cache
+  // deduplicates repeated/polled hits without a pre-aggregation table.
+  private readonly dashboardCache = new TtlCache();
+  private static readonly DASHBOARD_CACHE_TTL_MS = 15_000;
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly auditLog: AuditLogService,
+  ) {}
 
   private readonly dayLabels = [
     'Dom',
@@ -257,6 +276,14 @@ export class AdminService {
   }
 
   async getDashboard() {
+    return this.dashboardCache.getOrCompute(
+      'dashboard',
+      AdminService.DASHBOARD_CACHE_TTL_MS,
+      () => this.getDashboardUncached(),
+    );
+  }
+
+  private async getDashboardUncached() {
     const now = new Date();
     const todayStart = this.startOfDay(now);
     const tomorrowStart = this.addDays(todayStart, 1);
@@ -311,6 +338,16 @@ export class AdminService {
           contract_monthly_fee: true,
           contract_auto_renew: true,
           contract_notes: true,
+          plan_custom_terms: true,
+          plan: {
+            select: {
+              monthly_price: true,
+              included_events: true,
+              included_people: true,
+              extra_event_price: true,
+              extra_person_price: true,
+            },
+          },
         },
       }),
       this.prisma.events.findMany({
@@ -462,6 +499,26 @@ export class AdminService {
       activeVenueIds.length > 0 ? activeVenueIds.length : totalVenues;
     const totalTicketsSold = this.toNumber(totalTicketsSoldAgg._sum.quantity);
 
+    // revenueMonth is the gross volume transacted through venues (ticket orders +
+    // table reservations) - it is NOT what the app earns. The app's actual revenue today
+    // is the flat monthly plan/contract fee charged to venues with an active contract,
+    // plus metered overage (extra events/people beyond the plan's included quota - see
+    // platformOverageRevenueMonth below, filled in once eventsCompletedByVenueMonth/
+    // peopleAnalyzedByVenueMonth are available). Per-transaction commission exists in
+    // payments.service.ts but PLATFORM_FEE_CENTS is currently 0, so it contributes nothing.
+    const platformSubscriptionRevenueMonth =
+      Math.round(
+        venuesRaw
+          .filter(
+            (venue) =>
+              this.normalizeContractStatus(venue.contract_status) === 'active',
+          )
+          .reduce(
+            (sum, venue) => sum + this.toNumber(venue.contract_monthly_fee),
+            0,
+          ) * 100,
+      ) / 100;
+
     const metrics: DashboardMetrics = {
       totalVenues,
       activeVenues,
@@ -474,6 +531,8 @@ export class AdminService {
       contractsExpiringIn30d: contractsExpiringIn30d.length,
       contractsMissingData,
       revenueMonth,
+      platformRevenueMonth: platformSubscriptionRevenueMonth,
+      platformOverageRevenueMonth: 0,
       reservationsToday,
       newUsers30d,
       avgOrderValue,
@@ -518,23 +577,33 @@ export class AdminService {
       .sort((a, b) => b.revenue - a.revenue)
       .slice(0, 5);
 
-    const eventsActiveByVenue = await this.prisma.events.groupBy({
-      by: ['venue_id'],
-      where: {
-        status: 'LIVE',
-        date: { gte: todayStart, lt: tomorrowStart },
-      },
-      _count: { _all: true },
-    });
-
-    const eventsCompletedByVenueMonth = await this.prisma.events.groupBy({
-      by: ['venue_id'],
-      where: {
-        status: 'CLOSED',
-        date: { gte: monthStart, lt: nextMonthStart },
-      },
-      _count: { _all: true },
-    });
+    const [
+      eventsActiveByVenue,
+      eventsCompletedByVenueMonth,
+      peopleAnalyzedByVenueMonth,
+    ] = await Promise.all([
+      this.prisma.events.groupBy({
+        by: ['venue_id'],
+        where: {
+          status: 'LIVE',
+          date: { gte: todayStart, lt: tomorrowStart },
+        },
+        _count: { _all: true },
+      }),
+      this.prisma.events.groupBy({
+        by: ['venue_id'],
+        where: {
+          status: 'CLOSED',
+          date: { gte: monthStart, lt: nextMonthStart },
+        },
+        _count: { _all: true },
+      }),
+      this.prisma.venue_stays.groupBy({
+        by: ['venue_id'],
+        where: { entered_at: { gte: monthStart, lt: nextMonthStart } },
+        _count: { _all: true },
+      }),
+    ]);
 
     const activeMap = new Map<string, number>();
     for (const row of eventsActiveByVenue)
@@ -544,6 +613,42 @@ export class AdminService {
     for (const row of eventsCompletedByVenueMonth) {
       completedMap.set(row.venue_id, row._count._all);
     }
+
+    const peopleMonthMap = new Map<string, number>();
+    for (const row of peopleAnalyzedByVenueMonth) {
+      peopleMonthMap.set(row.venue_id, row._count._all);
+    }
+
+    // Extra events/people beyond each active venue's effective quota (plan, merged with any
+    // negotiated custom_terms override - see resolvePlanTerms), priced at the effective
+    // extra_event_price/extra_person_price. Venues without a plan, or on a custom/Elite plan
+    // with no quota set, contribute 0 (no metered quota to exceed).
+    const platformOverageRevenueMonth =
+      Math.round(
+        venuesRaw
+          .filter(
+            (venue) =>
+              this.normalizeContractStatus(venue.contract_status) === 'active',
+          )
+          .reduce((sum, venue) => {
+            const terms = this.resolvePlanTerms(
+              venue.plan,
+              this.parseCustomTerms(venue.plan_custom_terms),
+            );
+            const overage = this.computeOverage(
+              terms,
+              completedMap.get(venue.id) ?? 0,
+              peopleMonthMap.get(venue.id) ?? 0,
+            );
+            return sum + overage.overageCost;
+          }, 0) * 100,
+      ) / 100;
+
+    metrics.platformOverageRevenueMonth = platformOverageRevenueMonth;
+    metrics.platformRevenueMonth =
+      Math.round(
+        (platformSubscriptionRevenueMonth + platformOverageRevenueMonth) * 100,
+      ) / 100;
 
     const expiringContracts = contractsExpiringIn30d
       .sort((a, b) => a.daysLeft - b.daysLeft)
@@ -652,6 +757,7 @@ export class AdminService {
           id: true,
           name: true,
           city: true,
+          address: true,
           created_at: true,
           stripe_onboarding_completed_at: true,
           stripe_charges_enabled: true,
@@ -662,6 +768,22 @@ export class AdminService {
           contract_monthly_fee: true,
           contract_auto_renew: true,
           contract_notes: true,
+          plan_id: true,
+          plan_custom_terms: true,
+          plan: {
+            select: {
+              id: true,
+              key: true,
+              name: true,
+              icon: true,
+              monthly_price: true,
+              included_events: true,
+              included_people: true,
+              extra_event_price: true,
+              extra_person_price: true,
+              is_custom: true,
+            },
+          },
           users: {
             where: { role: UserRole.venue },
             orderBy: { updated_at: 'desc' },
@@ -800,6 +922,7 @@ export class AdminService {
       id: string;
       name: string;
       city: string | null;
+      address: string | null;
       created_at: Date;
       stripe_onboarding_completed_at: Date | null;
       stripe_charges_enabled: boolean;
@@ -810,6 +933,20 @@ export class AdminService {
       contract_monthly_fee: unknown;
       contract_auto_renew: boolean;
       contract_notes: string | null;
+      plan_id: string | null;
+      plan_custom_terms: unknown;
+      plan: {
+        id: string;
+        key: string;
+        name: string;
+        icon: string | null;
+        monthly_price: unknown;
+        included_events: number | null;
+        included_people: number | null;
+        extra_event_price: unknown;
+        extra_person_price: unknown;
+        is_custom: boolean;
+      } | null;
       users: Array<{
         id: string;
         name: string | null;
@@ -830,8 +967,6 @@ export class AdminService {
         Math.round((activeGuests / Math.max(1, effectiveCapacity)) * 100),
       );
 
-      const isStripeReady =
-        venue.stripe_charges_enabled && venue.stripe_payouts_enabled;
       const eventsActive = eventsActiveMap.get(venue.id) ?? 0;
       const eventsCompletedMonth = eventsCompletedMap.get(venue.id) ?? 0;
       const analyzedPeopleMonth = monthStaysMap.get(venue.id) ?? 0;
@@ -849,12 +984,20 @@ export class AdminService {
         contract_notes: venue.contract_notes,
       });
       const manager = venue.users[0] ?? null;
+      const customTerms = this.parseCustomTerms(venue.plan_custom_terms);
+      const terms = this.resolvePlanTerms(venue.plan, customTerms);
+      const overage = this.computeOverage(
+        terms,
+        eventsCompletedMonth,
+        analyzedPeopleMonth,
+      );
 
       return {
         id: venue.id,
         name: venue.name,
         city: venue.city ?? 'N/D',
-        status: isStripeReady ? 'Operativo' : 'Onboarding',
+        address: venue.address,
+        status: 'Operativo',
         occupancy,
         activeGuests,
         revenue: Math.round((revenueMap.get(venue.id) ?? 0) * 100) / 100,
@@ -872,6 +1015,23 @@ export class AdminService {
         contractMonthlyFee: contract.monthlyFee,
         contractAutoRenew: contract.autoRenew,
         contractNotes: contract.notes,
+        planId: venue.plan_id,
+        planKey: venue.plan?.key ?? null,
+        planName: venue.plan?.name ?? null,
+        planIcon: venue.plan?.icon ?? null,
+        planIsCustom: venue.plan?.is_custom ?? false,
+        planCustomTerms: customTerms,
+        planMonthlyPrice: terms.monthlyPrice,
+        planIncludedEvents: overage.includedEvents,
+        planIncludedPeople: overage.includedPeople,
+        extraEventsCount: overage.extraEventsCount,
+        extraPeopleCount: overage.extraPeopleCount,
+        extraEventsCost: overage.extraEventsCost,
+        extraPeopleCost: overage.extraPeopleCost,
+        overageCostMonth: overage.overageCost,
+        billedThisMonth:
+          Math.round(((contract.monthlyFee ?? 0) + overage.overageCost) * 100) /
+          100,
         managerUserId: manager?.id ?? null,
         managerName: manager?.name?.trim() || manager?.email || null,
         managerEmail: manager?.email ?? null,
@@ -885,6 +1045,22 @@ export class AdminService {
 
     const activeUsersSet = new Set<string>();
     const userActivityData = await Promise.all([
+      // Independent of every activity aggregate below - only merged at the end via
+      // `activeUsersSet`/`lastActivityMap`/`stayStatsMap` lookups - so it runs in the same
+      // batch instead of after it (previously a 10th sequential round trip).
+      this.prisma.users.findMany({
+        orderBy: { created_at: 'desc' },
+        take: 50,
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          role: true,
+          venue_id: true,
+          created_at: true,
+          venue: { select: { id: true, name: true } },
+        },
+      }),
       this.prisma.reservations.findMany({
         where: { created_at: { gte: activeSince } },
         distinct: ['user_id'],
@@ -931,6 +1107,7 @@ export class AdminService {
     ]);
 
     const [
+      users,
       reservationUsers,
       ticketUsers,
       entryUsers,
@@ -991,20 +1168,6 @@ export class AdminService {
       });
     }
 
-    const users = await this.prisma.users.findMany({
-      orderBy: { created_at: 'desc' },
-      take: 50,
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        role: true,
-        venue_id: true,
-        created_at: true,
-        venue: { select: { id: true, name: true } },
-      },
-    });
-
     return users.map((user) => {
       const displayName = user.name?.trim() || user.email;
       const role = String(user.role || '').toLowerCase();
@@ -1036,6 +1199,156 @@ export class AdminService {
         avgStayMinutes30d: stayStats?.avgStayMinutes30d ?? 0,
       };
     });
+  }
+
+  // Trust & safety: search across every user (not just the 50-most-recent list `getUsers`
+  // returns for the dashboard widget) so an admin can actually find one account to act on.
+  async searchUsers(search?: string) {
+    const term = String(search || '').trim();
+    const users = await this.prisma.users.findMany({
+      where: term
+        ? {
+            OR: [
+              { name: { contains: term, mode: 'insensitive' } },
+              { email: { contains: term, mode: 'insensitive' } },
+              { username: { contains: term, mode: 'insensitive' } },
+            ],
+          }
+        : undefined,
+      orderBy: { created_at: 'desc' },
+      take: 50,
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        username: true,
+        role: true,
+        is_active: true,
+        venue_id: true,
+        created_at: true,
+      },
+    });
+    return users;
+  }
+
+  async setUserActive(
+    userIdentifier: string,
+    active: boolean,
+    adminId?: string,
+  ) {
+    const user = await this.resolveUserByIdentifier(userIdentifier);
+    if (!user) {
+      throw new NotFoundException(
+        `User not found (looked up "${userIdentifier}" as id, email, and username)`,
+      );
+    }
+    const updated = await this.prisma.users.update({
+      where: { id: user.id },
+      data: { is_active: active },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        username: true,
+        role: true,
+        is_active: true,
+      },
+    });
+    if (adminId) {
+      this.auditLog.record({
+        adminId,
+        action: active ? 'user.reactivate' : 'user.suspend',
+        targetType: 'user',
+        targetId: user.id,
+      });
+    }
+    // Being logged in with a short-lived (15 min) access token is the one gap a suspend
+    // doesn't close instantly - see the comment on JwtAuthGuard for why that's a
+    // deliberate, bounded trade-off rather than a per-request DB check.
+    return updated;
+  }
+
+  // "Account" here means a venue: this is what the deleted admin-accounts screen (see git
+  // history) called locali/organizzazioni. Reuses `venues.contract_status` (already a free
+  // string written by the venue-contract editor) instead of adding a second status column -
+  // 'suspended' was already one of its possible values, it just had no enforcement behind
+  // it (see the venue-scoped guards below and in venues.controller.ts).
+  async listAccounts(search?: string) {
+    const term = String(search || '').trim();
+    const venues = await this.prisma.venues.findMany({
+      where: term
+        ? {
+            OR: [
+              { name: { contains: term, mode: 'insensitive' } },
+              { city: { contains: term, mode: 'insensitive' } },
+            ],
+          }
+        : undefined,
+      orderBy: { created_at: 'desc' },
+      take: 50,
+      select: {
+        id: true,
+        name: true,
+        city: true,
+        contract_status: true,
+        contract_monthly_fee: true,
+        created_at: true,
+      },
+    });
+
+    return venues.map((venue) => ({
+      id: venue.id,
+      name: venue.name,
+      type: 'venue' as const,
+      location: venue.city ?? '',
+      active: venue.contract_status !== 'suspended',
+      revenue_label: venue.contract_monthly_fee
+        ? `€${Number(venue.contract_monthly_fee).toFixed(0)}/mese`
+        : '—',
+      member_since: venue.created_at,
+    }));
+  }
+
+  async setAccountActive(venueId: string, active: boolean, adminId?: string) {
+    const venue = await this.prisma.venues.findUnique({
+      where: { id: venueId },
+      select: { id: true, contract_status: true },
+    });
+    if (!venue) throw new NotFoundException('Venue not found');
+
+    const updated = await this.prisma.venues.update({
+      where: { id: venueId },
+      data: { contract_status: active ? 'active' : 'suspended' },
+      select: {
+        id: true,
+        name: true,
+        city: true,
+        contract_status: true,
+        contract_monthly_fee: true,
+        created_at: true,
+      },
+    });
+
+    if (adminId) {
+      this.auditLog.record({
+        adminId,
+        action: active ? 'venue.reactivate' : 'venue.suspend',
+        targetType: 'venue',
+        targetId: venueId,
+      });
+    }
+
+    return {
+      id: updated.id,
+      name: updated.name,
+      type: 'venue' as const,
+      location: updated.city ?? '',
+      active: updated.contract_status !== 'suspended',
+      revenue_label: updated.contract_monthly_fee
+        ? `€${Number(updated.contract_monthly_fee).toFixed(0)}/mese`
+        : '—',
+      member_since: updated.created_at,
+    };
   }
 
   async getReports() {
@@ -1172,11 +1485,16 @@ export class AdminService {
     }
 
     const contractStatus = this.normalizeContractStatus(input.contract_status);
+    const address = input.address?.trim() || null;
+    const coords = address ? await geocodeAddress(address) : null;
 
     const venue = await this.prisma.venues.create({
       data: {
         name,
         city: input.city?.trim() || null,
+        address,
+        latitude: coords?.latitude,
+        longitude: coords?.longitude,
         radius_geofence:
           input.radius_geofence === undefined
             ? undefined
@@ -1196,6 +1514,9 @@ export class AdminService {
         id: true,
         name: true,
         city: true,
+        address: true,
+        latitude: true,
+        longitude: true,
         contract_start_at: true,
         contract_end_at: true,
         contract_status: true,
@@ -1214,6 +1535,9 @@ export class AdminService {
 
     return {
       ...venue,
+      latitude: venue.latitude == null ? null : this.toNumber(venue.latitude),
+      longitude:
+        venue.longitude == null ? null : this.toNumber(venue.longitude),
       contract_monthly_fee:
         venue.contract_monthly_fee == null
           ? null
@@ -1299,7 +1623,385 @@ export class AdminService {
     };
   }
 
-  async updateUserAssignment(userId: string, input: UpdateUserAssignmentDto) {
+  // Narrows a venue's `plan_custom_terms` JSON column back into a typed partial override.
+  // Unknown/malformed shapes (manual DB edits, future schema drift) degrade to "no override"
+  // per-field rather than throwing, since this is read on every dashboard/venues-list hit.
+  private parseCustomTerms(value: unknown): {
+    monthly_price?: number;
+    included_events?: number;
+    included_people?: number;
+    extra_event_price?: number;
+    extra_person_price?: number;
+    notes?: string;
+  } | null {
+    if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+      return null;
+    }
+    const raw = value as Record<string, unknown>;
+    const out: ReturnType<AdminService['parseCustomTerms']> = {};
+    if (typeof raw.monthly_price === 'number')
+      out.monthly_price = raw.monthly_price;
+    if (typeof raw.included_events === 'number')
+      out.included_events = raw.included_events;
+    if (typeof raw.included_people === 'number')
+      out.included_people = raw.included_people;
+    if (typeof raw.extra_event_price === 'number')
+      out.extra_event_price = raw.extra_event_price;
+    if (typeof raw.extra_person_price === 'number')
+      out.extra_person_price = raw.extra_person_price;
+    if (typeof raw.notes === 'string') out.notes = raw.notes;
+    return out;
+  }
+
+  // Merges a plan's own price/quotas with a venue's negotiated overrides (if any) - an
+  // override wins field-by-field when present. For a custom plan (is_custom, no defaults
+  // of its own) every field effectively comes from the override.
+  private resolvePlanTerms(
+    plan: {
+      monthly_price: unknown;
+      included_events: number | null;
+      included_people: number | null;
+      extra_event_price: unknown;
+      extra_person_price: unknown;
+    } | null,
+    customTerms: ReturnType<AdminService['parseCustomTerms']>,
+  ) {
+    const monthlyPrice =
+      customTerms?.monthly_price ??
+      (plan?.monthly_price == null ? null : this.toNumber(plan.monthly_price));
+    const includedEvents =
+      customTerms?.included_events ?? plan?.included_events ?? null;
+    const includedPeople =
+      customTerms?.included_people ?? plan?.included_people ?? null;
+    const extraEventPrice =
+      customTerms?.extra_event_price ??
+      (plan?.extra_event_price == null
+        ? 0
+        : this.toNumber(plan.extra_event_price));
+    const extraPersonPrice =
+      customTerms?.extra_person_price ??
+      (plan?.extra_person_price == null
+        ? 0
+        : this.toNumber(plan.extra_person_price));
+
+    return {
+      monthlyPrice,
+      includedEvents,
+      includedPeople,
+      extraEventPrice,
+      extraPersonPrice,
+    };
+  }
+
+  // Shared by getVenues() (per-venue billing detail) and getDashboardUncached()
+  // (platform-wide overage total). `null` includedEvents/includedPeople means nothing to
+  // meter (no plan assigned, or a custom/Elite plan with no quota set) - no overage.
+  private computeOverage(
+    terms: {
+      includedEvents: number | null;
+      includedPeople: number | null;
+      extraEventPrice: number;
+      extraPersonPrice: number;
+    },
+    eventsCount: number,
+    peopleCount: number,
+  ) {
+    const extraEventsCount =
+      terms.includedEvents == null
+        ? 0
+        : Math.max(0, eventsCount - terms.includedEvents);
+    const extraPeopleCount =
+      terms.includedPeople == null
+        ? 0
+        : Math.max(0, peopleCount - terms.includedPeople);
+
+    const extraEventsCost =
+      Math.round(extraEventsCount * terms.extraEventPrice * 100) / 100;
+    const extraPeopleCost =
+      Math.round(extraPeopleCount * terms.extraPersonPrice * 100) / 100;
+
+    return {
+      includedEvents: terms.includedEvents,
+      includedPeople: terms.includedPeople,
+      extraEventsCount,
+      extraPeopleCount,
+      extraEventsCost,
+      extraPeopleCost,
+      overageCost: Math.round((extraEventsCost + extraPeopleCost) * 100) / 100,
+    };
+  }
+
+  private serializePlan(plan: {
+    id: string;
+    key: string;
+    name: string;
+    tagline: string | null;
+    icon: string | null;
+    monthly_price: unknown;
+    included_events: number | null;
+    included_people: number | null;
+    extra_event_price: unknown;
+    extra_person_price: unknown;
+    is_custom: boolean;
+    is_recommended: boolean;
+    is_active: boolean;
+    sort_order: number;
+  }) {
+    return {
+      id: plan.id,
+      key: plan.key,
+      name: plan.name,
+      tagline: plan.tagline,
+      icon: plan.icon,
+      monthlyPrice:
+        plan.monthly_price == null ? null : this.toNumber(plan.monthly_price),
+      includedEvents: plan.included_events,
+      includedPeople: plan.included_people,
+      extraEventPrice:
+        plan.extra_event_price == null
+          ? null
+          : this.toNumber(plan.extra_event_price),
+      extraPersonPrice:
+        plan.extra_person_price == null
+          ? null
+          : this.toNumber(plan.extra_person_price),
+      isCustom: plan.is_custom,
+      isRecommended: plan.is_recommended,
+      isActive: plan.is_active,
+      sortOrder: plan.sort_order,
+    };
+  }
+
+  async listPlans() {
+    const plans = await this.prisma.subscription_plans.findMany({
+      orderBy: { sort_order: 'asc' },
+    });
+    return plans.map((plan) => this.serializePlan(plan));
+  }
+
+  async createPlan(input: CreatePlanDto) {
+    const key = String(input?.key || '')
+      .trim()
+      .toLowerCase();
+    const name = String(input?.name || '').trim();
+    if (!key) throw new BadRequestException('key is required');
+    if (!name) throw new BadRequestException('name is required');
+
+    try {
+      const plan = await this.prisma.subscription_plans.create({
+        data: {
+          key,
+          name,
+          tagline: input.tagline?.trim() || null,
+          icon: input.icon?.trim() || null,
+          monthly_price:
+            input.monthly_price === undefined ? null : input.monthly_price,
+          included_events:
+            input.included_events === undefined ? null : input.included_events,
+          included_people:
+            input.included_people === undefined ? null : input.included_people,
+          extra_event_price:
+            input.extra_event_price === undefined
+              ? null
+              : input.extra_event_price,
+          extra_person_price:
+            input.extra_person_price === undefined
+              ? null
+              : input.extra_person_price,
+          is_custom: Boolean(input.is_custom),
+          is_recommended: Boolean(input.is_recommended),
+          is_active: input.is_active === undefined ? true : input.is_active,
+          sort_order: input.sort_order ?? 0,
+        },
+      });
+      return this.serializePlan(plan);
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      ) {
+        throw new BadRequestException(
+          `A plan with key "${key}" already exists`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  async updatePlan(planId: string, input: UpdatePlanDto) {
+    const existing = await this.prisma.subscription_plans.findUnique({
+      where: { id: planId },
+      select: { id: true },
+    });
+    if (!existing) throw new NotFoundException('Plan not found');
+
+    const data: Prisma.subscription_plansUpdateInput = {};
+    if (input.name !== undefined) data.name = input.name.trim();
+    if (input.tagline !== undefined)
+      data.tagline = input.tagline?.trim() || null;
+    if (input.icon !== undefined) data.icon = input.icon?.trim() || null;
+    if (input.monthly_price !== undefined)
+      data.monthly_price = input.monthly_price;
+    if (input.included_events !== undefined)
+      data.included_events = input.included_events;
+    if (input.included_people !== undefined)
+      data.included_people = input.included_people;
+    if (input.extra_event_price !== undefined)
+      data.extra_event_price = input.extra_event_price;
+    if (input.extra_person_price !== undefined)
+      data.extra_person_price = input.extra_person_price;
+    if (input.is_custom !== undefined) data.is_custom = input.is_custom;
+    if (input.is_recommended !== undefined)
+      data.is_recommended = input.is_recommended;
+    if (input.is_active !== undefined) data.is_active = input.is_active;
+    if (input.sort_order !== undefined) data.sort_order = input.sort_order;
+
+    const plan = await this.prisma.subscription_plans.update({
+      where: { id: planId },
+      data,
+    });
+    return this.serializePlan(plan);
+  }
+
+  async deletePlan(planId: string) {
+    const existing = await this.prisma.subscription_plans.findUnique({
+      where: { id: planId },
+      select: { id: true },
+    });
+    if (!existing) throw new NotFoundException('Plan not found');
+
+    const assignedVenues = await this.prisma.venues.count({
+      where: { plan_id: planId },
+    });
+    if (assignedVenues > 0) {
+      throw new BadRequestException(
+        `Cannot delete plan: ${assignedVenues} venue(s) are still assigned to it. Reassign them first.`,
+      );
+    }
+
+    await this.prisma.subscription_plans.delete({ where: { id: planId } });
+    return { success: true };
+  }
+
+  async assignVenuePlan(venueId: string, input: AssignVenuePlanDto) {
+    const venue = await this.prisma.venues.findUnique({
+      where: { id: venueId },
+      select: { id: true },
+    });
+    if (!venue) throw new NotFoundException('Venue not found');
+
+    if (input.plan_id === undefined) {
+      throw new BadRequestException('plan_id is required');
+    }
+
+    if (input.plan_id === null) {
+      // Unassigning: custom terms are meaningless without a plan, so they're cleared too.
+      // contract_monthly_fee is left untouched - it's a general contract field, not
+      // exclusively plan-owned, and the admin may still want the venue billed manually.
+      const updated = await this.prisma.venues.update({
+        where: { id: venueId },
+        data: { plan_id: null, plan_custom_terms: Prisma.JsonNull },
+        select: { id: true, plan_id: true, contract_monthly_fee: true },
+      });
+      return {
+        id: updated.id,
+        planId: updated.plan_id,
+        planCustomTerms: null,
+        contractMonthlyFee:
+          updated.contract_monthly_fee == null
+            ? null
+            : this.toNumber(updated.contract_monthly_fee),
+      };
+    }
+
+    const plan = await this.prisma.subscription_plans.findUnique({
+      where: { id: input.plan_id },
+    });
+    if (!plan) throw new NotFoundException('Plan not found');
+
+    // custom_terms is the full override for this assignment (not a partial merge with
+    // whatever was saved before) - omitting it clears any previous override.
+    const customTerms = input.custom_terms ?? null;
+
+    if (plan.is_custom && customTerms?.monthly_price === undefined) {
+      throw new BadRequestException(
+        'custom_terms.monthly_price is required when assigning a custom-priced plan',
+      );
+    }
+
+    const terms = this.resolvePlanTerms(plan, customTerms);
+    if (terms.monthlyPrice == null) {
+      throw new BadRequestException(
+        'Unable to resolve a monthly price for this plan - pass custom_terms.monthly_price',
+      );
+    }
+
+    const updated = await this.prisma.venues.update({
+      where: { id: venueId },
+      data: {
+        plan_id: plan.id,
+        plan_custom_terms: customTerms
+          ? (customTerms as unknown as Prisma.InputJsonValue)
+          : Prisma.JsonNull,
+        contract_monthly_fee: terms.monthlyPrice,
+      },
+      select: {
+        id: true,
+        plan_id: true,
+        plan_custom_terms: true,
+        contract_monthly_fee: true,
+      },
+    });
+
+    return {
+      id: updated.id,
+      planId: updated.plan_id,
+      planCustomTerms: customTerms,
+      contractMonthlyFee: this.toNumber(updated.contract_monthly_fee),
+      plan: this.serializePlan(plan),
+      effectiveTerms: terms,
+    };
+  }
+
+  // Looks a user up by id, email, or username - whichever the caller has on hand, so an
+  // admin assigning a venue manager doesn't need to go find the user's UUID first. Emails
+  // are matched case-insensitively (stored lowercased, see auth.service.ts); usernames are
+  // matched as stored.
+  private async resolveUserByIdentifier(identifier: string) {
+    const value = String(identifier || '').trim();
+    if (!value) return null;
+
+    const isUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        value,
+      );
+    if (isUuid) {
+      const byId = await this.prisma.users.findUnique({ where: { id: value } });
+      if (byId) return byId;
+    }
+
+    if (value.includes('@')) {
+      const byEmail = await this.prisma.users.findUnique({
+        where: { email: value.toLowerCase() },
+      });
+      if (byEmail) return byEmail;
+    }
+
+    return this.prisma.users.findUnique({ where: { username: value } });
+  }
+
+  async updateUserAssignment(
+    userIdentifier: string,
+    input: UpdateUserAssignmentDto,
+  ) {
+    const user = await this.resolveUserByIdentifier(userIdentifier);
+    if (!user) {
+      throw new NotFoundException(
+        `User not found (looked up "${userIdentifier}" as id, email, and username)`,
+      );
+    }
+    const userId = user.id;
+
     const role = String(input.role || '')
       .trim()
       .toLowerCase() as UserRole;
@@ -1348,6 +2050,17 @@ export class AdminService {
     };
   }
 
+  async listAuditLog(filter: { targetType?: string; targetId?: string }) {
+    return this.prisma.admin_audit_logs.findMany({
+      where: {
+        ...(filter.targetType ? { target_type: filter.targetType } : {}),
+        ...(filter.targetId ? { target_id: filter.targetId } : {}),
+      },
+      orderBy: { created_at: 'desc' },
+      take: 200,
+    });
+  }
+
   async getProfile(userId: string) {
     const user = await this.prisma.users.findUnique({
       where: { id: userId },
@@ -1369,6 +2082,56 @@ export class AdminService {
       name: user.name?.trim() || user.email,
       email: user.email,
       role: roleLabel,
+    };
+  }
+
+  // Richer than getProfile() - meant for an admin "account/settings" screen: identity,
+  // other admins on the team (support contacts), and the same operational alerts shown on
+  // the dashboard (reused via getDashboard()'s own 15s cache, so this stays cheap).
+  async getMe(userId: string) {
+    const [user, dashboard] = await Promise.all([
+      this.prisma.users.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          username: true,
+          phone: true,
+          avatar: true,
+          role: true,
+          created_at: true,
+          last_active_at: true,
+        },
+      }),
+      this.getDashboard(),
+    ]);
+
+    if (!user) throw new NotFoundException('Admin user not found');
+
+    const team = await this.prisma.users.findMany({
+      where: { role: UserRole.admin, id: { not: userId } },
+      select: { id: true, name: true, email: true, created_at: true },
+      orderBy: { created_at: 'asc' },
+    });
+
+    return {
+      id: user.id,
+      name: user.name?.trim() || user.email,
+      email: user.email,
+      username: user.username,
+      phone: user.phone,
+      avatar: user.avatar,
+      role: 'admin',
+      createdAt: user.created_at,
+      lastActiveAt: user.last_active_at,
+      team: team.map((admin) => ({
+        id: admin.id,
+        name: admin.name?.trim() || admin.email,
+        email: admin.email,
+        createdAt: admin.created_at,
+      })),
+      alerts: dashboard.alerts,
     };
   }
 }

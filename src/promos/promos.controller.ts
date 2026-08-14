@@ -46,11 +46,15 @@ export class PromosController {
   }
 
   @Get(':id')
-  async get(@Param('id', new ParseUUIDPipe({ version: '4' })) id: string, @CurrentUser() user: RequestUser) {
+  async get(
+    @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
+    @CurrentUser() user: RequestUser,
+  ) {
     const promo = await this.promosService.getPromo(id);
     if (user.role === 'admin') return promo;
     if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
-    if (promo.venue_id !== user.venue_id) throw new ForbiddenException('Forbidden');
+    if (promo.venue_id !== user.venue_id)
+      throw new ForbiddenException('Forbidden');
     return promo;
   }
 
@@ -62,10 +66,7 @@ export class PromosController {
   }
 
   @Get('/by-venue/:venueId')
-  byVenue(
-    @Param('venueId') venueId: string,
-    @CurrentUser() user: RequestUser,
-  ) {
+  byVenue(@Param('venueId') venueId: string, @CurrentUser() user: RequestUser) {
     if (user.role === 'admin') return this.promosService.listByVenue(venueId);
     if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
     if (venueId !== user.venue_id) throw new ForbiddenException('Forbidden');
@@ -79,7 +80,10 @@ export class PromosController {
       body = { ...(body ?? {}), venue_id: user.venue_id };
       const eventId = body?.event_id ?? body?.eventId;
       if (eventId) {
-        await this.promosService.assertEventBelongsToVenue(String(eventId), user.venue_id);
+        await this.promosService.assertEventBelongsToVenue(
+          String(eventId),
+          user.venue_id,
+        );
       }
     }
     return this.promosService.createPromo(body);
@@ -94,11 +98,15 @@ export class PromosController {
     if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       const existing = await this.promosService.getPromo(id);
-      if (existing.venue_id !== user.venue_id) throw new ForbiddenException('Forbidden');
+      if (existing.venue_id !== user.venue_id)
+        throw new ForbiddenException('Forbidden');
 
       const eventId = body?.event_id ?? body?.eventId;
       if (eventId) {
-        await this.promosService.assertEventBelongsToVenue(String(eventId), user.venue_id);
+        await this.promosService.assertEventBelongsToVenue(
+          String(eventId),
+          user.venue_id,
+        );
       }
 
       // prevent cross-venue reassignment
@@ -112,11 +120,15 @@ export class PromosController {
   }
 
   @Delete(':id')
-  async delete(@Param('id', new ParseUUIDPipe({ version: '4' })) id: string, @CurrentUser() user: RequestUser) {
+  async delete(
+    @Param('id', new ParseUUIDPipe({ version: '4' })) id: string,
+    @CurrentUser() user: RequestUser,
+  ) {
     if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       const existing = await this.promosService.getPromo(id);
-      if (existing.venue_id !== user.venue_id) throw new ForbiddenException('Forbidden');
+      if (existing.venue_id !== user.venue_id)
+        throw new ForbiddenException('Forbidden');
     }
     return this.promosService.deletePromo(id);
   }

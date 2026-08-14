@@ -10,6 +10,10 @@ export class UpdateVenueDto {
   city?: string;
 
   @IsOptional()
+  @IsString()
+  address?: string;
+
+  @IsOptional()
   @IsInt()
   @Min(10)
   radius_geofence?: number;

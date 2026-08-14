@@ -6,12 +6,8 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { JwtService } from '@nestjs/jwt';
-import { Prisma } from '@prisma/client';
-import { PrismaService } from '../prisma/prisma.service';
 import { AuthService } from './auth.service';
 import { IS_PUBLIC_KEY } from './public.decorator';
-import type { RequestUser } from './types';
 
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
@@ -19,37 +15,12 @@ export class JwtAuthGuard implements CanActivate {
 
   constructor(
     private readonly reflector: Reflector,
-    private readonly jwtService: JwtService,
-    private readonly prisma: PrismaService,
     private readonly authService: AuthService,
   ) {}
 
-  private isTransientPrismaConnectivityError(error: unknown): boolean {
-    if (error instanceof Prisma.PrismaClientKnownRequestError) {
-      return (
-        error.code === 'P1001' ||
-        error.code === 'P1002' ||
-        error.code === 'P1017'
-      );
-    }
-
-    if (error instanceof Prisma.PrismaClientInitializationError) {
-      return true;
-    }
-
-    if (error instanceof Prisma.PrismaClientUnknownRequestError) {
-      const msg = String(error.message || '').toLowerCase();
-      return (
-        msg.includes('server has closed the connection') ||
-        msg.includes('connection reset') ||
-        msg.includes('connection closed') ||
-        msg.includes('can\'t reach database server')
-      );
-    }
-
-    return false;
-  }
-
+  // Kept async (despite no internal await) so it keeps returning a Promise<boolean>, matching
+  // the interface every other guard/caller in the app expects from canActivate().
+  // eslint-disable-next-line @typescript-eslint/require-await
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
       context.getHandler(),
@@ -59,61 +30,25 @@ export class JwtAuthGuard implements CanActivate {
 
     const req = context.switchToHttp().getRequest();
     const authorization: string | undefined = req?.headers?.authorization;
+    // The access token only ever travels in the Authorization header now - it is never
+    // read from a cookie. (The refresh token is the cookie-only one; see AuthController.)
     const token = authorization?.replace(/^Bearer\s+/i, '') || undefined;
     if (!token) throw new UnauthorizedException('Missing Authorization token');
 
-    if (this.authService.isTokenRevoked(token)) {
-      throw new UnauthorizedException('Token revoked');
-    }
-
-    let payload: unknown;
-    try {
-      payload = this.jwtService.verify(token);
-    } catch {
-      throw new UnauthorizedException('Invalid token');
-    }
-
-    if (!payload || typeof payload !== 'object' || !("sub" in payload)) {
-      throw new UnauthorizedException('Invalid token payload');
-    }
-
-    const p = payload as {
-      sub?: string;
-      role?: string;
-      venue_id?: string | null;
-      venueId?: string | null;
-    };
-
-    const id = String(p.sub || '');
-    const role = String(p.role || '').toLowerCase();
-    const venue_id = (p.venue_id ?? p.venueId ?? null) as string | null;
-
-    if (!id || !role) throw new UnauthorizedException('Invalid token payload');
-
-    // For backward compatibility with older tokens that didn't include venue_id.
-    let resolvedVenueId: string | null = venue_id;
-    if (resolvedVenueId === null || resolvedVenueId === undefined) {
-      try {
-        const u = await this.prisma.users.findUnique({
-          where: { id },
-          select: { venue_id: true },
-        });
-        resolvedVenueId = u?.venue_id ?? null;
-      } catch (error) {
-        if (this.isTransientPrismaConnectivityError(error)) {
-          this.logger.warn(
-            `Skipping venue lookup for user ${id}: temporary database connectivity issue.`,
-          );
-          resolvedVenueId = null;
-        } else {
-          throw error;
-        }
-      }
-    }
-
-    const user: RequestUser = { id, role, venue_id: resolvedVenueId };
+    // Access tokens are short-lived (15 min, see jwt.config.ts) and stateless: unlike the
+    // refresh token, there is no DB-backed revocation check here on purpose - a revoked
+    // session simply stops being able to mint new access tokens via /auth/refresh, and the
+    // short TTL bounds how long an already-issued access token can outlive that revocation.
+    const user = this.authService.verifyAccessToken(token);
     req.user = user;
-    await this.authService.touchUserActivity(id);
+
+    // Best-effort, throttled activity tracking. Fire-and-forget so it never adds a DB
+    // round-trip to the latency of every authenticated request.
+    void this.authService.touchUserActivity(user.id).catch((error) => {
+      this.logger.warn(
+        `Failed to record activity for user ${user.id}: ${String(error)}`,
+      );
+    });
 
     return true;
   }

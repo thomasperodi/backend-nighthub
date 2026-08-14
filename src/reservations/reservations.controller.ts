@@ -6,6 +6,7 @@ import {
   Param,
   Body,
   Query,
+  Headers,
   BadRequestException,
   ForbiddenException,
 } from '@nestjs/common';
@@ -14,6 +15,7 @@ import { Public } from '../auth/public.decorator';
 import { Roles } from '../auth/roles.decorator';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { RequestUser } from '../auth/types';
+import { assertCronSecret } from '../common/cron-auth.util';
 
 @Controller('reservations')
 export class ReservationsController {
@@ -43,13 +45,6 @@ export class ReservationsController {
     return tableName;
   }
 
-  private parseOptionalTableId(value: unknown): string | null | undefined {
-    if (value === undefined) return undefined;
-    if (value === null) return null;
-    const tableId = String(value).trim();
-    return tableId.length ? tableId : null;
-  }
-
   private parseOptionalTotalAmount(value: unknown): number | null | undefined {
     if (value === undefined) return undefined;
     if (value === null || value === '') return null;
@@ -62,8 +57,33 @@ export class ReservationsController {
     return amount;
   }
 
+  private parseOptionalStatus(
+    value: unknown,
+  ): 'pending' | 'confirmed' | 'cancelled' | 'completed' | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string') {
+      throw new BadRequestException(
+        'status must be pending|confirmed|cancelled|completed',
+      );
+    }
+
+    const status = value.trim().toLowerCase();
+    if (
+      status === 'pending' ||
+      status === 'confirmed' ||
+      status === 'cancelled' ||
+      status === 'completed'
+    ) {
+      return status;
+    }
+
+    throw new BadRequestException(
+      'status must be pending|confirmed|cancelled|completed',
+    );
+  }
+
   @Get()
-  @Roles('client', 'venue', 'admin')
+  @Roles('client', 'venue', 'staff', 'admin')
   list(
     @CurrentUser() user: RequestUser,
     @Query('event_id') eventIdSnake?: string,
@@ -81,12 +101,19 @@ export class ReservationsController {
       if (page || pageSize) {
         const pageNum = page ? parseInt(page, 10) || 1 : 1;
         const pageSizeNum = pageSize ? parseInt(pageSize, 10) || 20 : 20;
-        return this.reservationsService.listReservationsPaginated(pageNum, pageSizeNum, {
-          eventId,
-          userId: user.id,
-        });
+        return this.reservationsService.listReservationsPaginated(
+          pageNum,
+          pageSizeNum,
+          {
+            eventId,
+            userId: user.id,
+          },
+        );
       }
-      return this.reservationsService.listReservations({ eventId, userId: user.id });
+      return this.reservationsService.listReservations({
+        eventId,
+        userId: user.id,
+      });
     }
 
     // Admin can query with explicit filters (keeps existing behavior for ops).
@@ -94,10 +121,14 @@ export class ReservationsController {
       if (page || pageSize) {
         const pageNum = page ? parseInt(page, 10) || 1 : 1;
         const pageSizeNum = pageSize ? parseInt(pageSize, 10) || 20 : 20;
-        return this.reservationsService.listReservationsPaginated(pageNum, pageSizeNum, {
-          eventId,
-          userId,
-        });
+        return this.reservationsService.listReservationsPaginated(
+          pageNum,
+          pageSizeNum,
+          {
+            eventId,
+            userId,
+          },
+        );
       }
       return this.reservationsService.listReservations({ eventId, userId });
     }
@@ -106,25 +137,34 @@ export class ReservationsController {
     if (!eventId) throw new BadRequestException('event_id required');
 
     const venueId = user.venue_id ?? undefined;
-    if (!venueId) throw new ForbiddenException('Missing venue_id for this user');
+    if (!venueId)
+      throw new ForbiddenException('Missing venue_id for this user');
     return (async () => {
-      await this.reservationsService.assertEventBelongsToVenue(eventId, venueId);
+      await this.reservationsService.assertEventBelongsToVenue(
+        eventId,
+        venueId,
+      );
 
       if (page || pageSize) {
         const pageNum = page ? parseInt(page, 10) || 1 : 1;
         const pageSizeNum = pageSize ? parseInt(pageSize, 10) || 20 : 20;
-        return this.reservationsService.listReservationsPaginated(pageNum, pageSizeNum, {
-          eventId,
-          venueId,
-        });
+        return this.reservationsService.listReservationsPaginated(
+          pageNum,
+          pageSizeNum,
+          {
+            eventId,
+            venueId,
+          },
+        );
       }
 
       return this.reservationsService.listReservations({ eventId, venueId });
     })();
   }
 
-  // Public/low-sensitivity endpoint for client-side availability checks.
-  // Returns only booked table ids for a given event.
+  // Kept for backward compatibility with older clients - physical tables no longer exist
+  // in the booking flow (reservations target a zone directly, see `booked-zones` below),
+  // so there is never anything to report here.
   @Get('booked-tables')
   @Public()
   bookedTables(
@@ -133,7 +173,18 @@ export class ReservationsController {
   ) {
     const eventId = eventIdSnake ?? eventIdCamel;
     if (!eventId) throw new BadRequestException('event_id required');
-    return this.reservationsService.listBookedTableIdsForEvent(eventId);
+    return [];
+  }
+
+  @Get('booked-zones')
+  @Public()
+  bookedZones(
+    @Query('event_id') eventIdSnake?: string,
+    @Query('eventId') eventIdCamel?: string,
+  ) {
+    const eventId = eventIdSnake ?? eventIdCamel;
+    if (!eventId) throw new BadRequestException('event_id required');
+    return this.reservationsService.listBookedZoneIdsForEvent(eventId);
   }
 
   @Get('table-invitations/incoming')
@@ -142,8 +193,22 @@ export class ReservationsController {
     return this.reservationsService.listIncomingTableInvitations(user.id);
   }
 
+  // Called by an external scheduler (Vercel Cron) with a shared secret, same pattern as
+  // GET /events/sync-status. Expires `pending` reservations the venue never responded to,
+  // so they don't sit open forever with no operational signal.
+  @Get('sync-status')
+  @Public()
+  async syncStatus(
+    @Query('token') token?: string,
+    @Headers('x-cron-secret') headerSecret?: string,
+    @Headers('authorization') authorization?: string,
+  ) {
+    assertCronSecret({ token, headerSecret, authorization });
+    return this.reservationsService.expireStalePendingReservations();
+  }
+
   @Get(':id')
-  @Roles('client', 'venue', 'admin')
+  @Roles('client', 'venue', 'staff', 'admin')
   async get(@Param('id') id: string, @CurrentUser() user: RequestUser) {
     const r = await this.reservationsService.getReservation(id);
 
@@ -154,8 +219,10 @@ export class ReservationsController {
     }
 
     const venueId = user.venue_id ?? undefined;
-    if (!venueId) throw new ForbiddenException('Missing venue_id for this user');
-    if (r.event?.venue_id !== venueId) throw new ForbiddenException('Forbidden');
+    if (!venueId)
+      throw new ForbiddenException('Missing venue_id for this user');
+    if (r.event?.venue_id !== venueId)
+      throw new ForbiddenException('Forbidden');
     return r;
   }
 
@@ -163,9 +230,15 @@ export class ReservationsController {
   @Roles('client', 'venue', 'admin')
   async create(@Body() body: any, @CurrentUser() user: RequestUser) {
     if (user.role === 'client') {
-      // Clients can only create reservations for themselves.
+      // Clients can only create reservations for themselves, and can never assert their
+      // own price: total_amount/totalAmount is always server-computed from the zone for
+      // this role (venue/admin are still allowed to pass it explicitly, e.g. for a
+      // manually-priced walk-in booking).
+      const { total_amount, totalAmount, ...rest } = body ?? {};
+      void total_amount;
+      void totalAmount;
       return this.reservationsService.createReservation({
-        ...(body ?? {}),
+        ...rest,
         user_id: user.id,
       });
     }
@@ -179,8 +252,12 @@ export class ReservationsController {
     if (!eventId) throw new BadRequestException('event_id required');
 
     const venueId = user.venue_id ?? undefined;
-    if (!venueId) throw new ForbiddenException('Missing venue_id for this user');
-    await this.reservationsService.assertEventBelongsToVenue(String(eventId), venueId);
+    if (!venueId)
+      throw new ForbiddenException('Missing venue_id for this user');
+    await this.reservationsService.assertEventBelongsToVenue(
+      String(eventId),
+      venueId,
+    );
 
     return this.reservationsService.createReservation({
       ...(body ?? {}),
@@ -200,14 +277,20 @@ export class ReservationsController {
       if (!qrData) throw new BadRequestException('qr_data required');
 
       const staffId =
-        user.role === 'admin' && typeof adminStaffId === 'string' && adminStaffId
+        user.role === 'admin' &&
+        typeof adminStaffId === 'string' &&
+        adminStaffId
           ? adminStaffId
           : user.id;
 
       if (user.role !== 'admin') {
         const venueId = user.venue_id ?? undefined;
-        if (!venueId) throw new ForbiddenException('Missing venue_id for this user');
-        await this.reservationsService.assertEventBelongsToVenue(eventId, venueId);
+        if (!venueId)
+          throw new ForbiddenException('Missing venue_id for this user');
+        await this.reservationsService.assertEventBelongsToVenue(
+          eventId,
+          venueId,
+        );
       }
 
       return this.reservationsService.checkInEntryReservationByQr({
@@ -242,13 +325,16 @@ export class ReservationsController {
 
     if (user.role !== 'admin') {
       const venueId = user.venue_id ?? undefined;
-      if (!venueId) throw new ForbiddenException('Missing venue_id for this user');
-      if (r.event?.venue_id !== venueId) throw new ForbiddenException('Forbidden');
+      if (!venueId)
+        throw new ForbiddenException('Missing venue_id for this user');
+      if (r.event?.venue_id !== venueId)
+        throw new ForbiddenException('Forbidden');
     }
 
     // Allow only safe fields to be updated via API.
     const updates: any = {};
-    if (body && typeof body === 'object' && 'status' in body) updates.status = body.status;
+    const status = this.parseOptionalStatus(body?.status);
+    if (status !== undefined) updates.status = status;
 
     const guests = this.parseOptionalGuests(
       body?.guests ?? body?.guests_count ?? body?.guestsCount,
@@ -260,11 +346,6 @@ export class ReservationsController {
     );
     if (tableName !== undefined) updates.table_name = tableName;
 
-    const tableId = this.parseOptionalTableId(
-      body?.venue_table_id ?? body?.venueTableId ?? body?.table_id ?? body?.tableId,
-    );
-    if (tableId !== undefined) updates.venue_table_id = tableId;
-
     const totalAmount = this.parseOptionalTotalAmount(
       body?.total_amount ?? body?.totalAmount,
     );
@@ -272,14 +353,13 @@ export class ReservationsController {
 
     if (
       r.type !== 'table' &&
-      (
-        guests !== undefined ||
+      (guests !== undefined ||
         tableName !== undefined ||
-        tableId !== undefined ||
-        totalAmount !== undefined
-      )
+        totalAmount !== undefined)
     ) {
-      throw new BadRequestException('Only table reservations can update guests/table fields');
+      throw new BadRequestException(
+        'Only table reservations can update guests/table fields',
+      );
     }
 
     if (Object.keys(updates).length === 0) {
@@ -297,15 +377,44 @@ export class ReservationsController {
     if (user.role === 'client') {
       if (r.user_id !== user.id) throw new ForbiddenException('Forbidden');
       if (r.type === 'entry') {
-        throw new BadRequestException('Gli ingressi non sono annullabili dal cliente');
+        throw new BadRequestException(
+          'Gli ingressi non sono annullabili dal cliente',
+        );
       }
     } else if (user.role !== 'admin') {
       const venueId = user.venue_id ?? undefined;
-      if (!venueId) throw new ForbiddenException('Missing venue_id for this user');
-      if (r.event?.venue_id !== venueId) throw new ForbiddenException('Forbidden');
+      if (!venueId)
+        throw new ForbiddenException('Missing venue_id for this user');
+      if (r.event?.venue_id !== venueId)
+        throw new ForbiddenException('Forbidden');
     }
 
     return this.reservationsService.cancelReservation(id);
+  }
+
+  @Post(':id/checkin')
+  @Roles('staff', 'venue', 'admin')
+  async checkin(
+    @Param('id') id: string,
+    @Body() body: any,
+    @CurrentUser() user: RequestUser,
+  ) {
+    const r = await this.reservationsService.getReservation(id);
+
+    if (user.role !== 'admin') {
+      const venueId = user.venue_id ?? undefined;
+      if (!venueId)
+        throw new ForbiddenException('Missing venue_id for this user');
+      if (r.event?.venue_id !== venueId)
+        throw new ForbiddenException('Forbidden');
+    }
+
+    const actualGuests = body?.actual_guests ?? body?.actualGuests;
+    return this.reservationsService.checkinTableReservation(
+      id,
+      user.id,
+      actualGuests,
+    );
   }
 
   @Post(':id/table-invitations/respond')
@@ -315,7 +424,9 @@ export class ReservationsController {
     @Body() body: any,
     @CurrentUser() user: RequestUser,
   ) {
-    const response = String(body?.response ?? '').trim().toLowerCase();
+    const response = String(body?.response ?? '')
+      .trim()
+      .toLowerCase();
     if (response !== 'accepted' && response !== 'declined') {
       throw new BadRequestException('response must be accepted|declined');
     }

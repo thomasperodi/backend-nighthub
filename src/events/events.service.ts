@@ -17,6 +17,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { SupabaseStorageService } from '../common/storage/supabase-storage.service';
+import { ExpoPushService } from '../common/push/expo-push.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { UpdateEventDto } from './dto/update-event.dto';
 
@@ -39,10 +40,16 @@ type EventStatusSyncCandidate = {
 };
 
 type TablePricingOverrideInput = {
-  venue_table_id: string;
+  venue_table_zone_id: string;
   per_testa?: number | string;
   costo_minimo?: number | string;
   persone_max?: number;
+};
+
+type UploadedPosterFile = {
+  originalname?: string;
+  mimetype?: string;
+  buffer: Buffer;
 };
 
 @Injectable()
@@ -52,6 +59,7 @@ export class EventsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: SupabaseStorageService,
+    private readonly expoPush: ExpoPushService,
   ) {}
 
   private isTransientPrismaConnectivityError(error: unknown): boolean {
@@ -178,7 +186,7 @@ export class EventsService {
     );
   }
 
-  async uploadEventPoster(file?: Express.Multer.File) {
+  async uploadEventPoster(file?: UploadedPosterFile) {
     if (!file) {
       throw new BadRequestException('file is required');
     }
@@ -227,7 +235,11 @@ export class EventsService {
   private async listEventIdsByComputedStatus(params: {
     venueId?: string;
     date?: string; // YYYY-MM-DD
-    status: EventStatus;
+    // Exactly one of these two is expected: `status` for an exact match (explicit
+    // ?status=LIVE/CLOSED), `excludeStatus` to filter a status out (the default public feed
+    // excludes CLOSED - see listEvents/listEventsPaginated).
+    status?: EventStatus;
+    excludeStatus?: EventStatus;
     skip?: number;
     take?: number;
     withTotal?: boolean;
@@ -236,14 +248,19 @@ export class EventsService {
     const date = params.date ?? null;
     const skip = params.skip ?? 0;
     const take = params.take;
-    const status = params.status;
     const computed = this.computedStatusExpr();
+
+    const statusCondition = params.status
+      ? Prisma.sql`(${computed}) = (${params.status}::"EventStatus")`
+      : params.excludeStatus
+        ? Prisma.sql`(${computed}) <> (${params.excludeStatus}::"EventStatus")`
+        : Prisma.sql`TRUE`;
 
     const whereBase = Prisma.sql`
       FROM "events" e
       WHERE (${venueId}::uuid IS NULL OR e."venue_id" = ${venueId}::uuid)
         AND (${date}::date IS NULL OR e."date" = ${date}::date)
-        AND (${computed}) = (${status}::"EventStatus")
+        AND ${statusCondition}
     `;
 
     let total: number | undefined;
@@ -352,6 +369,41 @@ export class EventsService {
       });
     } catch {
       // ignore
+    }
+  }
+
+  // Batched variant of syncEventStatusIfNeeded for list endpoints: instead of one UPDATE
+  // per drifted row (N writes on every GET), group ids by target status and issue at most
+  // one updateMany per distinct target status (in practice at most 2: LIVE, CLOSED).
+  private async syncEventStatusesIfNeeded(
+    list: EventStatusSyncCandidate[],
+  ): Promise<void> {
+    const idsByStatus = new Map<EventStatus, string[]>();
+
+    for (const e of list) {
+      if (!e?.id || !e?.date || !e?.start_time || !e?.end_time) continue;
+      const effective = this.computeEffectiveStatus(e);
+      const current = e.status ?? EventStatus.DRAFT;
+      if (effective === current) continue;
+
+      const ids = idsByStatus.get(effective) ?? [];
+      ids.push(e.id);
+      idsByStatus.set(effective, ids);
+    }
+
+    if (idsByStatus.size === 0) return;
+
+    try {
+      await Promise.all(
+        Array.from(idsByStatus.entries()).map(([status, ids]) =>
+          this.prisma.events.updateMany({
+            where: { id: { in: ids } },
+            data: { status },
+          }),
+        ),
+      );
+    } catch {
+      // Best-effort: status sync must not break the read path.
     }
   }
 
@@ -477,59 +529,137 @@ export class EventsService {
     persone_max_override?: number | null;
   }) {
     return (
-      row.per_testa_override !== null && row.per_testa_override !== undefined
-    ) || (
-      row.costo_minimo_override !== null &&
-      row.costo_minimo_override !== undefined
-    ) || (
-      row.persone_max_override !== null && row.persone_max_override !== undefined
+      (row.per_testa_override !== null &&
+        row.per_testa_override !== undefined) ||
+      (row.costo_minimo_override !== null &&
+        row.costo_minimo_override !== undefined) ||
+      (row.persone_max_override !== null &&
+        row.persone_max_override !== undefined)
     );
   }
 
-  private async buildResolvedTablePricing(eventId: string, venueId: string) {
-    const [venueTables, eventTableOverrides] = await this.prisma.$transaction([
-      this.prisma.venue_tables.findMany({
-        where: { venue_id: venueId },
-        orderBy: [{ zona: 'asc' }, { nome: 'asc' }],
+  /**
+   * Fetches venue_tables, event_tables overrides, the venue's floor plan (+landmarks) and
+   * all its table zones, then derives both the resolved table pricing list and the floor
+   * plan from that shared data in memory. Replaces two previously-separate methods that each
+   * independently re-fetched venue_tables and event_tables (duplicated queries).
+   *
+   * Deliberately plain `Promise.all` rather than `$transaction([...])`: these 4 reads are
+   * read-only and don't need snapshot isolation with each other (same tolerance the original
+   * two-method version already had, since it ran as two independent transactions). A Prisma
+   * batch `$transaction` holds one connection and runs its queries sequentially over it (one
+   * BEGIN/COMMIT, not concurrent execution) - on a pooled remote DB the per-query network RTT
+   * dominates, so 4 queries in one transaction cost ~4x one query. `Promise.all` lets each
+   * query grab its own pooled connection and run concurrently, costing ~1x one query instead.
+   *
+   * Filtered through the `venue.events` relation keyed on `eventId` alone (not a `venueId`
+   * param) so this can run in the *same* `Promise.all` as the main event fetch in `getEvent`
+   * instead of waiting for it to resolve `venue_id` first - see the call site.
+   */
+  // Physical tables no longer exist in the booking pipeline - zones (`venue_table_zones`)
+  // are the addressable unit for both pricing overrides and floor-plan positioning (zones
+  // carry their own floor_x/y/w/h, same as venue_tables used to).
+  private async loadEventPricingAndFloorPlanSource(eventId: string) {
+    const prismaAny = this.prisma as any;
+    const venueByEvent = { venue: { events: { some: { id: eventId } } } };
+
+    const [venueZones, eventTableOverrides, floorPlan] = await Promise.all([
+      this.prisma.venue_table_zones.findMany({
+        where: venueByEvent,
+        orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
         select: {
           id: true,
-          nome: true,
-          zona: true,
+          name: true,
+          color: true,
+          booking_policy: true,
           per_testa: true,
           costo_minimo: true,
           persone_max: true,
+          floor_x: true,
+          floor_y: true,
+          floor_w: true,
+          floor_h: true,
+          sort_order: true,
+          is_active: true,
         },
       }),
       this.prisma.event_tables.findMany({
         where: { event_id: eventId },
         select: {
           id: true,
-          venue_table_id: true,
+          venue_table_zone_id: true,
           per_testa_override: true,
           costo_minimo_override: true,
           persone_max_override: true,
         },
       }),
+      prismaAny.venue_floor_plans.findFirst({
+        where: venueByEvent,
+        select: {
+          id: true,
+          venue_id: true,
+          background_image: true,
+          canvas_width: true,
+          canvas_height: true,
+          grid_size: true,
+          show_grid: true,
+          landmarks: {
+            orderBy: [{ sort_order: 'asc' }, { created_at: 'asc' }],
+            select: {
+              id: true,
+              type: true,
+              label: true,
+              x: true,
+              y: true,
+              width: true,
+              height: true,
+              rotation: true,
+              color: true,
+              metadata: true,
+              sort_order: true,
+            },
+          },
+        },
+      }),
     ]);
 
-    const overrideByVenueTableId = new Map(
-      eventTableOverrides.map((row) => [row.venue_table_id, row]),
+    return { venueZones, eventTableOverrides, floorPlan };
+  }
+
+  private buildResolvedTablePricingFromSource(
+    venueZones: Array<{
+      id: string;
+      name: string;
+      per_testa: Prisma.Decimal | null;
+      costo_minimo: Prisma.Decimal | null;
+      persone_max: number | null;
+    }>,
+    eventTableOverrides: Array<{
+      id: string;
+      venue_table_zone_id: string;
+      per_testa_override: Prisma.Decimal | null;
+      costo_minimo_override: Prisma.Decimal | null;
+      persone_max_override: number | null;
+    }>,
+  ) {
+    const overrideByZoneId = new Map(
+      eventTableOverrides.map((row) => [row.venue_table_zone_id, row]),
     );
     const hasExplicitSelection = eventTableOverrides.length > 0;
-    const selectedVenueTables = hasExplicitSelection
-      ? venueTables.filter((table) => overrideByVenueTableId.has(table.id))
-      : venueTables;
+    const selectedZones = hasExplicitSelection
+      ? venueZones.filter((zone) => overrideByZoneId.has(zone.id))
+      : venueZones;
 
-    return selectedVenueTables.map((table) => {
-      const override = overrideByVenueTableId.get(table.id);
+    return selectedZones.map((zone) => {
+      const override = overrideByZoneId.get(zone.id);
       const basePerTesta =
-        table.per_testa === null || table.per_testa === undefined
+        zone.per_testa === null || zone.per_testa === undefined
           ? null
-          : this.decimalToNumber(table.per_testa);
+          : this.decimalToNumber(zone.per_testa);
       const baseCostoMinimo =
-        table.costo_minimo === null || table.costo_minimo === undefined
+        zone.costo_minimo === null || zone.costo_minimo === undefined
           ? null
-          : this.decimalToNumber(table.costo_minimo);
+          : this.decimalToNumber(zone.costo_minimo);
       const overridePerTesta =
         override?.per_testa_override === null ||
         override?.per_testa_override === undefined
@@ -545,24 +675,26 @@ export class EventsService {
         override?.persone_max_override === undefined
           ? null
           : Number(override.persone_max_override);
-      const hasOverride = override ? this.hasTablePricingOverride(override) : false;
-      const label = String(table.zona ?? '').trim() || String(table.nome ?? '').trim() || 'Senza zona';
+      const hasOverride = override
+        ? this.hasTablePricingOverride(override)
+        : false;
 
       return {
         event_table_id: override?.id,
-        venue_table_id: table.id,
-        nome: table.nome,
-        zona: table.zona ?? null,
-        label,
+        venue_table_zone_id: zone.id,
+        nome: zone.name,
+        label: zone.name,
         per_testa: hasOverride ? overridePerTesta : basePerTesta,
         costo_minimo: hasOverride ? overrideCostoMinimo : baseCostoMinimo,
-        persone_max: hasOverride ? overridePersoneMax : (table.persone_max ?? null),
+        persone_max: hasOverride
+          ? overridePersoneMax
+          : (zone.persone_max ?? null),
         base_per_testa: basePerTesta,
         base_costo_minimo: baseCostoMinimo,
         base_persone_max:
-          table.persone_max === null || table.persone_max === undefined
+          zone.persone_max === null || zone.persone_max === undefined
             ? null
-            : Number(table.persone_max),
+            : Number(zone.persone_max),
         override_per_testa: overridePerTesta,
         override_costo_minimo: overrideCostoMinimo,
         override_persone_max: overridePersoneMax,
@@ -571,15 +703,163 @@ export class EventsService {
     });
   }
 
-  private async serializeEventWithTablePricing(e: any) {
+  private buildDerivedFloorPlanFromSource(
+    floorPlan: any,
+    venueZones: any[],
+    eventTableOverrides: Array<{
+      id: string;
+      venue_table_zone_id: string;
+      per_testa_override: Prisma.Decimal | null;
+      costo_minimo_override: Prisma.Decimal | null;
+      persone_max_override: number | null;
+    }>,
+  ) {
+    type EventTableOverrideRow = {
+      id: string;
+      venue_table_zone_id: string;
+      per_testa_override: Prisma.Decimal | null;
+      costo_minimo_override: Prisma.Decimal | null;
+      persone_max_override: number | null;
+    };
+
+    if (!floorPlan) return null;
+
+    const overrideByZoneId = new Map<string, EventTableOverrideRow>(
+      (eventTableOverrides as EventTableOverrideRow[]).map((row) => [
+        row.venue_table_zone_id,
+        row,
+      ]),
+    );
+    const hasExplicitSelection = eventTableOverrides.length > 0;
+    const selectedZones = hasExplicitSelection
+      ? venueZones.filter((zone) => overrideByZoneId.has(zone.id))
+      : venueZones;
+
+    const mappedZones = selectedZones
+      .filter((zone) => zone.is_active)
+      .map((zone) => {
+        const override = overrideByZoneId.get(zone.id);
+
+        const basePerTesta =
+          zone.per_testa === null || zone.per_testa === undefined
+            ? null
+            : this.decimalToNumber(zone.per_testa);
+        const baseCostoMinimo =
+          zone.costo_minimo === null || zone.costo_minimo === undefined
+            ? null
+            : this.decimalToNumber(zone.costo_minimo);
+        const overridePerTesta =
+          override?.per_testa_override === null ||
+          override?.per_testa_override === undefined
+            ? null
+            : this.decimalToNumber(override.per_testa_override);
+        const overrideCostoMinimo =
+          override?.costo_minimo_override === null ||
+          override?.costo_minimo_override === undefined
+            ? null
+            : this.decimalToNumber(override.costo_minimo_override);
+        const overridePersoneMax =
+          override?.persone_max_override === null ||
+          override?.persone_max_override === undefined
+            ? null
+            : Number(override.persone_max_override);
+        const hasOverride = override
+          ? this.hasTablePricingOverride(override)
+          : false;
+
+        return {
+          id: zone.id,
+          event_table_id: override?.id,
+          venue_table_zone_id: zone.id,
+          zone_name: zone.name,
+          booking_policy: zone.booking_policy ?? 'exclusive',
+          zone_color: zone.color ?? null,
+          nome: zone.name,
+          per_testa: hasOverride ? overridePerTesta : basePerTesta,
+          costo_minimo: hasOverride ? overrideCostoMinimo : baseCostoMinimo,
+          persone_max: hasOverride
+            ? overridePersoneMax
+            : zone.persone_max === null || zone.persone_max === undefined
+              ? null
+              : Number(zone.persone_max),
+          has_override: hasOverride,
+          floor_x:
+            zone.floor_x === null || zone.floor_x === undefined
+              ? null
+              : this.decimalToNumber(zone.floor_x),
+          floor_y:
+            zone.floor_y === null || zone.floor_y === undefined
+              ? null
+              : this.decimalToNumber(zone.floor_y),
+          floor_w:
+            zone.floor_w === null || zone.floor_w === undefined
+              ? null
+              : this.decimalToNumber(zone.floor_w),
+          floor_h:
+            zone.floor_h === null || zone.floor_h === undefined
+              ? null
+              : this.decimalToNumber(zone.floor_h),
+          floor_shape: 'rectangle',
+          floor_rotation: 0,
+          layout_order: zone.sort_order,
+        };
+      });
+
+    return {
+      id: floorPlan.id,
+      venue_id: floorPlan.venue_id,
+      background_image: floorPlan.background_image,
+      canvas_width: this.decimalToNumber(floorPlan.canvas_width),
+      canvas_height: this.decimalToNumber(floorPlan.canvas_height),
+      grid_size: this.decimalToNumber(floorPlan.grid_size),
+      show_grid: floorPlan.show_grid,
+      landmarks: floorPlan.landmarks.map((landmark) => ({
+        id: landmark.id,
+        type: landmark.type,
+        label: landmark.label,
+        x: this.decimalToNumber(landmark.x),
+        y: this.decimalToNumber(landmark.y),
+        width: this.decimalToNumber(landmark.width),
+        height: this.decimalToNumber(landmark.height),
+        rotation: this.decimalToNumber(landmark.rotation),
+        color: landmark.color,
+        metadata: landmark.metadata,
+        sort_order: landmark.sort_order,
+      })),
+      tables: mappedZones,
+    };
+  }
+
+  /** Combines an already-fetched event with a `loadEventPricingAndFloorPlanSource` result. */
+  private serializeEventWithPricingSource(
+    e: any,
+    source: {
+      venueZones: any[];
+      eventTableOverrides: any[];
+      floorPlan: any;
+    },
+  ) {
     const serialized = this.serializeEvent(e);
     if (!e?.id || !e?.venue_id) {
-      return { ...serialized, table_pricing: [] };
+      return { ...serialized, table_pricing: [], floor_plan: null };
     }
+
+    const { venueZones, eventTableOverrides, floorPlan } = source;
+
+    const tablePricing = this.buildResolvedTablePricingFromSource(
+      venueZones,
+      eventTableOverrides,
+    );
+    const derivedFloorPlan = this.buildDerivedFloorPlanFromSource(
+      floorPlan,
+      venueZones,
+      eventTableOverrides,
+    );
 
     return {
       ...serialized,
-      table_pricing: await this.buildResolvedTablePricing(e.id, e.venue_id),
+      table_pricing: tablePricing,
+      floor_plan: derivedFloorPlan,
     };
   }
 
@@ -670,27 +950,28 @@ export class EventsService {
   private normalizeTablePricingInput(
     tablePricing: TablePricingOverrideInput[] | undefined,
   ) {
-    return (tablePricing ?? [])
-      .map((row) => {
-        const venue_table_id = String(row?.venue_table_id ?? '').trim();
-        if (!venue_table_id) {
-          throw new BadRequestException('table_pricing.venue_table_id is required');
-        }
-
-        const per_testa = this.parseOptionalPrice(row.per_testa);
-        const costo_minimo = this.parseOptionalPrice(row.costo_minimo);
-        const persone_max = this.parsePositiveInt(
-          row.persone_max,
-          'table_pricing.persone_max',
+    return (tablePricing ?? []).map((row) => {
+      const venue_table_zone_id = String(row?.venue_table_zone_id ?? '').trim();
+      if (!venue_table_zone_id) {
+        throw new BadRequestException(
+          'table_pricing.venue_table_zone_id is required',
         );
+      }
 
-        return {
-          venue_table_id,
-          per_testa,
-          costo_minimo,
-          persone_max,
-        };
-      });
+      const per_testa = this.parseOptionalPrice(row.per_testa);
+      const costo_minimo = this.parseOptionalPrice(row.costo_minimo);
+      const persone_max = this.parsePositiveInt(
+        row.persone_max,
+        'table_pricing.persone_max',
+      );
+
+      return {
+        venue_table_zone_id,
+        per_testa,
+        costo_minimo,
+        persone_max,
+      };
+    });
   }
 
   private async applyTablePricingOverrides(
@@ -704,18 +985,18 @@ export class EventsService {
   ) {
     const normalizedRows = this.normalizeTablePricingInput(params.tablePricing);
     const uniqueIds = Array.from(
-      new Set(normalizedRows.map((row) => row.venue_table_id)),
+      new Set(normalizedRows.map((row) => row.venue_table_zone_id)),
     );
     const uniqueIdSet = new Set(uniqueIds);
 
     if (uniqueIds.length !== normalizedRows.length) {
       throw new BadRequestException(
-        'table_pricing contains duplicate venue_table_id values',
+        'table_pricing contains duplicate venue_table_zone_id values',
       );
     }
 
     if (uniqueIds.length > 0) {
-      const venueTables = await tx.venue_tables.findMany({
+      const venueZones = await tx.venue_table_zones.findMany({
         where: {
           venue_id: params.venueId,
           id: { in: uniqueIds },
@@ -723,7 +1004,7 @@ export class EventsService {
         select: { id: true },
       });
 
-      if (venueTables.length !== uniqueIds.length) {
+      if (venueZones.length !== uniqueIds.length) {
         throw new BadRequestException(
           'One or more table_pricing rows do not belong to the selected venue',
         );
@@ -736,7 +1017,7 @@ export class EventsService {
       },
       select: {
         id: true,
-        venue_table_id: true,
+        venue_table_zone_id: true,
         prenotati: true,
         entrati: true,
         confermato: true,
@@ -750,7 +1031,7 @@ export class EventsService {
 
     if (params.replaceExisting) {
       const rowsToRemove = existingRows.filter(
-        (row) => !uniqueIdSet.has(row.venue_table_id),
+        (row) => !uniqueIdSet.has(row.venue_table_zone_id),
       );
 
       const blockedRow = rowsToRemove.find(
@@ -778,10 +1059,10 @@ export class EventsService {
 
     if (!normalizedRows.length) return;
 
-    const existingByVenueTableId = new Map(
+    const existingByZoneId = new Map(
       existingRows
-        .filter((row) => uniqueIdSet.has(row.venue_table_id))
-        .map((row) => [row.venue_table_id, row]),
+        .filter((row) => uniqueIdSet.has(row.venue_table_zone_id))
+        .map((row) => [row.venue_table_zone_id, row]),
     );
 
     for (const row of normalizedRows) {
@@ -790,7 +1071,7 @@ export class EventsService {
         costo_minimo_override: row.costo_minimo ?? null,
         persone_max_override: row.persone_max ?? null,
       };
-      const existing = existingByVenueTableId.get(row.venue_table_id);
+      const existing = existingByZoneId.get(row.venue_table_zone_id);
 
       if (existing) {
         await tx.event_tables.update({
@@ -803,7 +1084,7 @@ export class EventsService {
       await tx.event_tables.create({
         data: {
           event_id: params.eventId,
-          venue_table_id: row.venue_table_id,
+          venue_table_zone_id: row.venue_table_zone_id,
           stato: 'libero',
           prenotati: 0,
           entrati: 0,
@@ -832,13 +1113,18 @@ export class EventsService {
     if (requestedStatus === EventStatus.DRAFT) where.status = requestedStatus;
     if (filters?.date) where.date = this.parseDate(filters.date);
 
-    // If the client asks for computed status (LIVE/CLOSED), filter in DB to avoid fetching all rows.
-    if (requestedStatus && requestedStatus !== EventStatus.DRAFT) {
+    // Any request that isn't explicitly asking for DRAFT (persisted DB status) goes through
+    // the computed-status path: an explicit ?status=LIVE/CLOSED filters to exactly that, and
+    // - importantly - the *default* call with no status filter at all (the public events
+    // feed) excludes CLOSED, so past events never show up there without being asked for.
+    if (requestedStatus !== EventStatus.DRAFT) {
       const dateOnly = filters?.date ? filters.date : undefined;
       const { ids } = await this.listEventIdsByComputedStatus({
         venueId: filters?.venue_id,
         date: dateOnly,
-        status: requestedStatus,
+        ...(requestedStatus
+          ? { status: requestedStatus }
+          : { excludeStatus: EventStatus.CLOSED }),
       });
 
       if (!ids.length) return [] as events[];
@@ -852,6 +1138,7 @@ export class EventsService {
             select: {
               id: true,
               venue_id: true,
+              venue: { select: { id: true, name: true, image: true } },
               name: true,
               description: true,
               image: true,
@@ -884,11 +1171,12 @@ export class EventsService {
 
       const byId = new Map(rows.map((r) => [r.id, r]));
       const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
-      await Promise.all(
-        ordered.map((e) =>
-          this.syncEventStatusIfNeeded(e as EventStatusSyncCandidate),
-        ),
-      );
+      // No write-on-read here anymore: `serializeEvent` below always computes the
+      // response's status live from date/time (see computeEffectiveStatus), so a briefly
+      // stale DB column doesn't affect what this response shows. Keeping the persisted
+      // column in sync is now the cron's job (GET /events/sync-status, wired in
+      // vercel.json, runs every 15 min) instead of this endpoint - the highest-traffic,
+      // unauthenticated public events list - paying for an UPDATE on every call.
       // eslint-disable-next-line @typescript-eslint/no-unsafe-return
       return ordered.map((e) => this.serializeEvent(e)) as any;
     }
@@ -902,6 +1190,7 @@ export class EventsService {
           select: {
             id: true,
             venue_id: true,
+            venue: { select: { id: true, name: true, image: true } },
             name: true,
             description: true,
             image: true,
@@ -942,11 +1231,7 @@ export class EventsService {
       });
     }
 
-    await Promise.all(
-      list.map((e) =>
-        this.syncEventStatusIfNeeded(e as EventStatusSyncCandidate),
-      ),
-    );
+    await this.syncEventStatusesIfNeeded(list as EventStatusSyncCandidate[]);
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     const serialized = list.map((e) => this.serializeEvent(e));
@@ -986,13 +1271,17 @@ export class EventsService {
     const take = Math.max(pageSize, 1);
     const skip = (Math.max(page, 1) - 1) * take;
 
-    // For computed statuses (LIVE/CLOSED) we must filter after serialization.
-    if (requestedStatus && requestedStatus !== EventStatus.DRAFT) {
+    // Same rule as listEvents: anything other than an explicit ?status=DRAFT goes through the
+    // computed-status path, and the default (no status filter - the public feed) excludes
+    // CLOSED so past events don't show up unasked.
+    if (requestedStatus !== EventStatus.DRAFT) {
       const dateOnly = filters?.date ? filters.date : undefined;
       const { ids, total } = await this.listEventIdsByComputedStatus({
         venueId: filters?.venue_id,
         date: dateOnly,
-        status: requestedStatus,
+        ...(requestedStatus
+          ? { status: requestedStatus }
+          : { excludeStatus: EventStatus.CLOSED }),
         skip,
         take,
         withTotal: true,
@@ -1016,6 +1305,7 @@ export class EventsService {
             select: {
               id: true,
               venue_id: true,
+              venue: { select: { id: true, name: true, image: true } },
               name: true,
               description: true,
               image: true,
@@ -1048,10 +1338,8 @@ export class EventsService {
 
       const byId = new Map(rows.map((r) => [r.id, r]));
       const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
-      await Promise.all(
-        ordered.map((e) =>
-          this.syncEventStatusIfNeeded(e as EventStatusSyncCandidate),
-        ),
+      await this.syncEventStatusesIfNeeded(
+        ordered as EventStatusSyncCandidate[],
       );
       // eslint-disable-next-line @typescript-eslint/no-unsafe-return
       const pageData = ordered.map((e) => this.serializeEvent(e));
@@ -1083,6 +1371,7 @@ export class EventsService {
             select: {
               id: true,
               venue_id: true,
+              venue: { select: { id: true, name: true, image: true } },
               name: true,
               description: true,
               image: true,
@@ -1114,11 +1403,7 @@ export class EventsService {
         ]),
     );
 
-    await Promise.all(
-      data.map((e) =>
-        this.syncEventStatusIfNeeded(e as EventStatusSyncCandidate),
-      ),
-    );
+    await this.syncEventStatusesIfNeeded(data as EventStatusSyncCandidate[]);
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     const serializedData = data.map((e) => this.serializeEvent(e));
@@ -1133,17 +1418,81 @@ export class EventsService {
   }
 
   async getEvent(id: string) {
-    const event = await this.prisma.events.findUnique({
-      where: { id },
-      include: {
-        venue: true,
-        promos: true,
-        entry_prices: { orderBy: { created_at: 'asc' } },
-      },
-    });
+    // `promos`/`entry_prices` and the whole table-pricing/floor-plan source are all keyed on
+    // `id` alone (the floor-plan source no longer needs `venue_id` resolved from the main
+    // event fetch first - see `loadEventPricingAndFloorPlanSource`), so everything this
+    // endpoint needs runs in one `Promise.all` instead of the main event fetch completing
+    // before the pricing/floor-plan queries could even start.
+    const [event, promos, entryPrices, pricingSource] = await Promise.all([
+      this.prisma.events.findUnique({
+        where: { id },
+        include: {
+          // Trimmed from `venue: true`: excludes Stripe account/payout status and contract
+          // billing fields, which aren't relevant to an event-detail view and shouldn't be
+          // sent to every client fetching an event.
+          venue: {
+            select: {
+              id: true,
+              name: true,
+              city: true,
+              address: true,
+              description: true,
+              image: true,
+              latitude: true,
+              longitude: true,
+              radius_geofence: true,
+              cloakroom_unit_price: true,
+              bar_price_list: true,
+              bottle_price_list: true,
+              created_at: true,
+              updated_at: true,
+            },
+          },
+        },
+      }),
+      this.prisma.promos.findMany({ where: { event_id: id } }),
+      this.prisma.event_entry_prices.findMany({
+        where: { event_id: id },
+        orderBy: { created_at: 'asc' },
+      }),
+      this.loadEventPricingAndFloorPlanSource(id),
+    ]);
     if (!event) throw new NotFoundException('Event not found');
-    await this.syncEventStatusIfNeeded(event as EventStatusSyncCandidate);
-    return this.serializeEventWithTablePricing(event);
+    const eventWithRelations = { ...event, promos, entry_prices: entryPrices };
+    await this.syncEventStatusIfNeeded(
+      eventWithRelations as EventStatusSyncCandidate,
+    );
+    return this.serializeEventWithPricingSource(
+      eventWithRelations,
+      pricingSource,
+    );
+  }
+
+  /** Friends of `userId` who currently hold a non-cancelled reservation (entry or table) for this event. */
+  async getFriendsGoing(eventId: string, userId: string) {
+    const links = await this.prisma.friendships.findMany({
+      where: { user_id: userId },
+      select: { friend_id: true },
+    });
+    const friendIds = links.map((l) => l.friend_id);
+    if (friendIds.length === 0) return [];
+
+    const reservations = await this.prisma.reservations.findMany({
+      where: {
+        event_id: eventId,
+        user_id: { in: friendIds },
+        status: { not: 'cancelled' },
+      },
+      select: { user_id: true },
+      distinct: ['user_id'],
+    });
+    const goingIds = reservations.map((r) => r.user_id);
+    if (goingIds.length === 0) return [];
+
+    return this.prisma.users.findMany({
+      where: { id: { in: goingIds } },
+      select: { id: true, username: true, name: true, avatar: true },
+    });
   }
 
   async assertEventBelongsToVenue(eventId: string, venueId: string) {
@@ -1171,12 +1520,14 @@ export class EventsService {
     }
     const start_time = this.parseTime(dto.start_time);
     const end_time = this.parseTime(dto.end_time);
-    const accessMode = this.normalizeAccessMode(dto.access_mode) ?? EventAccessMode.LIST;
+    const accessMode =
+      this.normalizeAccessMode(dto.access_mode) ?? EventAccessMode.LIST;
     const presalePrice =
       dto.presale_price === undefined || dto.presale_price === null
         ? undefined
         : this.parsePrice(dto.presale_price);
-    const presaleCurrency = this.normalizeCurrency(dto.presale_currency) ?? 'eur';
+    const presaleCurrency =
+      this.normalizeCurrency(dto.presale_currency) ?? 'eur';
     const presaleCapacity = this.parsePositiveInt(
       dto.presale_capacity,
       'presale_capacity',
@@ -1235,7 +1586,11 @@ export class EventsService {
         name: dto.name,
         description: dto.description,
         image: imagePath,
+        // dto.is_featured only ever reaches here truthy for an admin caller (the controller
+        // forces it false for a venue) - so a true value here is always a deliberate manual
+        // grant, never something the auto-featured cron should later consider "its own".
         is_featured: dto.is_featured ?? false,
+        featured_source: dto.is_featured ? 'manual' : null,
         date,
         start_time,
         end_time,
@@ -1318,8 +1673,21 @@ export class EventsService {
           name: dto.name,
           description: dto.description,
           image: imagePath,
+          // Same reasoning as createEvent(): dto.is_featured only ever arrives here for an
+          // admin caller (the controller deletes it from the DTO for a venue), so an
+          // explicit value here is always a deliberate manual grant/revoke - stamp
+          // featured_source accordingly so the auto-featured cron knows to leave it alone.
+          // `undefined` (the field wasn't sent) leaves both columns untouched.
           is_featured:
-            dto.is_featured === undefined ? undefined : Boolean(dto.is_featured),
+            dto.is_featured === undefined
+              ? undefined
+              : Boolean(dto.is_featured),
+          featured_source:
+            dto.is_featured === undefined
+              ? undefined
+              : dto.is_featured
+                ? 'manual'
+                : null,
           date,
           start_time,
           end_time,
@@ -1402,8 +1770,69 @@ export class EventsService {
     return this.getEvent(id);
   }
 
+  // Marks the event CANCELLED and cancels every non-cancelled reservation tied to it
+  // (an UPDATE, unlike deleteEvent's DELETE - this is what keeps history intact and is
+  // what avoids the ticket_orders FK issue deleteEvent has). Notifies every affected
+  // reservation holder with a best-effort push; a failed push never blocks the
+  // cancellation itself.
+  async cancelEvent(id: string) {
+    const event = await this.prisma.events.findUnique({
+      where: { id },
+      select: { id: true, name: true, status: true },
+    });
+    if (!event) throw new NotFoundException('Event not found');
+    if (event.status === EventStatus.CANCELLED) {
+      return { success: true, already_cancelled: true };
+    }
+
+    const affectedReservations = await this.prisma.reservations.findMany({
+      where: { event_id: id, status: { not: 'cancelled' } },
+      select: {
+        id: true,
+        user: { select: { push_token: true } },
+      },
+    });
+
+    await this.prisma.$transaction([
+      this.prisma.events.update({
+        where: { id },
+        data: { status: EventStatus.CANCELLED },
+      }),
+      this.prisma.reservations.updateMany({
+        where: { event_id: id, status: { not: 'cancelled' } },
+        data: { status: 'cancelled' },
+      }),
+    ]);
+
+    await Promise.all(
+      affectedReservations
+        .filter((r) => r.user?.push_token)
+        .map((r) =>
+          this.expoPush.send({
+            token: r.user!.push_token!,
+            title: 'Evento annullato',
+            body: `"${event.name}" è stato annullato dal locale. La tua prenotazione è stata cancellata.`,
+            data: { type: 'event_cancelled', event_id: id },
+          }),
+        ),
+    );
+
+    return { success: true, cancelled_reservations: affectedReservations.length };
+  }
+
   async deleteEvent(id: string) {
     await this.getEvent(id);
+
+    const [ticketOrdersCount, reservationsCount] = await Promise.all([
+      this.prisma.ticket_orders.count({ where: { event_id: id } }),
+      this.prisma.reservations.count({ where: { event_id: id } }),
+    ]);
+    if (ticketOrdersCount > 0 || reservationsCount > 0) {
+      throw new BadRequestException(
+        'Impossibile eliminare un evento con prenotazioni o ordini collegati. Usa "Annulla evento" per cancellarlo mantenendo lo storico.',
+      );
+    }
+
     await this.prisma.$transaction([
       // Delete dependents first to satisfy FK constraints
       this.prisma.reservations.deleteMany({ where: { event_id: id } }),
@@ -1428,28 +1857,39 @@ export class EventsService {
   }
 
   async recalculateEventStats(eventId: string): Promise<EventStats> {
-    await this.getEvent(eventId);
+    // Was `await this.getEvent(eventId)` - the full serialized event (venue include +
+    // promos + entry_prices, plus 2 extra transactions for table pricing / floor plan
+    // resolution, ~1s+ measured) fetched and immediately discarded just to check
+    // existence. A bare id-only lookup does the same existence check for a fraction of
+    // the cost. Plain `Promise.all` (not `$transaction`) so the 5 independent reads run
+    // concurrently on separate pooled connections instead of sequentially on one - see the
+    // comment on `loadEventPricingAndFloorPlanSource` for why a batch `$transaction` doesn't
+    // actually parallelize anything on a remote pooled DB.
+    const [exists, entriesAgg, barAgg, cloakAgg, tableAgg] = await Promise.all([
+      this.prisma.events.findUnique({
+        where: { id: eventId },
+        select: { id: true },
+      }),
+      this.prisma.entries.aggregate({
+        where: { event_id: eventId },
+        _count: { id: true },
+        _sum: { price: true },
+      }),
+      this.prisma.bar_sales.aggregate({
+        where: { event_id: eventId },
+        _sum: { amount: true },
+      }),
+      this.prisma.cloakroom_sales.aggregate({
+        where: { event_id: eventId },
+        _sum: { amount: true },
+      }),
+      this.prisma.event_tables.aggregate({
+        where: { event_id: eventId },
+        _sum: { pagato_totale: true },
+      }),
+    ]);
 
-    const [entriesAgg, barAgg, cloakAgg, tableAgg] =
-      await this.prisma.$transaction([
-        this.prisma.entries.aggregate({
-          where: { event_id: eventId },
-          _count: { id: true },
-          _sum: { price: true },
-        }),
-        this.prisma.bar_sales.aggregate({
-          where: { event_id: eventId },
-          _sum: { amount: true },
-        }),
-        this.prisma.cloakroom_sales.aggregate({
-          where: { event_id: eventId },
-          _sum: { amount: true },
-        }),
-        this.prisma.event_tables.aggregate({
-          where: { event_id: eventId },
-          _sum: { pagato_totale: true },
-        }),
-      ]);
+    if (!exists) throw new NotFoundException('Event not found');
 
     return {
       event_id: eventId,
@@ -1482,6 +1922,137 @@ export class EventsService {
     `;
 
     return { success: true, updated: Number(updated) };
+  }
+
+  // Tunable knobs for the free/automatic side of `is_featured` - see the doc comment above
+  // evaluateAutoFeaturedEvents() for what they mean. Kept as named constants (not spread
+  // across the query) so the formula is easy to find and retune without reading SQL.
+  private static readonly AUTO_FEATURED_RECENT_WINDOW_HOURS = 24;
+  private static readonly AUTO_FEATURED_BASELINE_WINDOW_DAYS = 90;
+  private static readonly AUTO_FEATURED_MULTIPLIER = 2;
+  private static readonly AUTO_FEATURED_MIN_FLOOR = 3;
+  private static readonly AUTO_FEATURED_BOOKING_STATUSES: Prisma.Sql = Prisma.sql`('pending', 'confirmed', 'completed')`;
+
+  /**
+   * Recomputes the *automatic* side of `events.is_featured` for every upcoming (not CLOSED)
+   * event - a free reward for booking velocity, as opposed to an admin manually granting it
+   * as a paid placement (see EventsController.create/update). Both write to the same
+   * `is_featured` boolean; `featured_source` ('manual' | 'auto') is what keeps them from
+   * stepping on each other:
+   *   - This job only ever flips events whose `featured_source` is already 'auto' or null -
+   *     it never touches (turns on or off) an event an admin explicitly set, because that
+   *     would silently take away something a venue paid for, or silently grant a paid-tier
+   *     benefit for free.
+   *   - When it grants is_featured, it also stamps featured_source = 'auto', so a later run
+   *     knows this specific true is one it's allowed to revoke if the hype fades.
+   *
+   * Formula, relative to each venue's own history (a fixed absolute threshold would be
+   * unfair to a small venue that fills up its 40-person room quickly vs. a 500-person venue
+   * where the same booking count is nothing):
+   *   - `recentCount`   = this event's (pending|confirmed|completed) reservations created in
+   *                       the last {AUTO_FEATURED_RECENT_WINDOW_HOURS}h.
+   *   - `venueDailyAvg` = that venue's total such reservations over the last
+   *                       {AUTO_FEATURED_BASELINE_WINDOW_DAYS} days, divided by that many days.
+   *   - qualifies = recentCount >= max(venueDailyAvg * {AUTO_FEATURED_MULTIPLIER}, {AUTO_FEATURED_MIN_FLOOR})
+   * The `MIN_FLOOR` matters most for a venue with little/no booking history yet, where
+   * `venueDailyAvg` is ~0 and any multiplier of it would trivially qualify every event.
+   *
+   * Triggered by the same cron as syncEventStatusesNow (see EventsController#syncStatus) -
+   * not on every booking, to keep the booking request path free of this computation.
+   */
+  async evaluateAutoFeaturedEvents(): Promise<{
+    success: boolean;
+    updated: number;
+  }> {
+    const { ids: upcomingIds } = await this.listEventIdsByComputedStatus({
+      excludeStatus: EventStatus.CLOSED,
+    });
+    if (!upcomingIds.length) return { success: true, updated: 0 };
+
+    // Only events this job is allowed to touch - anything featured_source = 'manual' is
+    // off-limits in both directions.
+    const eligibleEvents = await this.prisma.events.findMany({
+      where: {
+        id: { in: upcomingIds },
+        featured_source: { not: 'manual' },
+      },
+      select: { id: true, venue_id: true, is_featured: true },
+    });
+    if (!eligibleEvents.length) return { success: true, updated: 0 };
+
+    const venueIds = Array.from(
+      new Set(eligibleEvents.map((e) => e.venue_id)),
+    );
+    const eligibleEventIds = eligibleEvents.map((e) => e.id);
+
+    const [dailyAverageRows, recentCountRows] = await Promise.all([
+      this.prisma.$queryRaw<Array<{ venue_id: string; daily_avg: number }>>(
+        Prisma.sql`
+          SELECT e."venue_id" AS venue_id,
+                 COUNT(r."id")::float / ${EventsService.AUTO_FEATURED_BASELINE_WINDOW_DAYS} AS daily_avg
+          FROM "events" e
+          JOIN "reservations" r ON r."event_id" = e."id"
+          WHERE e."venue_id" = ANY(${venueIds}::uuid[])
+            AND r."status" IN ${EventsService.AUTO_FEATURED_BOOKING_STATUSES}
+            AND r."created_at" >= NOW() - (${EventsService.AUTO_FEATURED_BASELINE_WINDOW_DAYS}::int * interval '1 day')
+          GROUP BY e."venue_id"
+        `,
+      ),
+      this.prisma.$queryRaw<Array<{ event_id: string; recent_count: number }>>(
+        Prisma.sql`
+          SELECT r."event_id" AS event_id, COUNT(*)::int AS recent_count
+          FROM "reservations" r
+          WHERE r."event_id" = ANY(${eligibleEventIds}::uuid[])
+            AND r."status" IN ${EventsService.AUTO_FEATURED_BOOKING_STATUSES}
+            AND r."created_at" >= NOW() - (${EventsService.AUTO_FEATURED_RECENT_WINDOW_HOURS}::int * interval '1 hour')
+          GROUP BY r."event_id"
+        `,
+      ),
+    ]);
+
+    const dailyAverageByVenue = new Map(
+      dailyAverageRows.map((r) => [r.venue_id, r.daily_avg]),
+    );
+    const recentCountByEvent = new Map(
+      recentCountRows.map((r) => [r.event_id, r.recent_count]),
+    );
+
+    const toFeature: string[] = [];
+    const toUnfeature: string[] = [];
+
+    for (const event of eligibleEvents) {
+      const dailyAvg = dailyAverageByVenue.get(event.venue_id) ?? 0;
+      const recentCount = recentCountByEvent.get(event.id) ?? 0;
+      const threshold = Math.max(
+        dailyAvg * EventsService.AUTO_FEATURED_MULTIPLIER,
+        EventsService.AUTO_FEATURED_MIN_FLOOR,
+      );
+      const qualifies = recentCount >= threshold;
+
+      if (qualifies !== event.is_featured) {
+        (qualifies ? toFeature : toUnfeature).push(event.id);
+      }
+    }
+
+    const [featuredResult, unfeaturedResult] = await Promise.all([
+      toFeature.length
+        ? this.prisma.events.updateMany({
+            where: { id: { in: toFeature } },
+            data: { is_featured: true, featured_source: 'auto' },
+          })
+        : { count: 0 },
+      toUnfeature.length
+        ? this.prisma.events.updateMany({
+            where: { id: { in: toUnfeature } },
+            data: { is_featured: false, featured_source: null },
+          })
+        : { count: 0 },
+    ]);
+
+    return {
+      success: true,
+      updated: featuredResult.count + unfeaturedResult.count,
+    };
   }
 
   async venueStats(venueId: string) {

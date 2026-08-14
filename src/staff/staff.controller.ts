@@ -30,8 +30,38 @@ export class StaffController {
     private readonly eventsService: EventsService,
   ) {}
 
+  /**
+   * `resolveEventIdForStaffApi` is only a real async dependency when `eventId` isn't already
+   * known (it has to look up the venue's active event first). When the caller already passed
+   * an explicit `eventId`, resolution just re-validates it (existence + venue ownership) and
+   * returns the same id back - so the validation and the actual list fetch can run
+   * concurrently instead of the fetch waiting on the validation to finish. If validation
+   * rejects (404/403), `Promise.all` rejects before this returns anything to the caller, so an
+   * unauthorized/invalid `eventId` never leaks list data - it only means one wasted query on
+   * that rare error path in exchange for one fewer round trip on every normal call.
+   */
+  private async resolveEventIdAndFetch<T>(
+    params: {
+      eventId?: string;
+      venueId?: string;
+      staffId?: string;
+      expectedVenueId?: string;
+    },
+    fetch: (eventId: string) => Promise<T>,
+  ): Promise<T> {
+    const eventIdPromise = this.staffService.resolveEventIdForStaffApi(params);
+    const fetchPromise = params.eventId
+      ? fetch(params.eventId)
+      : eventIdPromise.then((id) => fetch(id));
+    const [, result] = await Promise.all([eventIdPromise, fetchPromise]);
+    return result;
+  }
+
   @Post('entries')
-  async recordEntry(@Body() dto: RecordEntryDto, @CurrentUser() user: RequestUser) {
+  async recordEntry(
+    @Body() dto: RecordEntryDto,
+    @CurrentUser() user: RequestUser,
+  ) {
     try {
       if (user.role !== 'admin') {
         if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
@@ -43,7 +73,10 @@ export class StaffController {
         payload.staff_id = user.id;
         const eventId = payload.event_id ?? payload.eventId;
         if (eventId) {
-          await this.staffService.assertEventBelongsToVenue(eventId, user.venue_id);
+          await this.staffService.assertEventBelongsToVenue(
+            eventId,
+            user.venue_id,
+          );
         }
       }
 
@@ -80,23 +113,26 @@ export class StaffController {
     const isAdmin = user.role === 'admin';
     const effectiveVenueId: string | undefined = isAdmin
       ? venueId
-      : user.venue_id ?? undefined;
-    if (!isAdmin && !effectiveVenueId) throw new ForbiddenException('Missing venue_id');
+      : (user.venue_id ?? undefined);
+    if (!isAdmin && !effectiveVenueId)
+      throw new ForbiddenException('Missing venue_id');
 
-    const resolvedEventId = await this.staffService.resolveEventIdForStaffApi({
-      eventId,
-      venueId: effectiveVenueId,
-      staffId: isAdmin ? staffId : undefined,
-    });
-
-    if (!isAdmin && effectiveVenueId) {
-      await this.staffService.assertEventBelongsToVenue(resolvedEventId, effectiveVenueId);
-    }
-    return this.staffService.listEntries(resolvedEventId);
+    return this.resolveEventIdAndFetch(
+      {
+        eventId,
+        venueId: effectiveVenueId,
+        staffId: isAdmin ? staffId : undefined,
+        expectedVenueId: !isAdmin ? effectiveVenueId : undefined,
+      },
+      (id) => this.staffService.listEntries(id),
+    );
   }
 
   @Post('bar-sales')
-  async recordBarSale(@Body() dto: RecordSaleDto, @CurrentUser() user: RequestUser) {
+  async recordBarSale(
+    @Body() dto: RecordSaleDto,
+    @CurrentUser() user: RequestUser,
+  ) {
     if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       const payload = dto as unknown as {
@@ -107,7 +143,10 @@ export class StaffController {
       payload.staff_id = user.id;
       const eventId = payload.event_id ?? payload.eventId;
       if (eventId) {
-        await this.staffService.assertEventBelongsToVenue(eventId, user.venue_id);
+        await this.staffService.assertEventBelongsToVenue(
+          eventId,
+          user.venue_id,
+        );
       }
     }
     return this.staffService.recordBarSale(dto);
@@ -123,19 +162,19 @@ export class StaffController {
     const isAdmin = user.role === 'admin';
     const effectiveVenueId: string | undefined = isAdmin
       ? venueId
-      : user.venue_id ?? undefined;
-    if (!isAdmin && !effectiveVenueId) throw new ForbiddenException('Missing venue_id');
+      : (user.venue_id ?? undefined);
+    if (!isAdmin && !effectiveVenueId)
+      throw new ForbiddenException('Missing venue_id');
 
-    const resolvedEventId = await this.staffService.resolveEventIdForStaffApi({
-      eventId,
-      venueId: effectiveVenueId,
-      staffId: isAdmin ? staffId : undefined,
-    });
-
-    if (!isAdmin && effectiveVenueId) {
-      await this.staffService.assertEventBelongsToVenue(resolvedEventId, effectiveVenueId);
-    }
-    return this.staffService.listBarSales(resolvedEventId);
+    return this.resolveEventIdAndFetch(
+      {
+        eventId,
+        venueId: effectiveVenueId,
+        staffId: isAdmin ? staffId : undefined,
+        expectedVenueId: !isAdmin ? effectiveVenueId : undefined,
+      },
+      (id) => this.staffService.listBarSales(id),
+    );
   }
 
   @Post('cloakroom-sales')
@@ -153,7 +192,10 @@ export class StaffController {
       payload.staff_id = user.id;
       const eventId = payload.event_id ?? payload.eventId;
       if (eventId) {
-        await this.staffService.assertEventBelongsToVenue(eventId, user.venue_id);
+        await this.staffService.assertEventBelongsToVenue(
+          eventId,
+          user.venue_id,
+        );
       }
     }
     return this.staffService.recordCloakroomSale(dto);
@@ -169,23 +211,26 @@ export class StaffController {
     const isAdmin = user.role === 'admin';
     const effectiveVenueId: string | undefined = isAdmin
       ? venueId
-      : user.venue_id ?? undefined;
-    if (!isAdmin && !effectiveVenueId) throw new ForbiddenException('Missing venue_id');
+      : (user.venue_id ?? undefined);
+    if (!isAdmin && !effectiveVenueId)
+      throw new ForbiddenException('Missing venue_id');
 
-    const resolvedEventId = await this.staffService.resolveEventIdForStaffApi({
-      eventId,
-      venueId: effectiveVenueId,
-      staffId: isAdmin ? staffId : undefined,
-    });
-
-    if (!isAdmin && effectiveVenueId) {
-      await this.staffService.assertEventBelongsToVenue(resolvedEventId, effectiveVenueId);
-    }
-    return this.staffService.listCloakroomSales(resolvedEventId);
+    return this.resolveEventIdAndFetch(
+      {
+        eventId,
+        venueId: effectiveVenueId,
+        staffId: isAdmin ? staffId : undefined,
+        expectedVenueId: !isAdmin ? effectiveVenueId : undefined,
+      },
+      (id) => this.staffService.listCloakroomSales(id),
+    );
   }
 
   @Post('table-sales')
-  async recordTableSale(@Body() dto: RecordSaleDto, @CurrentUser() user: RequestUser) {
+  async recordTableSale(
+    @Body() dto: RecordSaleDto,
+    @CurrentUser() user: RequestUser,
+  ) {
     if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       const payload = dto as unknown as {
@@ -214,19 +259,19 @@ export class StaffController {
     const isAdmin = user.role === 'admin';
     const effectiveVenueId: string | undefined = isAdmin
       ? venueId
-      : user.venue_id ?? undefined;
-    if (!isAdmin && !effectiveVenueId) throw new ForbiddenException('Missing venue_id');
+      : (user.venue_id ?? undefined);
+    if (!isAdmin && !effectiveVenueId)
+      throw new ForbiddenException('Missing venue_id');
 
-    const resolvedEventId = await this.staffService.resolveEventIdForStaffApi({
-      eventId,
-      venueId: effectiveVenueId,
-      staffId: isAdmin ? staffId : undefined,
-    });
-
-    if (!isAdmin && effectiveVenueId) {
-      await this.staffService.assertEventBelongsToVenue(resolvedEventId, effectiveVenueId);
-    }
-    return this.staffService.listTableSales(resolvedEventId);
+    return this.resolveEventIdAndFetch(
+      {
+        eventId,
+        venueId: effectiveVenueId,
+        staffId: isAdmin ? staffId : undefined,
+        expectedVenueId: !isAdmin ? effectiveVenueId : undefined,
+      },
+      (id) => this.staffService.listTableSales(id),
+    );
   }
 
   @Get('events/:eventId/stats')
@@ -261,27 +306,28 @@ export class StaffController {
     const isAdmin = user.role === 'admin';
     const effectiveVenueId: string | undefined = isAdmin
       ? venueId
-      : user.venue_id ?? undefined;
-    if (!isAdmin && !effectiveVenueId) throw new ForbiddenException('Missing venue_id');
+      : (user.venue_id ?? undefined);
+    if (!isAdmin && !effectiveVenueId)
+      throw new ForbiddenException('Missing venue_id');
 
-    const resolvedEventId = await this.staffService.resolveEventIdForStaffApi({
-      eventId,
-      venueId: effectiveVenueId,
-      staffId: isAdmin ? staffId : undefined,
-    });
-
-    if (!isAdmin && effectiveVenueId) {
-      await this.staffService.assertEventBelongsToVenue(resolvedEventId, effectiveVenueId);
-    }
-    return this.staffService.listHostessTables({
-      eventId: resolvedEventId,
-      venueId: effectiveVenueId,
-      onlyBooked: onlyBooked === 'true' || onlyBooked === '1',
-      includeConfirmed:
-        includeConfirmed === undefined
-          ? true
-          : includeConfirmed === 'true' || includeConfirmed === '1',
-    });
+    return this.resolveEventIdAndFetch(
+      {
+        eventId,
+        venueId: effectiveVenueId,
+        staffId: isAdmin ? staffId : undefined,
+        expectedVenueId: !isAdmin ? effectiveVenueId : undefined,
+      },
+      (id) =>
+        this.staffService.listHostessTables({
+          eventId: id,
+          venueId: effectiveVenueId,
+          onlyBooked: onlyBooked === 'true' || onlyBooked === '1',
+          includeConfirmed:
+            includeConfirmed === undefined
+              ? true
+              : includeConfirmed === 'true' || includeConfirmed === '1',
+        }),
+    );
   }
 
   @Post('hostess-tables/:id/update-entrati')
@@ -294,7 +340,9 @@ export class StaffController {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       return this.staffService
         .assertEventTableBelongsToVenue(id, user.venue_id)
-        .then(() => this.staffService.updateHostessTableEntrati(id, body?.delta ?? 1));
+        .then(() =>
+          this.staffService.updateHostessTableEntrati(id, body?.delta ?? 1),
+        );
     }
     return this.staffService.updateHostessTableEntrati(id, body?.delta ?? 1);
   }
@@ -309,7 +357,9 @@ export class StaffController {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       return this.staffService
         .assertEventTableBelongsToVenue(id, user.venue_id)
-        .then(() => this.staffService.assignHostessTableNumber(id, body.numero));
+        .then(() =>
+          this.staffService.assignHostessTableNumber(id, body.numero),
+        );
     }
     return this.staffService.assignHostessTableNumber(id, body.numero);
   }
@@ -347,7 +397,10 @@ export class StaffController {
       return this.staffService.assignHostessTableNumber(id, body.numero);
     }
     if (body.action === 'set_confirmed') {
-      return this.staffService.setHostessTableConfirmed(id, Boolean(body.confirmed));
+      return this.staffService.setHostessTableConfirmed(
+        id,
+        Boolean(body.confirmed),
+      );
     }
     throw new BadRequestException('unknown action');
   }
@@ -405,7 +458,10 @@ export class StaffController {
   ) {
     if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
-      await this.staffService.assertEventTableBelongsToVenue(tableId, user.venue_id);
+      await this.staffService.assertEventTableBelongsToVenue(
+        tableId,
+        user.venue_id,
+      );
     }
 
     return this.staffService.createTableBottleOrder(tableId, dto, {
@@ -429,24 +485,24 @@ export class StaffController {
     const effectiveStaffId = isAdmin ? (staffId ?? userId) : undefined;
     const effectiveVenueId: string | undefined = isAdmin
       ? venueId
-      : user.venue_id ?? undefined;
-    if (!isAdmin && !effectiveVenueId) throw new ForbiddenException('Missing venue_id');
+      : (user.venue_id ?? undefined);
+    if (!isAdmin && !effectiveVenueId)
+      throw new ForbiddenException('Missing venue_id');
 
-    const resolvedEventId = await this.staffService.resolveEventIdForStaffApi({
-      eventId,
-      venueId: effectiveVenueId,
-      staffId: effectiveStaffId,
-    });
-
-    if (!isAdmin && effectiveVenueId) {
-      await this.staffService.assertEventBelongsToVenue(resolvedEventId, effectiveVenueId);
-    }
-
-    return this.staffService.listWaiterTables({
-      eventId: resolvedEventId,
-      venueId: effectiveVenueId,
-      onlyBooked: onlyBooked === 'true' || onlyBooked === '1',
-    });
+    return this.resolveEventIdAndFetch(
+      {
+        eventId,
+        venueId: effectiveVenueId,
+        staffId: effectiveStaffId,
+        expectedVenueId: !isAdmin ? effectiveVenueId : undefined,
+      },
+      (id) =>
+        this.staffService.listWaiterTables({
+          eventId: id,
+          venueId: effectiveVenueId,
+          onlyBooked: onlyBooked === 'true' || onlyBooked === '1',
+        }),
+    );
   }
 
   @Get('bottle-orders')
@@ -460,24 +516,24 @@ export class StaffController {
     const isAdmin = user.role === 'admin';
     const effectiveVenueId: string | undefined = isAdmin
       ? venueId
-      : user.venue_id ?? undefined;
-    if (!isAdmin && !effectiveVenueId) throw new ForbiddenException('Missing venue_id');
+      : (user.venue_id ?? undefined);
+    if (!isAdmin && !effectiveVenueId)
+      throw new ForbiddenException('Missing venue_id');
 
-    const resolvedEventId = await this.staffService.resolveEventIdForStaffApi({
-      eventId,
-      venueId: effectiveVenueId,
-      staffId: isAdmin ? staffId : undefined,
-    });
-
-    if (!isAdmin && effectiveVenueId) {
-      await this.staffService.assertEventBelongsToVenue(resolvedEventId, effectiveVenueId);
-    }
-
-    return this.staffService.listBottleOrders({
-      eventId: resolvedEventId,
-      venueId: effectiveVenueId,
-      status,
-    });
+    return this.resolveEventIdAndFetch(
+      {
+        eventId,
+        venueId: effectiveVenueId,
+        staffId: isAdmin ? staffId : undefined,
+        expectedVenueId: !isAdmin ? effectiveVenueId : undefined,
+      },
+      (id) =>
+        this.staffService.listBottleOrders({
+          eventId: id,
+          venueId: effectiveVenueId,
+          status,
+        }),
+    );
   }
 
   @Post('bottle-orders/:id/prepare')
@@ -487,7 +543,10 @@ export class StaffController {
   ) {
     if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
-      await this.staffService.assertBottleOrderBelongsToVenue(orderId, user.venue_id);
+      await this.staffService.assertBottleOrderBelongsToVenue(
+        orderId,
+        user.venue_id,
+      );
     }
 
     return this.staffService.markBottleOrderPreparing(
@@ -503,7 +562,10 @@ export class StaffController {
   ) {
     if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
-      await this.staffService.assertBottleOrderBelongsToVenue(orderId, user.venue_id);
+      await this.staffService.assertBottleOrderBelongsToVenue(
+        orderId,
+        user.venue_id,
+      );
     }
 
     return this.staffService.markBottleOrderDelivered(
@@ -520,7 +582,10 @@ export class StaffController {
   ) {
     if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
-      await this.staffService.assertEventTableBelongsToVenue(tableId, user.venue_id);
+      await this.staffService.assertEventTableBelongsToVenue(
+        tableId,
+        user.venue_id,
+      );
     }
     return this.staffService.settleTable(tableId);
   }

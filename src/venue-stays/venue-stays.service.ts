@@ -1,4 +1,8 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Injectable()
@@ -35,7 +39,12 @@ export class VenueStaysService {
 
     if (event_type === 'enter') {
       const openStay = await this.prisma.venue_stays.findFirst({
-        where: { user_id, venue_id, event_id: event_id ?? null, exited_at: null },
+        where: {
+          user_id,
+          venue_id,
+          event_id: event_id ?? null,
+          exited_at: null,
+        },
         orderBy: { entered_at: 'desc' },
       });
 
@@ -61,7 +70,10 @@ export class VenueStaysService {
     }
 
     const exitedAt = enteredAt;
-    const duration = Math.max(0, exitedAt.getTime() - openStay.entered_at.getTime());
+    const duration = Math.max(
+      0,
+      exitedAt.getTime() - openStay.entered_at.getTime(),
+    );
 
     return this.prisma.venue_stays.update({
       where: { id: openStay.id },

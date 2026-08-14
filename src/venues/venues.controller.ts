@@ -9,17 +9,28 @@ import {
   Query,
   Res,
   ForbiddenException,
+  Headers,
+  UploadedFile,
+  UseInterceptors,
 } from '@nestjs/common';
 import type { Response } from 'express';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { VenuesService } from './venues.service';
 import { EventsService } from '../events/events.service';
 import { CreateVenueDto } from './dto/create-venue.dto';
 import { CreateVenueStationsBulkDto } from './dto/create-venue-stations-bulk.dto';
+import { UpdateVenueImageDto } from './dto/update-venue-image.dto';
 import { UpdateVenueDto } from './dto/update-venue.dto';
 import { UpdateVenuePricingDto } from './dto/update-venue-pricing.dto';
 import { CreateVenueTablesBulkDto } from './dto/create-venue-tables-bulk.dto';
 import { UpdateVenueStationDto } from './dto/update-venue-station.dto';
 import { UpdateVenueTableDto } from './dto/update-venue-table.dto';
+import { CreateVenueTableZoneDto } from './dto/create-venue-table-zone.dto';
+import { UpdateVenueTableZoneDto } from './dto/update-venue-table-zone.dto';
+import { UpdateVenueFloorPlanDto } from './dto/update-venue-floor-plan.dto';
+import { CreateVenueFloorLandmarkDto } from './dto/create-venue-floor-landmark.dto';
+import { UpdateVenueFloorLandmarkDto } from './dto/update-venue-floor-landmark.dto';
+import { CreateZoneTablesDto } from './dto/create-zone-tables.dto';
 import { CreateVenuePrMemberDto } from './dto/create-venue-pr-member.dto';
 import { UpdateVenuePrMemberDto } from './dto/update-venue-pr-member.dto';
 import { AssignPrEventDto } from './dto/assign-pr-event.dto';
@@ -53,6 +64,27 @@ export class VenuesController {
     return this.venuesService.listMyPrVenueMemberships(user);
   }
 
+  @Get('passes/apple/:passId')
+  @Public()
+  async downloadPrApplePass(
+    @Param('passId') passId: string,
+    @Query('token') token: string | undefined,
+    @Res() res: Response,
+  ) {
+    const payload = await this.venuesService.getPrSeasonPassApplePkpass(
+      passId,
+      token,
+    );
+
+    res.setHeader('Content-Type', 'application/vnd.apple.pkpass');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${payload.filename}"`,
+    );
+    res.setHeader('Cache-Control', 'private, max-age=60');
+    res.send(payload.buffer);
+  }
+
   @Get(':id')
   @Public()
   get(@Param('id') id: string, @Res({ passthrough: true }) res?: Response) {
@@ -75,43 +107,61 @@ export class VenuesController {
     return this.venuesService.updateVenue(id, body);
   }
 
-  @Post(':id/stripe/connect/onboarding')
+  @Patch(':id/image')
   @Roles('venue', 'admin')
-  createStripeConnectOnboarding(
+  updateImage(
     @Param('id') id: string,
-    @Body() body: { refresh_url?: string; return_url?: string; email?: string },
+    @Body() body: UpdateVenueImageDto,
     @CurrentUser() user?: RequestUser,
   ) {
     if (String(user?.role || '').toLowerCase() === 'venue') {
-      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
     }
 
-    return this.venuesService.createStripeConnectOnboardingLink({
-      venueId: id,
-      refreshUrl: body?.refresh_url,
-      returnUrl: body?.return_url,
-      email: body?.email,
-    });
+    return this.venuesService.updateVenueImage(id, body?.image);
   }
 
-  @Get(':id/stripe/connect/status')
+  @Post(':id/image')
   @Roles('venue', 'admin')
-  getStripeConnectStatus(
+  @UseInterceptors(FileInterceptor('file'))
+  uploadImage(
     @Param('id') id: string,
+    @UploadedFile()
+    file?: { buffer: Buffer; mimetype: string; originalname: string },
     @CurrentUser() user?: RequestUser,
   ) {
     if (String(user?.role || '').toLowerCase() === 'venue') {
-      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
     }
-    return this.venuesService.getStripeConnectStatus(id);
+
+    return this.venuesService.uploadVenueImage(file);
+  }
+
+  @Post(':id/image/signed')
+  @Roles('venue', 'admin')
+  createImageSignedUpload(
+    @Param('id') id: string,
+    @Headers('authorization') authorization?: string,
+    @Body() body?: { ext?: string; contentType?: string },
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+
+    void authorization;
+    return this.venuesService.createVenueImageSignedUpload(body);
   }
 
   @Get(':id/pricing')
   @Roles('staff', 'venue', 'admin')
-  getPricing(
-    @Param('id') id: string,
-    @CurrentUser() user?: RequestUser,
-  ) {
+  getPricing(@Param('id') id: string, @CurrentUser() user?: RequestUser) {
     if (String(user?.role || '').toLowerCase() !== 'admin') {
       if (!user?.venue_id || user.venue_id !== id) {
         throw new ForbiddenException('Forbidden');
@@ -156,6 +206,45 @@ export class VenuesController {
     return this.venuesService.getMyPrNetworkMembership(id, user);
   }
 
+  @Get(':id/pr-network/me/season-pass')
+  @Roles('client', 'staff', 'venue', 'admin')
+  getMyPrSeasonPass(
+    @Param('id') id: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.getMyPrSeasonPass(id, user);
+  }
+
+  @Post(':id/pr-network/me/season-pass/refresh-wallet')
+  @Roles('client', 'staff', 'venue', 'admin')
+  refreshMyPrSeasonPassWalletLinks(
+    @Param('id') id: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.venuesService.getMyPrSeasonPass(id, user, {
+      refreshWalletLinks: true,
+    });
+  }
+
+  // Resolves an existing user by id/email/username so the venue team-management screen can
+  // invite someone without asking for a raw UUID - CreateVenuePrMemberDto only accepts
+  // `user_id`, and unlike admin's resolveUserByIdentifier, nothing venue-scoped existed to
+  // look one up before creating the membership.
+  @Get(':id/pr-network/lookup')
+  @Roles('venue', 'admin')
+  lookupPrNetworkUser(
+    @Param('id') id: string,
+    @Query('identifier') identifier: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.lookupUserForPrInvite(identifier);
+  }
+
   @Get(':id/pr-network')
   @Roles('client', 'staff', 'venue', 'admin')
   listPrNetworkMembers(
@@ -183,7 +272,12 @@ export class VenuesController {
     @Body() body: UpdateVenuePrMemberDto,
     @CurrentUser() user?: RequestUser,
   ) {
-    return this.venuesService.updateVenuePrNetworkMember(id, memberId, body, user);
+    return this.venuesService.updateVenuePrNetworkMember(
+      id,
+      memberId,
+      body,
+      user,
+    );
   }
 
   @Delete(':id/pr-network/:memberId')
@@ -253,8 +347,8 @@ export class VenuesController {
 
   @Delete(':id')
   @Roles('admin')
-  delete(@Param('id') id: string) {
-    return this.venuesService.deleteVenue(id);
+  delete(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    return this.venuesService.deleteVenue(id, user.id);
   }
 
   @Get(':id/events')
@@ -285,7 +379,8 @@ export class VenuesController {
     );
 
     if (String(user?.role || '').toLowerCase() === 'venue') {
-      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+      if (!user?.venue_id || user.venue_id !== id)
+        throw new ForbiddenException('Forbidden');
     }
     return this.venuesService.getStats(id);
   }
@@ -366,6 +461,155 @@ export class VenuesController {
     return this.venuesService.listPromos(id);
   }
 
+  @Get(':id/table-zones')
+  @Public()
+  tableZones(
+    @Param('id') id: string,
+    @Res({ passthrough: true }) res?: Response,
+  ) {
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=120, stale-while-revalidate=900',
+    );
+    return this.venuesService.listVenueTableZones(id);
+  }
+
+  @Post(':id/table-zones')
+  @Roles('venue', 'admin')
+  createTableZone(
+    @Param('id') id: string,
+    @Body() body: CreateVenueTableZoneDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.createVenueTableZone(id, body);
+  }
+
+  @Patch(':id/table-zones/:zoneId')
+  @Roles('venue', 'admin')
+  updateTableZone(
+    @Param('id') id: string,
+    @Param('zoneId') zoneId: string,
+    @Body() body: UpdateVenueTableZoneDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.updateVenueTableZone(id, zoneId, body);
+  }
+
+  @Delete(':id/table-zones/:zoneId')
+  @Roles('venue', 'admin')
+  deleteTableZone(
+    @Param('id') id: string,
+    @Param('zoneId') zoneId: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.deleteVenueTableZone(id, zoneId);
+  }
+
+  @Get(':id/floor-plan')
+  @Public()
+  floorPlan(
+    @Param('id') id: string,
+    @Res({ passthrough: true }) res?: Response,
+  ) {
+    res?.setHeader(
+      'Cache-Control',
+      'public, max-age=0, s-maxage=90, stale-while-revalidate=600',
+    );
+    return this.venuesService.getVenueFloorPlan(id);
+  }
+
+  @Patch(':id/floor-plan')
+  @Roles('venue', 'admin')
+  updateFloorPlan(
+    @Param('id') id: string,
+    @Body() body: UpdateVenueFloorPlanDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.updateVenueFloorPlan(id, body);
+  }
+
+  @Post(':id/floor-plan/landmarks')
+  @Roles('venue', 'admin')
+  createFloorPlanLandmark(
+    @Param('id') id: string,
+    @Body() body: CreateVenueFloorLandmarkDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.createVenueFloorLandmark(id, body);
+  }
+
+  @Patch(':id/floor-plan/landmarks/:landmarkId')
+  @Roles('venue', 'admin')
+  updateFloorPlanLandmark(
+    @Param('id') id: string,
+    @Param('landmarkId') landmarkId: string,
+    @Body() body: UpdateVenueFloorLandmarkDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.updateVenueFloorLandmark(id, landmarkId, body);
+  }
+
+  @Delete(':id/floor-plan/landmarks/:landmarkId')
+  @Roles('venue', 'admin')
+  deleteFloorPlanLandmark(
+    @Param('id') id: string,
+    @Param('landmarkId') landmarkId: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.deleteVenueFloorLandmark(id, landmarkId);
+  }
+
+  @Post(':id/table-zones/:zoneId/tables')
+  @Roles('venue', 'admin')
+  createTablesFromZone(
+    @Param('id') id: string,
+    @Param('zoneId') zoneId: string,
+    @Body() body: CreateZoneTablesDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    if (String(user?.role || '').toLowerCase() === 'venue') {
+      if (!user?.venue_id || user.venue_id !== id) {
+        throw new ForbiddenException('Forbidden');
+      }
+    }
+    return this.venuesService.createZoneTables(id, zoneId, body);
+  }
+
   // Venue structural tables (persisted in DB)
   @Get(':id/tables')
   @Public()
@@ -404,7 +648,8 @@ export class VenuesController {
     @CurrentUser() user?: RequestUser,
   ) {
     if (String(user?.role || '').toLowerCase() === 'venue') {
-      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+      if (!user?.venue_id || user.venue_id !== id)
+        throw new ForbiddenException('Forbidden');
     }
     return this.venuesService.createVenueStationsBulk(id, body);
   }
@@ -418,7 +663,8 @@ export class VenuesController {
     @CurrentUser() user?: RequestUser,
   ) {
     if (String(user?.role || '').toLowerCase() === 'venue') {
-      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+      if (!user?.venue_id || user.venue_id !== id)
+        throw new ForbiddenException('Forbidden');
     }
     return this.venuesService.updateVenueStation(id, stationId, body);
   }
@@ -431,7 +677,8 @@ export class VenuesController {
     @CurrentUser() user?: RequestUser,
   ) {
     if (String(user?.role || '').toLowerCase() === 'venue') {
-      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+      if (!user?.venue_id || user.venue_id !== id)
+        throw new ForbiddenException('Forbidden');
     }
     return this.venuesService.deleteVenueStation(id, stationId);
   }
@@ -444,7 +691,8 @@ export class VenuesController {
     @CurrentUser() user?: RequestUser,
   ) {
     if (String(user?.role || '').toLowerCase() === 'venue') {
-      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+      if (!user?.venue_id || user.venue_id !== id)
+        throw new ForbiddenException('Forbidden');
     }
     return this.venuesService.createVenueTablesBulk(id, body);
   }
@@ -457,7 +705,8 @@ export class VenuesController {
     @CurrentUser() user?: RequestUser,
   ) {
     if (String(user?.role || '').toLowerCase() === 'venue') {
-      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+      if (!user?.venue_id || user.venue_id !== id)
+        throw new ForbiddenException('Forbidden');
     }
     return this.venuesService.deleteVenueTable(id, tableId);
   }
@@ -471,7 +720,8 @@ export class VenuesController {
     @CurrentUser() user?: RequestUser,
   ) {
     if (String(user?.role || '').toLowerCase() === 'venue') {
-      if (!user?.venue_id || user.venue_id !== id) throw new ForbiddenException('Forbidden');
+      if (!user?.venue_id || user.venue_id !== id)
+        throw new ForbiddenException('Forbidden');
     }
     return this.venuesService.updateVenueTable(id, tableId, body);
   }

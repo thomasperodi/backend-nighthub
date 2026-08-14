@@ -8,18 +8,30 @@ import {
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReservationsService } from '../reservations/reservations.service';
+import { BadgesService } from '../badges/badges.service';
 
 @Injectable()
 export class FriendsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly reservationsService: ReservationsService,
+    private readonly badgesService: BadgesService,
   ) {}
   private readonly logger = new Logger(FriendsService.name);
+
+  private evaluateBadges(userId: string | null | undefined) {
+    if (!userId) return;
+    void this.badgesService.evaluateForUser(userId).catch((error) => {
+      this.logger.error(
+        `Badge evaluation failed for user ${userId}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    });
+  }
   private readonly pushDebug = process.env.PUSH_DEBUG === '1';
   private readonly onlineActivityMinutes = 2;
   private readonly staleLocationMinutes = 30;
-  private readonly hideLocationAfterHours = 24;
+  private readonly hideLocationAfterHours = 24 * 7;
   private readonly hotspotMinFriends = 2;
   private readonly nearbyVenueMultiplier = 1.5;
 
@@ -29,15 +41,17 @@ export class FriendsService {
     return `${token.slice(0, 10)}...${token.slice(-4)}`;
   }
 
-  private decimalToNumber(value: Prisma.Decimal | number | string | null | undefined) {
+  private decimalToNumber(
+    value: Prisma.Decimal | number | string | null | undefined,
+  ) {
     if (value === null || value === undefined) return null;
     if (typeof value === 'number') return Number.isFinite(value) ? value : null;
     if (typeof value === 'string') {
       const numeric = Number(value);
       return Number.isFinite(numeric) ? numeric : null;
     }
-    if (typeof (value as Prisma.Decimal).toNumber === 'function') {
-      const numeric = (value as Prisma.Decimal).toNumber();
+    if (typeof value.toNumber === 'function') {
+      const numeric = value.toNumber();
       return Number.isFinite(numeric) ? numeric : null;
     }
     const numeric = Number(value);
@@ -63,7 +77,10 @@ export class FriendsService {
     return earthRadiusKm * c * 1000;
   }
 
-  private getUserDisplayName(user: { name?: string | null; username?: string | null }) {
+  private getUserDisplayName(user: {
+    name?: string | null;
+    username?: string | null;
+  }) {
     return user.name || user.username || 'Amico';
   }
 
@@ -80,8 +97,12 @@ export class FriendsService {
     }>;
   }) {
     if (params.openStay?.venue) {
-      const venueLatitude = this.decimalToNumber(params.openStay.venue.latitude);
-      const venueLongitude = this.decimalToNumber(params.openStay.venue.longitude);
+      const venueLatitude = this.decimalToNumber(
+        params.openStay.venue.latitude,
+      );
+      const venueLongitude = this.decimalToNumber(
+        params.openStay.venue.longitude,
+      );
       const radiusMeters = Number(params.openStay.venue.radius_geofence ?? 100);
       const distanceMeters =
         venueLatitude !== null && venueLongitude !== null
@@ -98,7 +119,8 @@ export class FriendsService {
         venue_id: params.openStay.venue.id,
         venue_name: params.openStay.venue.name,
         radius_meters: radiusMeters,
-        distance_meters: distanceMeters === null ? null : Math.round(distanceMeters),
+        distance_meters:
+          distanceMeters === null ? null : Math.round(distanceMeters),
         entered_at: params.openStay.entered_at,
       };
     }
@@ -122,14 +144,20 @@ export class FriendsService {
     if (!nearestVenue) return null;
 
     const radiusMeters = Number(nearestVenue.radius_geofence ?? 100);
-    const maxNearbyDistance = Math.max(radiusMeters * this.nearbyVenueMultiplier, 140);
+    const maxNearbyDistance = Math.max(
+      radiusMeters * this.nearbyVenueMultiplier,
+      140,
+    );
 
     if (nearestDistance > maxNearbyDistance) {
       return null;
     }
 
     return {
-      type: nearestDistance <= radiusMeters ? ('inside' as const) : ('nearby' as const),
+      type:
+        nearestDistance <= radiusMeters
+          ? ('inside' as const)
+          : ('nearby' as const),
       venue_id: nearestVenue.id,
       venue_name: nearestVenue.name,
       radius_meters: radiusMeters,
@@ -210,7 +238,9 @@ export class FriendsService {
     memberIds: string[];
   }) {
     const uniqueMemberIds = Array.from(
-      new Set((params.memberIds ?? []).filter((id) => id && id !== params.ownerId)),
+      new Set(
+        (params.memberIds ?? []).filter((id) => id && id !== params.ownerId),
+      ),
     );
     if (uniqueMemberIds.length === 0) return;
 
@@ -235,7 +265,9 @@ export class FriendsService {
     await Promise.allSettled(
       recipients
         .map((recipient) => ({ id: recipient.id, token: recipient.push_token }))
-        .filter((recipient): recipient is { id: string; token: string } => Boolean(recipient.token))
+        .filter((recipient): recipient is { id: string; token: string } =>
+          Boolean(recipient.token),
+        )
         .map((recipient) =>
           this.sendExpoPush({
             token: recipient.token,
@@ -252,36 +284,44 @@ export class FriendsService {
   }
 
   async searchUsers(query: string, currentUserId: string) {
-    const q = String(query || '').trim().toLowerCase();
+    const q = String(query || '')
+      .trim()
+      .toLowerCase();
     if (!q) return [];
 
-    const [currentUserFriendLinks, candidates] = await this.prisma.$transaction([
-      this.prisma.friendships.findMany({
-        where: { user_id: currentUserId },
-        select: { friend_id: true },
-      }),
-      this.prisma.users.findMany({
-        where: {
-          id: { not: currentUserId },
-          OR: [
-            { username: { contains: q, mode: 'insensitive' } },
-            { name: { contains: q, mode: 'insensitive' } },
-          ],
-        },
-        select: {
-          id: true,
-          username: true,
-          name: true,
-          avatar: true,
-        },
-        take: 20,
-      }),
-    ]);
+    const [currentUserFriendLinks, candidates] = await this.prisma.$transaction(
+      [
+        this.prisma.friendships.findMany({
+          where: { user_id: currentUserId },
+          select: { friend_id: true },
+        }),
+        this.prisma.users.findMany({
+          where: {
+            id: { not: currentUserId },
+            OR: [
+              { username: { contains: q, mode: 'insensitive' } },
+              { name: { contains: q, mode: 'insensitive' } },
+            ],
+          },
+          select: {
+            id: true,
+            username: true,
+            name: true,
+            avatar: true,
+          },
+          take: 20,
+        }),
+      ],
+    );
 
     if (candidates.length === 0) return [];
 
     const currentUserFriendIds = Array.from(
-      new Set(currentUserFriendLinks.map((link) => String(link.friend_id)).filter(Boolean)),
+      new Set(
+        currentUserFriendLinks
+          .map((link) => String(link.friend_id))
+          .filter(Boolean),
+      ),
     );
 
     if (currentUserFriendIds.length === 0) {
@@ -320,7 +360,11 @@ export class FriendsService {
     }
 
     const allMutualIds = Array.from(
-      new Set(candidateMutualLinks.map((link) => String(link.friend_id)).filter(Boolean)),
+      new Set(
+        candidateMutualLinks
+          .map((link) => String(link.friend_id))
+          .filter(Boolean),
+      ),
     );
 
     const mutualProfiles = allMutualIds.length
@@ -336,14 +380,18 @@ export class FriendsService {
         })
       : [];
 
-    const profileById = new Map(mutualProfiles.map((profile) => [profile.id, profile] as const));
+    const profileById = new Map(
+      mutualProfiles.map((profile) => [profile.id, profile] as const),
+    );
 
     return candidates.map((candidate) => {
       const mutualIdsRaw = mutualIdsByCandidate.get(candidate.id) ?? [];
       const mutualIds = Array.from(new Set(mutualIdsRaw));
       const mutualFriendProfiles = mutualIds
         .map((id) => profileById.get(id))
-        .filter((profile): profile is (typeof mutualProfiles)[number] => Boolean(profile));
+        .filter((profile): profile is (typeof mutualProfiles)[number] =>
+          Boolean(profile),
+        );
 
       return {
         ...candidate,
@@ -422,7 +470,9 @@ export class FriendsService {
         radius_geofence: Number(venue.radius_geofence ?? 100),
       }))
       .filter(
-        (venue: any): venue is {
+        (
+          venue: any,
+        ): venue is {
           id: string;
           name: string;
           latitude: number;
@@ -452,7 +502,9 @@ export class FriendsService {
           : null;
         const locationUpdatedAtMs = locationUpdatedAt?.getTime() ?? null;
         const locationAgeMs =
-          locationUpdatedAtMs === null ? null : Math.max(0, now - locationUpdatedAtMs);
+          locationUpdatedAtMs === null
+            ? null
+            : Math.max(0, now - locationUpdatedAtMs);
         const locationLastSeenMinutes =
           locationAgeMs === null ? null : Math.round(locationAgeMs / 60000);
         const isLocationExpired =
@@ -476,7 +528,8 @@ export class FriendsService {
           ? new Date(friend.last_active_at)
           : null;
         const lastActiveMs = lastActiveAt?.getTime() ?? null;
-        const activityAgeMs = lastActiveMs === null ? null : Math.max(0, now - lastActiveMs);
+        const activityAgeMs =
+          lastActiveMs === null ? null : Math.max(0, now - lastActiveMs);
         const lastActiveMinutes =
           activityAgeMs === null ? null : Math.round(activityAgeMs / 60000);
         const isOnline = activityAgeMs !== null && activityAgeMs <= onlineMs;
@@ -497,10 +550,11 @@ export class FriendsService {
               ? 'Attivo ora'
               : null,
           last_active_at: lastActiveAt?.toISOString() ?? null,
-          last_seen_at: (lastActiveAt ?? locationUpdatedAt)?.toISOString() ?? null,
+          last_seen_at:
+            (lastActiveAt ?? locationUpdatedAt)?.toISOString() ?? null,
           last_seen_minutes_ago: isOnline
             ? 0
-            : lastActiveMinutes ?? locationLastSeenMinutes,
+            : (lastActiveMinutes ?? locationLastSeenMinutes),
           sharing_enabled: Boolean(friend.location_sharing_enabled),
           is_stale: locationAgeMs === null ? true : locationAgeMs > staleMs,
         };
@@ -510,8 +564,12 @@ export class FriendsService {
           return left.online ? -1 : 1;
         }
 
-        const leftName = String(left.name || left.username || '').toLocaleLowerCase();
-        const rightName = String(right.name || right.username || '').toLocaleLowerCase();
+        const leftName = String(
+          left.name || left.username || '',
+        ).toLocaleLowerCase();
+        const rightName = String(
+          right.name || right.username || '',
+        ).toLocaleLowerCase();
         return leftName.localeCompare(rightName, 'it');
       });
   }
@@ -569,7 +627,9 @@ export class FriendsService {
       };
     }
 
-    const observedAt = params.timestamp ? new Date(params.timestamp) : new Date();
+    const observedAt = params.timestamp
+      ? new Date(params.timestamp)
+      : new Date();
     if (Number.isNaN(observedAt.getTime())) {
       throw new BadRequestException('timestamp must be ISO8601');
     }
@@ -738,7 +798,8 @@ export class FriendsService {
         ? new Date(friend.last_location_updated_at)
         : null;
       const updatedAtMs = updatedAt?.getTime() ?? null;
-      const ageMs = updatedAtMs === null ? null : Math.max(0, now - updatedAtMs);
+      const ageMs =
+        updatedAtMs === null ? null : Math.max(0, now - updatedAtMs);
       const lastSeenMinutes = ageMs === null ? null : Math.round(ageMs / 60000);
       const isExpired = ageMs !== null && ageMs > hiddenAfterMs;
       const hasShareableLocation =
@@ -757,7 +818,9 @@ export class FriendsService {
         : null;
 
       if (venuePresence) {
-        const existing: VenuePresenceAggregate = friendPresenceMap.get(venuePresence.venue_id) ?? {
+        const existing: VenuePresenceAggregate = friendPresenceMap.get(
+          venuePresence.venue_id,
+        ) ?? {
           venue_id: venuePresence.venue_id,
           venue_name: venuePresence.venue_name,
           friend_count: 0,
@@ -825,7 +888,10 @@ export class FriendsService {
       };
       if (String(event.status).toUpperCase() === 'LIVE') {
         current.active_event_count += 1;
-      } else if (event.date && new Date(event.date).getTime() >= startOfToday.getTime()) {
+      } else if (
+        event.date &&
+        new Date(event.date).getTime() >= startOfToday.getTime()
+      ) {
         current.upcoming_event_count += 1;
       }
       eventCountsByVenueId.set(event.venue_id, current);
@@ -870,8 +936,14 @@ export class FriendsService {
         );
       })
       .sort((a, b) => {
-        const scoreA = a.friend_count * 10 + a.active_event_count * 5 + a.upcoming_event_count;
-        const scoreB = b.friend_count * 10 + b.active_event_count * 5 + b.upcoming_event_count;
+        const scoreA =
+          a.friend_count * 10 +
+          a.active_event_count * 5 +
+          a.upcoming_event_count;
+        const scoreB =
+          b.friend_count * 10 +
+          b.active_event_count * 5 +
+          b.upcoming_event_count;
         return scoreB - scoreA;
       });
 
@@ -883,20 +955,80 @@ export class FriendsService {
     };
   }
 
+  /** Friends with an active (non-cancelled) reservation for today's or an upcoming event, one entry per friend (their soonest event). */
+  async getFriendsTonight(userId: string) {
+    const links = await this.prisma.friendships.findMany({
+      where: { user_id: userId },
+      select: { friend_id: true },
+    });
+    const friendIds = links.map((link) => link.friend_id);
+    if (friendIds.length === 0) return [];
+
+    const today = new Date(new Date().toISOString().slice(0, 10));
+
+    const reservations = await this.prisma.reservations.findMany({
+      where: {
+        user_id: { in: friendIds },
+        status: { not: 'cancelled' },
+        event: { date: { gte: today } },
+      },
+      orderBy: { event: { date: 'asc' } },
+      select: {
+        user_id: true,
+        event: {
+          select: {
+            id: true,
+            name: true,
+            date: true,
+            venue: { select: { id: true, name: true, image: true } },
+          },
+        },
+      },
+    });
+
+    const soonestByUser = new Map<string, (typeof reservations)[number]>();
+    for (const reservation of reservations) {
+      if (!soonestByUser.has(reservation.user_id)) {
+        soonestByUser.set(reservation.user_id, reservation);
+      }
+    }
+    if (soonestByUser.size === 0) return [];
+
+    const friends = await this.prisma.users.findMany({
+      where: { id: { in: Array.from(soonestByUser.keys()) } },
+      select: { id: true, username: true, name: true, avatar: true },
+    });
+
+    return friends.map((friend) => {
+      const reservation = soonestByUser.get(friend.id)!;
+      return {
+        ...friend,
+        event_id: reservation.event.id,
+        event_name: reservation.event.name,
+        venue_id: reservation.event.venue.id,
+        venue_name: reservation.event.venue.name,
+      };
+    });
+  }
+
   async listRequests(userId: string) {
     const [incoming, outgoing] = await this.prisma.$transaction([
       this.prisma.friend_requests.findMany({
         where: { to_user_id: userId, status: 'pending' },
         orderBy: { created_at: 'desc' },
         include: {
-          from_user: { select: { id: true, username: true, name: true, avatar: true } },
+          from_user: {
+            select: { id: true, username: true, name: true, avatar: true },
+          },
         },
       }),
       this.prisma.friend_requests.findMany({
         where: { from_user_id: userId, status: 'pending' },
         orderBy: { created_at: 'desc' },
         include: {
-          to_user: { select: { id: true, username: true, name: true, avatar: true } },
+          to_user: {
+            select: { id: true, username: true, name: true, avatar: true },
+          },
         },
       }),
     ]);
@@ -904,12 +1036,19 @@ export class FriendsService {
     return { incoming, outgoing };
   }
 
-  async sendRequest(params: { from_user_id: string; username?: string; user_id?: string }) {
+  async sendRequest(params: {
+    from_user_id: string;
+    username?: string;
+    user_id?: string;
+  }) {
     const { from_user_id, username, user_id } = params;
 
     let target = null as { id: string } | null;
     if (user_id) {
-      target = await this.prisma.users.findUnique({ where: { id: user_id }, select: { id: true } });
+      target = await this.prisma.users.findUnique({
+        where: { id: user_id },
+        select: { id: true },
+      });
     } else if (username) {
       target = await this.prisma.users.findFirst({
         where: { username: { equals: username, mode: 'insensitive' } },
@@ -918,22 +1057,25 @@ export class FriendsService {
     }
 
     if (!target) throw new NotFoundException('User not found');
-    if (target.id === from_user_id) throw new BadRequestException('Cannot add yourself');
+    if (target.id === from_user_id)
+      throw new BadRequestException('Cannot add yourself');
 
-    const existingFriend = await this.prisma.friendships.findFirst({
-      where: { user_id: from_user_id, friend_id: target.id },
-      select: { id: true },
-    });
+    const [existingFriend, existingRequest] = await Promise.all([
+      this.prisma.friendships.findFirst({
+        where: { user_id: from_user_id, friend_id: target.id },
+        select: { id: true },
+      }),
+      this.prisma.friend_requests.findFirst({
+        where: {
+          from_user_id,
+          to_user_id: target.id,
+        },
+        select: { id: true, status: true },
+      }),
+    ]);
     if (existingFriend) return { alreadyFriends: true };
-
-    const existingRequest = await this.prisma.friend_requests.findFirst({
-      where: {
-        from_user_id,
-        to_user_id: target.id,
-      },
-      select: { id: true, status: true },
-    });
-    if (existingRequest?.status === 'pending') return { alreadyRequested: true };
+    if (existingRequest?.status === 'pending')
+      return { alreadyRequested: true };
     if (existingRequest?.status === 'accepted') return { alreadyFriends: true };
 
     let createdRequest: { id: string };
@@ -968,7 +1110,8 @@ export class FriendsService {
           });
 
           if (!conflicted) throw error;
-          if (conflicted.status === 'pending') return { alreadyRequested: true };
+          if (conflicted.status === 'pending')
+            return { alreadyRequested: true };
           if (conflicted.status === 'accepted') return { alreadyFriends: true };
 
           createdRequest = await this.prisma.friend_requests.update({
@@ -1034,6 +1177,9 @@ export class FriendsService {
       }),
     ]);
 
+    this.evaluateBadges(request.from_user_id);
+    this.evaluateBadges(request.to_user_id);
+
     const [acceptingUser, requesterUser] = await Promise.all([
       this.prisma.users.findUnique({
         where: { id: request.to_user_id },
@@ -1095,28 +1241,33 @@ export class FriendsService {
   async listGroups(userId: string) {
     return this.prisma.friend_groups.findMany({
       where: {
-        OR: [
-          { owner_id: userId },
-          { members: { some: { user_id: userId } } },
-        ],
+        OR: [{ owner_id: userId }, { members: { some: { user_id: userId } } }],
       },
       orderBy: { created_at: 'desc' },
       include: {
         members: {
           include: {
-            user: { select: { id: true, username: true, name: true, avatar: true } },
+            user: {
+              select: { id: true, username: true, name: true, avatar: true },
+            },
           },
         },
       },
     });
   }
 
-  async createGroup(params: { owner_id: string; name: string; member_ids?: string[] }) {
+  async createGroup(params: {
+    owner_id: string;
+    name: string;
+    member_ids?: string[];
+  }) {
     const name = String(params.name || '').trim();
     if (!name) throw new BadRequestException('name required');
 
     const memberIds = Array.from(
-      new Set((params.member_ids ?? []).filter((id) => id && id !== params.owner_id)),
+      new Set(
+        (params.member_ids ?? []).filter((id) => id && id !== params.owner_id),
+      ),
     );
 
     const existingMembers = memberIds.length
@@ -1127,7 +1278,9 @@ export class FriendsService {
       : [];
 
     const existingMemberIds = new Set(existingMembers.map((user) => user.id));
-    const missingMemberIds = memberIds.filter((id) => !existingMemberIds.has(id));
+    const missingMemberIds = memberIds.filter(
+      (id) => !existingMemberIds.has(id),
+    );
     if (missingMemberIds.length > 0) {
       throw new BadRequestException({
         message: 'Some member_ids are invalid',
@@ -1146,7 +1299,9 @@ export class FriendsService {
       include: {
         members: {
           include: {
-            user: { select: { id: true, username: true, name: true, avatar: true } },
+            user: {
+              select: { id: true, username: true, name: true, avatar: true },
+            },
           },
         },
       },
@@ -1162,7 +1317,11 @@ export class FriendsService {
     return group;
   }
 
-  async updateGroup(params: { group_id: string; owner_id: string; name?: string }) {
+  async updateGroup(params: {
+    group_id: string;
+    owner_id: string;
+    name?: string;
+  }) {
     const group = await this.prisma.friend_groups.findUnique({
       where: { id: params.group_id },
     });
@@ -1190,7 +1349,11 @@ export class FriendsService {
     return { success: true };
   }
 
-  async addGroupMember(params: { group_id: string; owner_id: string; user_id: string }) {
+  async addGroupMember(params: {
+    group_id: string;
+    owner_id: string;
+    user_id: string;
+  }) {
     const group = await this.prisma.friend_groups.findUnique({
       where: { id: params.group_id },
     });
@@ -1206,9 +1369,11 @@ export class FriendsService {
       throw new NotFoundException('User not found');
     }
 
-    const existingMembership = await this.prisma.friend_group_members.findFirst({
-      where: { group_id: params.group_id, user_id: params.user_id },
-    });
+    const existingMembership = await this.prisma.friend_group_members.findFirst(
+      {
+        where: { group_id: params.group_id, user_id: params.user_id },
+      },
+    );
     if (existingMembership) {
       return existingMembership;
     }
@@ -1230,7 +1395,11 @@ export class FriendsService {
     return member;
   }
 
-  async removeGroupMember(params: { group_id: string; owner_id: string; user_id: string }) {
+  async removeGroupMember(params: {
+    group_id: string;
+    owner_id: string;
+    user_id: string;
+  }) {
     const group = await this.prisma.friend_groups.findUnique({
       where: { id: params.group_id },
     });
@@ -1268,7 +1437,9 @@ export class FriendsService {
     return { group, isOwner, isMember };
   }
 
-  private toProposalStatus(votes: Array<{ vote: 'yes' | 'no' | 'pending' }>): 'voting' | 'ready' {
+  private toProposalStatus(
+    votes: Array<{ vote: 'yes' | 'no' | 'pending' }>,
+  ): 'voting' | 'ready' {
     const pending = votes.some((vote) => vote.vote === 'pending');
     const yesCount = votes.filter((vote) => vote.vote === 'yes').length;
     if (!pending && yesCount > 0) return 'ready';
@@ -1276,9 +1447,13 @@ export class FriendsService {
   }
 
   private formatProposal(proposal: any) {
-    const yes = proposal.votes.filter((vote: any) => vote.vote === 'yes').length;
+    const yes = proposal.votes.filter(
+      (vote: any) => vote.vote === 'yes',
+    ).length;
     const no = proposal.votes.filter((vote: any) => vote.vote === 'no').length;
-    const pending = proposal.votes.filter((vote: any) => vote.vote === 'pending').length;
+    const pending = proposal.votes.filter(
+      (vote: any) => vote.vote === 'pending',
+    ).length;
 
     return {
       id: proposal.id,
@@ -1301,7 +1476,13 @@ export class FriendsService {
     const live = await this.prisma.events.findFirst({
       where: { venue_id: venueId, status: 'LIVE' },
       orderBy: [{ date: 'desc' }, { created_at: 'desc' }],
-      select: { id: true, venue_id: true, name: true, date: true, status: true },
+      select: {
+        id: true,
+        venue_id: true,
+        name: true,
+        date: true,
+        status: true,
+      },
     });
     if (live) return live;
 
@@ -1314,12 +1495,20 @@ export class FriendsService {
         date: { gte: today },
       },
       orderBy: [{ date: 'asc' }, { start_time: 'asc' }, { created_at: 'asc' }],
-      select: { id: true, venue_id: true, name: true, date: true, status: true },
+      select: {
+        id: true,
+        venue_id: true,
+        name: true,
+        date: true,
+        status: true,
+      },
     });
 
     if (next) return next;
 
-    throw new BadRequestException('Nessun evento prenotabile trovato per questo locale');
+    throw new BadRequestException(
+      'Nessun evento prenotabile trovato per questo locale',
+    );
   }
 
   async listGroupTableProposals(groupId: string, userId: string) {
@@ -1330,13 +1519,30 @@ export class FriendsService {
       where: { group_id: groupId },
       orderBy: { created_at: 'desc' },
       include: {
-        created_by_user: { select: { id: true, username: true, name: true, avatar: true } },
-        event: { select: { id: true, name: true, date: true, start_time: true, end_time: true, status: true } },
-        venue: { select: { id: true, name: true, city: true } },
-        booked_reservation: { select: { id: true, status: true, guests: true, created_at: true } },
+        created_by_user: {
+          select: { id: true, username: true, name: true, avatar: true },
+        },
+        event: {
+          select: {
+            id: true,
+            name: true,
+            date: true,
+            start_time: true,
+            end_time: true,
+            status: true,
+          },
+        },
+        venue: { select: { id: true, name: true, city: true, image: true } },
+        booked_reservation: {
+          select: { id: true, status: true, guests: true, created_at: true },
+        },
         votes: {
           orderBy: { created_at: 'asc' },
-          include: { user: { select: { id: true, username: true, name: true, avatar: true } } },
+          include: {
+            user: {
+              select: { id: true, username: true, name: true, avatar: true },
+            },
+          },
         },
       },
     });
@@ -1357,18 +1563,29 @@ export class FriendsService {
       throw new BadRequestException('guests must be an integer >= 2');
     }
 
-    const { group } = await this.getGroupWithAccess(params.group_id, params.user_id);
+    const { group } = await this.getGroupWithAccess(
+      params.group_id,
+      params.user_id,
+    );
     const venue = await this.prisma.venues.findUnique({
       where: { id: params.venue_id },
       select: { id: true, name: true },
     });
     if (!venue) throw new NotFoundException('Venue not found');
 
-    let event: Awaited<ReturnType<FriendsService['resolveBookableEventForVenue']>>;
+    let event: Awaited<
+      ReturnType<FriendsService['resolveBookableEventForVenue']>
+    >;
     if (params.event_id) {
       const found = await (this.prisma as any).events.findUnique({
         where: { id: params.event_id },
-        select: { id: true, venue_id: true, name: true, date: true, status: true },
+        select: {
+          id: true,
+          venue_id: true,
+          name: true,
+          date: true,
+          status: true,
+        },
       });
       if (!found || found.venue_id !== params.venue_id) {
         throw new BadRequestException('Evento non valido per questo locale');
@@ -1377,7 +1594,12 @@ export class FriendsService {
     } else {
       event = await this.resolveBookableEventForVenue(params.venue_id);
     }
-    const voterIds = Array.from(new Set([group.owner_id, ...group.members.map((member) => member.user_id)]));
+    const voterIds = Array.from(
+      new Set([
+        group.owner_id,
+        ...group.members.map((member) => member.user_id),
+      ]),
+    );
 
     const proposal = await this.prisma.$transaction(async (tx) => {
       const created = await (tx as any).group_table_proposals.create({
@@ -1400,16 +1622,35 @@ export class FriendsService {
         })),
       });
 
-      const createdWithVotes = await (tx as any).group_table_proposals.findUnique({
+      const createdWithVotes = await (
+        tx as any
+      ).group_table_proposals.findUnique({
         where: { id: created.id },
         include: {
-          created_by_user: { select: { id: true, username: true, name: true, avatar: true } },
-          event: { select: { id: true, name: true, date: true, start_time: true, end_time: true, status: true } },
-          venue: { select: { id: true, name: true, city: true } },
-          booked_reservation: { select: { id: true, status: true, guests: true, created_at: true } },
+          created_by_user: {
+            select: { id: true, username: true, name: true, avatar: true },
+          },
+          event: {
+            select: {
+              id: true,
+              name: true,
+              date: true,
+              start_time: true,
+              end_time: true,
+              status: true,
+            },
+          },
+          venue: { select: { id: true, name: true, city: true, image: true } },
+          booked_reservation: {
+            select: { id: true, status: true, guests: true, created_at: true },
+          },
           votes: {
             orderBy: { created_at: 'asc' },
-            include: { user: { select: { id: true, username: true, name: true, avatar: true } } },
+            include: {
+              user: {
+                select: { id: true, username: true, name: true, avatar: true },
+              },
+            },
           },
         },
       });
@@ -1447,12 +1688,20 @@ export class FriendsService {
       throw new BadRequestException('Proposal is closed');
     }
 
-    const existingVote = proposal.votes.find((vote) => vote.user_id === params.user_id);
-    if (!existingVote) throw new ForbiddenException('User cannot vote on this proposal');
+    const existingVote = proposal.votes.find(
+      (vote) => vote.user_id === params.user_id,
+    );
+    if (!existingVote)
+      throw new ForbiddenException('User cannot vote on this proposal');
 
     const updated = await this.prisma.$transaction(async (tx) => {
       await (tx as any).group_table_proposal_votes.update({
-        where: { proposal_id_user_id: { proposal_id: params.proposal_id, user_id: params.user_id } },
+        where: {
+          proposal_id_user_id: {
+            proposal_id: params.proposal_id,
+            user_id: params.user_id,
+          },
+        },
         data: { vote: params.vote },
       });
 
@@ -1470,13 +1719,30 @@ export class FriendsService {
       return (tx as any).group_table_proposals.findUnique({
         where: { id: params.proposal_id },
         include: {
-          created_by_user: { select: { id: true, username: true, name: true, avatar: true } },
-          event: { select: { id: true, name: true, date: true, start_time: true, end_time: true, status: true } },
-          venue: { select: { id: true, name: true, city: true } },
-          booked_reservation: { select: { id: true, status: true, guests: true, created_at: true } },
+          created_by_user: {
+            select: { id: true, username: true, name: true, avatar: true },
+          },
+          event: {
+            select: {
+              id: true,
+              name: true,
+              date: true,
+              start_time: true,
+              end_time: true,
+              status: true,
+            },
+          },
+          venue: { select: { id: true, name: true, city: true, image: true } },
+          booked_reservation: {
+            select: { id: true, status: true, guests: true, created_at: true },
+          },
           votes: {
             orderBy: { created_at: 'asc' },
-            include: { user: { select: { id: true, username: true, name: true, avatar: true } } },
+            include: {
+              user: {
+                select: { id: true, username: true, name: true, avatar: true },
+              },
+            },
           },
         },
       });
@@ -1492,7 +1758,10 @@ export class FriendsService {
     user_id: string;
     table_name?: string;
   }) {
-    const { group, isOwner } = await this.getGroupWithAccess(params.group_id, params.user_id);
+    const { group, isOwner } = await this.getGroupWithAccess(
+      params.group_id,
+      params.user_id,
+    );
 
     const prismaAny = this.prisma as any;
     const proposal = await prismaAny.group_table_proposals.findUnique({
@@ -1508,26 +1777,36 @@ export class FriendsService {
     }
 
     if (proposal.created_by_user_id !== params.user_id && !isOwner) {
-      throw new ForbiddenException('Only proposal creator or group owner can book');
+      throw new ForbiddenException(
+        'Only proposal creator or group owner can book',
+      );
     }
 
     if (proposal.status === 'booked' && proposal.booked_reservation_id) {
-      const existingReservation = await this.reservationsService.getReservation(proposal.booked_reservation_id);
-      return { reservation: existingReservation, proposal_id: proposal.id, already_booked: true };
+      const existingReservation = await this.reservationsService.getReservation(
+        proposal.booked_reservation_id,
+      );
+      return {
+        reservation: existingReservation,
+        proposal_id: proposal.id,
+        already_booked: true,
+      };
     }
 
-    const yesVotes = proposal.votes.filter((vote: any) => vote.vote === 'yes').length;
+    const yesVotes = proposal.votes.filter(
+      (vote: any) => vote.vote === 'yes',
+    ).length;
     if (yesVotes < 1) {
       throw new BadRequestException('Not enough yes votes to book');
     }
 
-    const fallbackTable = await this.prisma.venue_tables.findFirst({
-      where: { venue_id: proposal.event.venue_id },
-      orderBy: [{ zona: 'asc' }, { nome: 'asc' }],
+    const fallbackZone = await this.prisma.venue_table_zones.findFirst({
+      where: { venue_id: proposal.event.venue_id, is_active: true },
+      orderBy: [{ sort_order: 'asc' }, { name: 'asc' }],
       select: { id: true },
     });
-    if (!fallbackTable) {
-      throw new BadRequestException('Nessun tavolo/zona disponibile per il locale');
+    if (!fallbackZone) {
+      throw new BadRequestException('Nessuna zona disponibile per il locale');
     }
 
     const reservation = await this.reservationsService.createReservation({
@@ -1535,8 +1814,7 @@ export class FriendsService {
       event_id: proposal.event_id,
       type: 'table',
       guests: yesVotes,
-      venue_zone_id: fallbackTable.id,
-      venue_table_id: fallbackTable.id,
+      venue_zone_id: fallbackZone.id,
       status: 'pending',
       table_name: params.table_name?.trim() || `Gruppo ${group.name}`,
     });
@@ -1561,19 +1839,39 @@ export class FriendsService {
     proposal_id: string;
     user_id: string;
   }) {
-    const { isOwner } = await this.getGroupWithAccess(params.group_id, params.user_id);
+    const { isOwner } = await this.getGroupWithAccess(
+      params.group_id,
+      params.user_id,
+    );
 
     const prismaAny = this.prisma as any;
     const proposal = await prismaAny.group_table_proposals.findUnique({
       where: { id: params.proposal_id },
       include: {
-        created_by_user: { select: { id: true, username: true, name: true, avatar: true } },
-        event: { select: { id: true, name: true, date: true, start_time: true, end_time: true, status: true } },
-        venue: { select: { id: true, name: true, city: true } },
-        booked_reservation: { select: { id: true, status: true, guests: true, created_at: true } },
+        created_by_user: {
+          select: { id: true, username: true, name: true, avatar: true },
+        },
+        event: {
+          select: {
+            id: true,
+            name: true,
+            date: true,
+            start_time: true,
+            end_time: true,
+            status: true,
+          },
+        },
+        venue: { select: { id: true, name: true, city: true, image: true } },
+        booked_reservation: {
+          select: { id: true, status: true, guests: true, created_at: true },
+        },
         votes: {
           orderBy: { created_at: 'asc' },
-          include: { user: { select: { id: true, username: true, name: true, avatar: true } } },
+          include: {
+            user: {
+              select: { id: true, username: true, name: true, avatar: true },
+            },
+          },
         },
       },
     });
@@ -1583,7 +1881,9 @@ export class FriendsService {
     }
 
     if (proposal.created_by_user_id !== params.user_id && !isOwner) {
-      throw new ForbiddenException('Only proposal creator or group owner can cancel');
+      throw new ForbiddenException(
+        'Only proposal creator or group owner can cancel',
+      );
     }
 
     if (proposal.status === 'booked') {
@@ -1598,13 +1898,30 @@ export class FriendsService {
       where: { id: params.proposal_id },
       data: { status: 'cancelled' },
       include: {
-        created_by_user: { select: { id: true, username: true, name: true, avatar: true } },
-        event: { select: { id: true, name: true, date: true, start_time: true, end_time: true, status: true } },
-        venue: { select: { id: true, name: true, city: true } },
-        booked_reservation: { select: { id: true, status: true, guests: true, created_at: true } },
+        created_by_user: {
+          select: { id: true, username: true, name: true, avatar: true },
+        },
+        event: {
+          select: {
+            id: true,
+            name: true,
+            date: true,
+            start_time: true,
+            end_time: true,
+            status: true,
+          },
+        },
+        venue: { select: { id: true, name: true, city: true, image: true } },
+        booked_reservation: {
+          select: { id: true, status: true, guests: true, created_at: true },
+        },
         votes: {
           orderBy: { created_at: 'asc' },
-          include: { user: { select: { id: true, username: true, name: true, avatar: true } } },
+          include: {
+            user: {
+              select: { id: true, username: true, name: true, avatar: true },
+            },
+          },
         },
       },
     });

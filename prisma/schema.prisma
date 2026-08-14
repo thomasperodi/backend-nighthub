@@ -6,8 +6,8 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
 }
 
@@ -27,10 +27,23 @@ enum VenuePrRole {
   pr
 }
 
+enum VenuePrMembershipPassStatus {
+  active
+  revoked
+  expired
+}
+
 enum EventStatus {
   DRAFT
   LIVE
   CLOSED
+  CANCELLED
+}
+
+// Who last turned events.is_featured on - see the field's doc comment on `model events`.
+enum EventFeaturedSource {
+  manual
+  auto
 }
 
 enum EventAccessMode {
@@ -95,6 +108,27 @@ enum AgeBucket {
   UNKNOWN
 }
 
+enum BadgeCategory {
+  NIGHTLIFE
+  EXPLORATION
+  SOCIAL
+  SQUAD
+  TABLES_VIP
+  STREAK
+  NIGHT_CHALLENGES
+  SPECIAL_EVENTS
+  MILESTONE
+  SECRET
+}
+
+enum BadgeRarity {
+  COMMON
+  RARE
+  EPIC
+  LEGENDARY
+  EXCLUSIVE
+}
+
 enum FriendRequestStatus {
   pending
   accepted
@@ -119,6 +153,15 @@ enum VenueStationType {
   cloakroom
   bar
   table
+}
+
+enum VenueTableBookingPolicy {
+  exclusive
+  shared
+}
+
+enum VenueFloorLandmarkType {
+  dj_console
 }
 
 enum PresenceEventType {
@@ -160,48 +203,55 @@ model users {
   password_hash String
   role          UserRole
 
-  name          String?
-  phone         String?
-  avatar        String?
-  push_token    String?
-  push_token_updated_at DateTime?
-  location_sharing_enabled Boolean @default(false)
-  last_latitude Decimal? @db.Decimal(9,6)
-  last_longitude Decimal? @db.Decimal(9,6)
+  name                          String?
+  phone                         String?
+  avatar                        String?
+  is_active                     Boolean   @default(true)
+  push_token                    String?
+  push_token_updated_at         DateTime?
+  location_sharing_enabled      Boolean   @default(false)
+  last_latitude                 Decimal?  @db.Decimal(9, 6)
+  last_longitude                Decimal?  @db.Decimal(9, 6)
   last_location_accuracy_meters Int?
-  last_location_updated_at DateTime?
-  last_active_at DateTime?
+  last_location_updated_at      DateTime?
+  last_active_at                DateTime?
 
-  sesso         Gender?
-  birth_date    DateTime?
+  sesso      Gender?
+  birth_date DateTime?
 
-  created_at    DateTime @default(now())
-  updated_at    DateTime @updatedAt
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
 
-  venue_id      String?  @db.Uuid
-  venue         venues?  @relation(fields: [venue_id], references: [id])
+  venue_id String? @db.Uuid
+  venue    venues? @relation(fields: [venue_id], references: [id])
 
   // 🔥 QUESTI DUE DEVONO ESISTERE ENTRAMBI
-  entries        entries[] @relation("UserEntries")
-  staff_entries  entries[] @relation("StaffEntries")
-  pr_memberships venue_pr_memberships[] @relation("VenuePrMembershipUser")
-  created_pr_memberships venue_pr_memberships[] @relation("VenuePrMembershipCreator")
+  entries                  entries[]                        @relation("UserEntries")
+  staff_entries            entries[]                        @relation("StaffEntries")
+  pr_memberships           venue_pr_memberships[]           @relation("VenuePrMembershipUser")
+  created_pr_memberships   venue_pr_memberships[]           @relation("VenuePrMembershipCreator")
+  pr_membership_passes     venue_pr_membership_passes[]     @relation("VenuePrMembershipPassUser")
+  pr_membership_pass_scans venue_pr_membership_pass_scans[] @relation("VenuePrMembershipPassScanStaff")
 
-  reservations  reservations[]
-  ticket_orders ticket_orders[]
-  user_promos   user_promos[]
-  venue_stays   venue_stays[]
+  reservations            reservations[]
+  ticket_orders           ticket_orders[]
+  user_promos             user_promos[]
+  venue_stays             venue_stays[]
   requested_bottle_orders table_bottle_orders[] @relation("BottleOrderRequestedBy")
   prepared_bottle_orders  table_bottle_orders[] @relation("BottleOrderPreparedBy")
   delivered_bottle_orders table_bottle_orders[] @relation("BottleOrderDeliveredBy")
 
-  sent_friend_requests     friend_requests[] @relation("FriendRequestsSent")
-  received_friend_requests friend_requests[] @relation("FriendRequestsReceived")
-  friendships              friendships[]     @relation("UserFriendships")
-  friend_groups            friend_groups[]
-  group_memberships        friend_group_members[]
-  created_group_table_proposals group_table_proposals[] @relation("GroupTableProposalCreator")
+  sent_friend_requests          friend_requests[]            @relation("FriendRequestsSent")
+  received_friend_requests      friend_requests[]            @relation("FriendRequestsReceived")
+  friendships                   friendships[]                @relation("UserFriendships")
+  friend_groups                 friend_groups[]
+  group_memberships             friend_group_members[]
+  created_group_table_proposals group_table_proposals[]      @relation("GroupTableProposalCreator")
   group_table_proposal_votes    group_table_proposal_votes[]
+  user_badges                   user_badges[]
+  refresh_tokens                refresh_tokens[]
+  filed_content_reports         content_reports[]            @relation("ContentReportReporter")
+  content_reports_received      content_reports[]            @relation("ContentReportReported")
 
   @@index([venue_id])
   @@index([username])
@@ -209,69 +259,134 @@ model users {
   @@index([last_active_at])
 }
 
+// Refresh-token session store backing the access/refresh auth flow (AuthService).
+// One row per issued refresh token; `family_id` links every token produced by rotating
+// the same original login (a "session"), which is what lets reuse-detection revoke the
+// whole chain at once instead of a single token. Only a SHA-256 hash of the opaque token
+// is ever stored - the raw value only ever exists in the HttpOnly cookie and in-flight.
+model refresh_tokens {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id     String    @db.Uuid
+  user        users     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  token_hash  String    @unique
+  family_id   String    @db.Uuid
+  replaced_by String?   @unique @db.Uuid
+  expires_at  DateTime
+  revoked_at  DateTime?
+  created_at  DateTime  @default(now())
+  user_agent  String?
+  ip          String?
 
+  @@index([user_id, revoked_at])
+  @@index([family_id])
+}
+
+// Marks a legacy (non-Supabase) password-reset JWT as consumed. The reset token itself
+// stays a short-lived stateless JWT (see AuthService.requestPasswordReset); this table only
+// records that a given token's `jti` has already been redeemed, so a second attempt with
+// the same link/token inside its validity window is rejected instead of silently working.
+model used_password_reset_tokens {
+  jti        String   @id
+  used_at    DateTime @default(now())
+  expires_at DateTime
+}
 
 // ===============================
 // VENUES (LOCALI)
 // ===============================
 model venues {
-  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  name        String
-  city        String?
-  address     String?
-  description String?
-  image       String?
-  latitude    Decimal? @db.Decimal(9,6)
-  longitude   Decimal? @db.Decimal(9,6)
-  radius_geofence Int    @default(100)
-  stripe_account_id String? @unique
-  cloakroom_unit_price Decimal @default(3) @db.Decimal(10,2)
-  bar_price_list Json?
-  bottle_price_list Json?
-  stripe_charges_enabled Boolean @default(false)
-  stripe_payouts_enabled Boolean @default(false)
+  id                             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                           String
+  city                           String?
+  address                        String?
+  description                    String?
+  image                          String?
+  latitude                       Decimal?  @db.Decimal(9, 6)
+  longitude                      Decimal?  @db.Decimal(9, 6)
+  radius_geofence                Int       @default(100)
+  stripe_account_id              String?   @unique
+  cloakroom_unit_price           Decimal   @default(3) @db.Decimal(10, 2)
+  bar_price_list                 Json?
+  bottle_price_list              Json?
+  stripe_charges_enabled         Boolean   @default(false)
+  stripe_payouts_enabled         Boolean   @default(false)
   stripe_onboarding_completed_at DateTime?
-  contract_start_at DateTime?
-  contract_end_at DateTime?
-  contract_status String?
-  contract_monthly_fee Decimal? @db.Decimal(10,2)
-  contract_auto_renew Boolean @default(false)
-  contract_notes String?
-  created_at  DateTime @default(now())
-  updated_at  DateTime @updatedAt
+  contract_start_at              DateTime?
+  contract_end_at                DateTime?
+  contract_status                String?
+  contract_monthly_fee           Decimal?  @db.Decimal(10, 2)
+  contract_auto_renew            Boolean   @default(false)
+  contract_notes                 String?
+  plan_id                        String?   @db.Uuid
+  plan_custom_terms              Json?
+  created_at                     DateTime  @default(now())
+  updated_at                     DateTime  @updatedAt
 
-  events      events[]
-  tables      venue_tables[]
-  promos      promos[]
-  users       users[]
-  pr_memberships venue_pr_memberships[]
-  pr_event_assignments venue_pr_event_assignments[]
-  pr_qr_scans venue_pr_qr_scans[]
-  venue_stays venue_stays[]
-  stations    venue_stations[]
-  group_table_proposals group_table_proposals[]
+  events                   events[]
+  tables                   venue_tables[]
+  promos                   promos[]
+  users                    users[]
+  pr_memberships           venue_pr_memberships[]
+  pr_event_assignments     venue_pr_event_assignments[]
+  pr_qr_scans              venue_pr_qr_scans[]
+  pr_membership_passes     venue_pr_membership_passes[]
+  pr_membership_pass_scans venue_pr_membership_pass_scans[]
+  venue_stays              venue_stays[]
+  stations                 venue_stations[]
+  table_zones              venue_table_zones[]
+  floor_plan               venue_floor_plans?
+  group_table_proposals    group_table_proposals[]
+  plan                     subscription_plans?              @relation(fields: [plan_id], references: [id], onDelete: SetNull)
+
+  @@index([plan_id])
+}
+
+// NightHub listino: catalog of subscription plans sold to venues (Essential/Pulse/Peak/Elite).
+// `monthly_price`/`included_events`/`included_people` null = custom, negotiated per venue
+// (Elite) - `is_custom` flags that case for the UI instead of inferring it from nulls.
+model subscription_plans {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key                String   @unique
+  name               String
+  tagline            String?
+  icon               String?
+  monthly_price      Decimal? @db.Decimal(10, 2)
+  included_events    Int?
+  included_people    Int?
+  extra_event_price  Decimal? @db.Decimal(10, 2)
+  extra_person_price Decimal? @db.Decimal(10, 4)
+  is_custom          Boolean  @default(false)
+  is_recommended     Boolean  @default(false)
+  is_active          Boolean  @default(true)
+  sort_order         Int      @default(0)
+  created_at         DateTime @default(now())
+  updated_at         DateTime @updatedAt
+
+  venues venues[]
 }
 
 model venue_pr_memberships {
-  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  venue_id             String   @db.Uuid
-  user_id              String   @db.Uuid
+  id                   String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id             String      @db.Uuid
+  user_id              String      @db.Uuid
   role                 VenuePrRole
-  parent_membership_id String?  @db.Uuid
+  parent_membership_id String?     @db.Uuid
   ref_code             String
-  is_active            Boolean  @default(true)
-  created_by_user_id   String?  @db.Uuid
-  created_at           DateTime @default(now())
-  updated_at           DateTime @updatedAt
+  is_active            Boolean     @default(true)
+  created_by_user_id   String?     @db.Uuid
+  created_at           DateTime    @default(now())
+  updated_at           DateTime    @updatedAt
 
-  venue               venues                @relation(fields: [venue_id], references: [id], onDelete: Cascade)
-  user                users                 @relation("VenuePrMembershipUser", fields: [user_id], references: [id], onDelete: Cascade)
-  parent_membership   venue_pr_memberships? @relation("VenuePrMembershipHierarchy", fields: [parent_membership_id], references: [id], onDelete: SetNull)
-  child_memberships   venue_pr_memberships[] @relation("VenuePrMembershipHierarchy")
-  created_by_user     users?                @relation("VenuePrMembershipCreator", fields: [created_by_user_id], references: [id], onDelete: SetNull)
-  event_assignments   venue_pr_event_assignments[]
-  qr_scans            venue_pr_qr_scans[]
-  tracked_entries     entries[]             @relation("PrMembershipEntries")
+  venue             venues                           @relation(fields: [venue_id], references: [id], onDelete: Cascade)
+  user              users                            @relation("VenuePrMembershipUser", fields: [user_id], references: [id], onDelete: Cascade)
+  parent_membership venue_pr_memberships?            @relation("VenuePrMembershipHierarchy", fields: [parent_membership_id], references: [id], onDelete: SetNull)
+  child_memberships venue_pr_memberships[]           @relation("VenuePrMembershipHierarchy")
+  created_by_user   users?                           @relation("VenuePrMembershipCreator", fields: [created_by_user_id], references: [id], onDelete: SetNull)
+  event_assignments venue_pr_event_assignments[]
+  qr_scans          venue_pr_qr_scans[]
+  tracked_entries   entries[]                        @relation("PrMembershipEntries")
+  season_pass       venue_pr_membership_passes?
+  season_pass_scans venue_pr_membership_pass_scans[]
 
   @@unique([venue_id, user_id])
   @@unique([venue_id, ref_code])
@@ -299,19 +414,19 @@ model venue_pr_event_assignments {
 }
 
 model venue_pr_qr_scans {
-  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  venue_id           String   @db.Uuid
-  event_id           String   @db.Uuid
-  pr_membership_id   String   @db.Uuid
-  scanned_by_user_id String?  @db.Uuid
-  guest_user_id      String?  @db.Uuid
+  id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id           String    @db.Uuid
+  event_id           String    @db.Uuid
+  pr_membership_id   String    @db.Uuid
+  scanned_by_user_id String?   @db.Uuid
+  guest_user_id      String?   @db.Uuid
   referral_code      String
-  scanned_at         DateTime @default(now())
-  entry_id           String?  @db.Uuid
+  scanned_at         DateTime  @default(now())
+  entry_id           String?   @db.Uuid
   entered_at         DateTime?
   metadata           Json?
-  created_at         DateTime @default(now())
-  updated_at         DateTime @updatedAt
+  created_at         DateTime  @default(now())
+  updated_at         DateTime  @updatedAt
 
   venue         venues               @relation(fields: [venue_id], references: [id], onDelete: Cascade)
   event         events               @relation(fields: [event_id], references: [id], onDelete: Cascade)
@@ -321,6 +436,60 @@ model venue_pr_qr_scans {
   @@index([pr_membership_id, scanned_at])
   @@index([entry_id])
   @@index([guest_user_id, scanned_at])
+}
+
+model venue_pr_membership_passes {
+  id                    String                      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id              String                      @db.Uuid
+  pr_membership_id      String                      @unique @db.Uuid
+  user_id               String                      @db.Uuid
+  status                VenuePrMembershipPassStatus @default(active)
+  valid_from            DateTime                    @default(now())
+  valid_until           DateTime
+  qr_token              String                      @unique
+  serial_number         String                      @unique
+  wallet_apple_url      String?
+  wallet_google_url     String?
+  wallet_last_issued_at DateTime?
+  revoked_at            DateTime?
+  metadata              Json?
+  created_at            DateTime                    @default(now())
+  updated_at            DateTime                    @updatedAt
+
+  venue         venues                           @relation(fields: [venue_id], references: [id], onDelete: Cascade)
+  pr_membership venue_pr_memberships             @relation(fields: [pr_membership_id], references: [id], onDelete: Cascade)
+  user          users                            @relation("VenuePrMembershipPassUser", fields: [user_id], references: [id], onDelete: Cascade)
+  scans         venue_pr_membership_pass_scans[]
+
+  @@index([venue_id, status])
+  @@index([user_id, status])
+  @@index([valid_until])
+}
+
+model venue_pr_membership_pass_scans {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  pass_id            String   @db.Uuid
+  venue_id           String   @db.Uuid
+  event_id           String?  @db.Uuid
+  pr_membership_id   String   @db.Uuid
+  scanned_by_user_id String?  @db.Uuid
+  entry_id           String?  @db.Uuid
+  scan_result        String   @default("accepted")
+  reason             String?
+  qr_payload         String?
+  scanned_at         DateTime @default(now())
+  created_at         DateTime @default(now())
+
+  pass            venue_pr_membership_passes @relation(fields: [pass_id], references: [id], onDelete: Cascade)
+  venue           venues                     @relation(fields: [venue_id], references: [id], onDelete: Cascade)
+  event           events?                    @relation(fields: [event_id], references: [id], onDelete: SetNull)
+  pr_membership   venue_pr_memberships       @relation(fields: [pr_membership_id], references: [id], onDelete: Cascade)
+  scanned_by_user users?                     @relation("VenuePrMembershipPassScanStaff", fields: [scanned_by_user_id], references: [id], onDelete: SetNull)
+
+  @@index([pass_id, scanned_at])
+  @@index([venue_id, event_id, scanned_at])
+  @@index([pr_membership_id, scanned_at])
+  @@index([scan_result, scanned_at])
 }
 
 model venue_stations {
@@ -333,26 +502,93 @@ model venue_stations {
   created_at   DateTime         @default(now())
   updated_at   DateTime         @updatedAt
 
-  venue        venues           @relation(fields: [venue_id], references: [id])
+  venue venues @relation(fields: [venue_id], references: [id])
 
   @@unique([venue_id, name])
   @@index([venue_id, station_type, is_active])
   @@index([venue_id, sort_order])
 }
 
+model venue_table_zones {
+  id             String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id       String                  @db.Uuid
+  name           String
+  color          String?
+  per_testa      Decimal?                @db.Decimal(10, 2)
+  costo_minimo   Decimal?                @db.Decimal(10, 2)
+  persone_max    Int?
+  booking_policy VenueTableBookingPolicy @default(exclusive)
+  sort_order     Int                     @default(0)
+  floor_x        Decimal?                @db.Decimal(10, 2)
+  floor_y        Decimal?                @db.Decimal(10, 2)
+  floor_w        Decimal?                @db.Decimal(10, 2)
+  floor_h        Decimal?                @db.Decimal(10, 2)
+  is_active      Boolean                 @default(true)
+  created_at     DateTime                @default(now())
+  updated_at     DateTime                @updatedAt
+
+  venue        venues         @relation(fields: [venue_id], references: [id], onDelete: Cascade)
+  tables       venue_tables[]
+  reservations reservations[]
+  event_tables event_tables[]
+
+  @@unique([venue_id, name])
+  @@index([venue_id, sort_order])
+  @@index([venue_id, is_active])
+}
+
+model venue_floor_plans {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id         String   @unique @db.Uuid
+  background_image String?
+  canvas_width     Decimal  @default(1000) @db.Decimal(10, 2)
+  canvas_height    Decimal  @default(700) @db.Decimal(10, 2)
+  grid_size        Decimal  @default(24) @db.Decimal(10, 2)
+  show_grid        Boolean  @default(true)
+  created_at       DateTime @default(now())
+  updated_at       DateTime @updatedAt
+
+  venue     venues                  @relation(fields: [venue_id], references: [id], onDelete: Cascade)
+  landmarks venue_floor_landmarks[]
+
+  @@index([venue_id])
+}
+
+model venue_floor_landmarks {
+  id            String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  floor_plan_id String                 @db.Uuid
+  type          VenueFloorLandmarkType @default(dj_console)
+  label         String?
+  x             Decimal                @default(0) @db.Decimal(10, 2)
+  y             Decimal                @default(0) @db.Decimal(10, 2)
+  width         Decimal                @default(120) @db.Decimal(10, 2)
+  height        Decimal                @default(48) @db.Decimal(10, 2)
+  rotation      Decimal                @default(0) @db.Decimal(10, 2)
+  color         String?
+  metadata      Json?
+  sort_order    Int                    @default(0)
+  created_at    DateTime               @default(now())
+  updated_at    DateTime               @updatedAt
+
+  floor_plan venue_floor_plans @relation(fields: [floor_plan_id], references: [id], onDelete: Cascade)
+
+  @@index([floor_plan_id, sort_order])
+  @@index([floor_plan_id, type])
+}
+
 // ===============================
 // FRIEND REQUESTS
 // ===============================
 model friend_requests {
-  id           String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  from_user_id String               @db.Uuid
-  to_user_id   String               @db.Uuid
-  status       FriendRequestStatus  @default(pending)
-  created_at   DateTime             @default(now())
-  updated_at   DateTime             @updatedAt
+  id           String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  from_user_id String              @db.Uuid
+  to_user_id   String              @db.Uuid
+  status       FriendRequestStatus @default(pending)
+  created_at   DateTime            @default(now())
+  updated_at   DateTime            @updatedAt
 
-  from_user    users @relation("FriendRequestsSent", fields: [from_user_id], references: [id])
-  to_user      users @relation("FriendRequestsReceived", fields: [to_user_id], references: [id])
+  from_user users @relation("FriendRequestsSent", fields: [from_user_id], references: [id])
+  to_user   users @relation("FriendRequestsReceived", fields: [to_user_id], references: [id])
 
   @@unique([from_user_id, to_user_id])
   @@index([to_user_id, status])
@@ -368,7 +604,7 @@ model friendships {
   friend_id  String   @db.Uuid
   created_at DateTime @default(now())
 
-  user       users @relation("UserFriendships", fields: [user_id], references: [id])
+  user users @relation("UserFriendships", fields: [user_id], references: [id])
 
   @@unique([user_id, friend_id])
   @@index([friend_id])
@@ -384,8 +620,8 @@ model friend_groups {
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
 
-  owner      users @relation(fields: [owner_id], references: [id])
-  members    friend_group_members[]
+  owner           users                   @relation(fields: [owner_id], references: [id])
+  members         friend_group_members[]
   table_proposals group_table_proposals[]
 
   @@index([owner_id])
@@ -397,32 +633,32 @@ model friend_group_members {
   user_id    String   @db.Uuid
   created_at DateTime @default(now())
 
-  group      friend_groups @relation(fields: [group_id], references: [id])
-  user       users         @relation(fields: [user_id], references: [id])
+  group friend_groups @relation(fields: [group_id], references: [id])
+  user  users         @relation(fields: [user_id], references: [id])
 
   @@unique([group_id, user_id])
   @@index([user_id])
 }
 
 model group_table_proposals {
-  id                   String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  group_id             String                   @db.Uuid
-  created_by_user_id   String                   @db.Uuid
-  event_id             String                   @db.Uuid
-  venue_id             String                   @db.Uuid
-  guests               Int
-  note                 String?
-  status               GroupTableProposalStatus @default(voting)
-  booked_reservation_id String?                 @unique @db.Uuid
-  created_at           DateTime                 @default(now())
-  updated_at           DateTime                 @updatedAt
+  id                    String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  group_id              String                   @db.Uuid
+  created_by_user_id    String                   @db.Uuid
+  event_id              String                   @db.Uuid
+  venue_id              String                   @db.Uuid
+  guests                Int
+  note                  String?
+  status                GroupTableProposalStatus @default(voting)
+  booked_reservation_id String?                  @unique @db.Uuid
+  created_at            DateTime                 @default(now())
+  updated_at            DateTime                 @updatedAt
 
-  group                friend_groups            @relation(fields: [group_id], references: [id])
-  created_by_user      users                    @relation("GroupTableProposalCreator", fields: [created_by_user_id], references: [id])
-  event                events                   @relation(fields: [event_id], references: [id])
-  venue                venues                   @relation(fields: [venue_id], references: [id])
-  booked_reservation   reservations?            @relation("BookedProposalReservation", fields: [booked_reservation_id], references: [id])
-  votes                group_table_proposal_votes[]
+  group              friend_groups                @relation(fields: [group_id], references: [id])
+  created_by_user    users                        @relation("GroupTableProposalCreator", fields: [created_by_user_id], references: [id])
+  event              events                       @relation(fields: [event_id], references: [id])
+  venue              venues                       @relation(fields: [venue_id], references: [id])
+  booked_reservation reservations?                @relation("BookedProposalReservation", fields: [booked_reservation_id], references: [id])
+  votes              group_table_proposal_votes[]
 
   @@index([group_id, created_at])
   @@index([created_by_user_id, created_at])
@@ -438,8 +674,8 @@ model group_table_proposal_votes {
   created_at  DateTime               @default(now())
   updated_at  DateTime               @updatedAt
 
-  proposal    group_table_proposals  @relation(fields: [proposal_id], references: [id])
-  user        users                  @relation(fields: [user_id], references: [id])
+  proposal group_table_proposals @relation(fields: [proposal_id], references: [id])
+  user     users                 @relation(fields: [user_id], references: [id])
 
   @@unique([proposal_id, user_id])
   @@index([user_id, updated_at])
@@ -449,18 +685,18 @@ model group_table_proposal_votes {
 // VENUE STAYS (PERMANENZA CLIENTI)
 // ===============================
 model venue_stays {
-  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  user_id     String   @db.Uuid
-  venue_id    String   @db.Uuid
-  event_id    String?  @db.Uuid
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id     String    @db.Uuid
+  venue_id    String    @db.Uuid
+  event_id    String?   @db.Uuid
   entered_at  DateTime
   exited_at   DateTime?
   duration_ms Int?
-  created_at  DateTime @default(now())
-  updated_at  DateTime @updatedAt
+  created_at  DateTime  @default(now())
+  updated_at  DateTime  @updatedAt
 
-  user        users    @relation(fields: [user_id], references: [id])
-  venue       venues   @relation(fields: [venue_id], references: [id])
+  user  users  @relation(fields: [user_id], references: [id])
+  venue venues @relation(fields: [venue_id], references: [id])
 
   @@index([user_id, entered_at])
   @@index([venue_id, entered_at])
@@ -472,37 +708,46 @@ model venue_stays {
 // EVENTS
 // ===============================
 model events {
-  id          String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  venue_id    String      @db.Uuid
-  name        String
-  description String?
-  image       String?
-  is_featured Boolean     @default(false)
-  date        DateTime    @db.Date
-  start_time  DateTime?   @db.Time(6)
-  end_time    DateTime?   @db.Time(6)
-  status      EventStatus @default(DRAFT)
-  access_mode EventAccessMode @default(LIST)
-  presale_price Decimal?
-  presale_currency String @default("eur")
+  id               String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id         String          @db.Uuid
+  name             String
+  description      String?
+  image            String?
+  // Single "in evidence" flag with two possible sources, tracked by `featured_source`:
+  // an admin can grant it manually (paid placement - a venue can never set this on itself,
+  // see EventsController), or the periodic hype-evaluation cron can grant it automatically
+  // (free reward for booking velocity above this venue's own historical average). The cron
+  // only ever touches events it granted itself (`featured_source = auto`) - it never
+  // switches off something an admin turned on manually, and never turns on something an
+  // admin explicitly turned off (see EventsService.evaluateAutoFeaturedEvents).
+  is_featured      Boolean              @default(false)
+  featured_source  EventFeaturedSource?
+  date             DateTime        @db.Date
+  start_time       DateTime?       @db.Time(6)
+  end_time         DateTime?       @db.Time(6)
+  status           EventStatus     @default(DRAFT)
+  access_mode      EventAccessMode @default(LIST)
+  presale_price    Decimal?
+  presale_currency String          @default("eur")
   presale_capacity Int?
-  presale_sold Int @default(0)
-  created_at  DateTime    @default(now())
-  updated_at  DateTime    @updatedAt
+  presale_sold     Int             @default(0)
+  created_at       DateTime        @default(now())
+  updated_at       DateTime        @updatedAt
 
-  venue       venues      @relation(fields: [venue_id], references: [id])
+  venue venues @relation(fields: [venue_id], references: [id])
 
-  entries     entries[]
-  entry_prices event_entry_prices[]
-  event_tables event_tables[]
-  reservations reservations[]
-  ticket_orders ticket_orders[]
-  promos      promos[]
-  bar_sales   bar_sales[]
-  cloakroom_sales cloakroom_sales[]
-  pr_event_assignments venue_pr_event_assignments[]
-  pr_qr_scans venue_pr_qr_scans[]
-  group_table_proposals group_table_proposals[]
+  entries                  entries[]
+  entry_prices             event_entry_prices[]
+  event_tables             event_tables[]
+  reservations             reservations[]
+  ticket_orders            ticket_orders[]
+  promos                   promos[]
+  bar_sales                bar_sales[]
+  cloakroom_sales          cloakroom_sales[]
+  pr_event_assignments     venue_pr_event_assignments[]
+  pr_qr_scans              venue_pr_qr_scans[]
+  pr_membership_pass_scans venue_pr_membership_pass_scans[]
+  group_table_proposals    group_table_proposals[]
 
   @@index([venue_id, date])
   @@index([date, start_time])
@@ -516,8 +761,8 @@ model events {
 // - Optional time window (nulls = always)
 // ===============================
 model event_entry_prices {
-  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  event_id   String   @db.Uuid
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_id String @db.Uuid
 
   label      String?
   gender     Gender?
@@ -536,46 +781,57 @@ model event_entry_prices {
 // VENUE TABLES (STRUTTURALI)
 // ===============================
 model venue_tables {
-  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  venue_id     String   @db.Uuid
-  nome         String
-  zona         String?
-  numero       Int?
-  per_testa    Decimal?
-  costo_minimo Decimal?
-  persone_max  Int?
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id            String   @db.Uuid
+  venue_table_zone_id String?  @db.Uuid
+  nome                String
+  zona                String?
+  numero              Int?
+  per_testa           Decimal? @db.Decimal(10, 2)
+  costo_minimo        Decimal? @db.Decimal(10, 2)
+  persone_max         Int?
+  floor_x             Decimal? @db.Decimal(10, 2)
+  floor_y             Decimal? @db.Decimal(10, 2)
+  floor_w             Decimal? @db.Decimal(10, 2)
+  floor_h             Decimal? @db.Decimal(10, 2)
+  floor_shape         String?  @default("rectangle")
+  floor_rotation      Decimal? @db.Decimal(10, 2)
+  layout_order        Int      @default(0)
+  is_hidden           Boolean  @default(false)
 
-  venue        venues    @relation(fields: [venue_id], references: [id])
-  event_tables event_tables[]
-  reservations reservations[]
+  venue venues             @relation(fields: [venue_id], references: [id])
+  zone  venue_table_zones? @relation(fields: [venue_table_zone_id], references: [id], onDelete: SetNull)
 
   @@unique([venue_id, numero])
+  @@index([venue_id, venue_table_zone_id])
+  @@index([venue_id, layout_order])
+  @@index([venue_id, floor_x, floor_y])
 }
 
 // ===============================
 // EVENT TABLES (STATO TAVOLO PER EVENTO)
 // ===============================
 model event_tables {
-  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  event_id       String   @db.Uuid
-  venue_table_id String   @db.Uuid
-  assigned_number Int?
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_id              String   @db.Uuid
+  venue_table_zone_id   String   @db.Uuid
+  assigned_number       Int?
   per_testa_override    Decimal?
   costo_minimo_override Decimal?
   persone_max_override  Int?
 
-  prenotati     Int      @default(0)
-  entrati       Int      @default(0)
-  pagato_totale Decimal  @default(0)
-  stato         String   @default("libero")
-  confermato    Boolean  @default(false)
+  prenotati     Int     @default(0)
+  entrati       Int     @default(0)
+  pagato_totale Decimal @default(0)
+  stato         String  @default("libero")
+  confermato    Boolean @default(false)
 
-  event         events       @relation(fields: [event_id], references: [id])
-  venue_table   venue_tables @relation(fields: [venue_table_id], references: [id])
-  table_sales   table_sales[]
-  bottle_orders table_bottle_orders[]
+  event            events                @relation(fields: [event_id], references: [id])
+  venue_table_zone venue_table_zones     @relation(fields: [venue_table_zone_id], references: [id])
+  table_sales      table_sales[]
+  bottle_orders    table_bottle_orders[]
 
-  @@unique([event_id, venue_table_id])
+  @@unique([event_id, venue_table_zone_id])
   @@index([event_id])
   @@index([event_id, confermato])
   @@index([event_id, assigned_number])
@@ -585,26 +841,26 @@ model event_tables {
 // ENTRIES (INGRESSI)
 // ===============================
 model entries {
-  id         String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
 
-  event_id   String      @db.Uuid
-  user_id    String?     @db.Uuid
-  staff_id   String?     @db.Uuid
-  station_id String?     @db.Uuid
+  event_id         String  @db.Uuid
+  user_id          String? @db.Uuid
+  staff_id         String? @db.Uuid
+  station_id       String? @db.Uuid
   pr_membership_id String? @db.Uuid
 
-  sesso      Gender
-  price      Decimal     @default(0)
-  is_complimentary Boolean @default(false)
-  age_bucket AgeBucket?
-  method     EntryMethod
+  sesso            Gender
+  price            Decimal     @default(0)
+  is_complimentary Boolean     @default(false)
+  age_bucket       AgeBucket?
+  method           EntryMethod
 
-  created_at DateTime    @default(now())
+  created_at DateTime @default(now())
 
-  event      events      @relation(fields: [event_id], references: [id])
+  event events @relation(fields: [event_id], references: [id])
 
-  user       users?      @relation("UserEntries", fields: [user_id], references: [id])
-  staff      users?      @relation("StaffEntries", fields: [staff_id], references: [id])
+  user          users?                @relation("UserEntries", fields: [user_id], references: [id])
+  staff         users?                @relation("StaffEntries", fields: [staff_id], references: [id])
   pr_membership venue_pr_memberships? @relation("PrMembershipEntries", fields: [pr_membership_id], references: [id], onDelete: SetNull)
 
   @@index([event_id, created_at])
@@ -615,9 +871,6 @@ model entries {
   @@index([station_id])
   @@index([pr_membership_id, created_at])
 }
-
-
-
 
 // ===============================
 // BAR SALES
@@ -662,10 +915,10 @@ model cloakroom_sales {
 // ===============================
 model table_sales {
   id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  event_id        String?  @db.Uuid
+  event_id       String?  @db.Uuid
   event_table_id String   @db.Uuid
-  station_id      String?  @db.Uuid
-  staff_id        String?  @db.Uuid
+  station_id     String?  @db.Uuid
+  staff_id       String?  @db.Uuid
   amount         Decimal
   metadata       Json?
   created_at     DateTime @default(now())
@@ -686,8 +939,8 @@ model table_bottle_orders {
   delivered_by_staff_id String?                @db.Uuid
   bottle_name           String
   quantity              Int                    @default(1)
-  unit_price            Decimal                @db.Decimal(10,2)
-  total_price           Decimal                @db.Decimal(10,2)
+  unit_price            Decimal                @db.Decimal(10, 2)
+  total_price           Decimal                @db.Decimal(10, 2)
   status                TableBottleOrderStatus @default(requested)
   note                  String?
   created_at            DateTime               @default(now())
@@ -717,7 +970,7 @@ model event_presence_events {
   station_id     String?             @db.Uuid
   event_type     PresenceEventType
   source         PresenceEventSource
-  amount         Decimal?            @db.Decimal(10,2)
+  amount         Decimal?            @db.Decimal(10, 2)
   occurred_at    DateTime
   metadata       Json?
   created_at     DateTime            @default(now())
@@ -729,66 +982,66 @@ model event_presence_events {
 }
 
 model event_analytics_snapshots {
-  id                     String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  event_id               String   @db.Uuid
-  venue_id               String   @db.Uuid
-  snapshot_date          DateTime @db.Date
-  entries_count          Int      @default(0)
-  unique_attendees       Int      @default(0)
-  reservations_count     Int      @default(0)
-  ticket_orders_count    Int      @default(0)
-  avg_stay_minutes       Decimal? @db.Decimal(10,2)
-  male_count             Int      @default(0)
-  female_count           Int      @default(0)
-  other_gender_count     Int      @default(0)
-  unknown_gender_count   Int      @default(0)
-  age_18_20              Int      @default(0)
-  age_21_24              Int      @default(0)
-  age_25_29              Int      @default(0)
-  age_30_34              Int      @default(0)
-  age_35_plus            Int      @default(0)
-  entry_revenue          Decimal  @default(0) @db.Decimal(12,2)
-  bar_revenue            Decimal  @default(0) @db.Decimal(12,2)
-  cloakroom_revenue      Decimal  @default(0) @db.Decimal(12,2)
-  table_revenue          Decimal  @default(0) @db.Decimal(12,2)
-  total_revenue          Decimal  @default(0) @db.Decimal(12,2)
-  generated_at           DateTime @default(now())
-  updated_at             DateTime @updatedAt
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_id             String   @db.Uuid
+  venue_id             String   @db.Uuid
+  snapshot_date        DateTime @db.Date
+  entries_count        Int      @default(0)
+  unique_attendees     Int      @default(0)
+  reservations_count   Int      @default(0)
+  ticket_orders_count  Int      @default(0)
+  avg_stay_minutes     Decimal? @db.Decimal(10, 2)
+  male_count           Int      @default(0)
+  female_count         Int      @default(0)
+  other_gender_count   Int      @default(0)
+  unknown_gender_count Int      @default(0)
+  age_18_20            Int      @default(0)
+  age_21_24            Int      @default(0)
+  age_25_29            Int      @default(0)
+  age_30_34            Int      @default(0)
+  age_35_plus          Int      @default(0)
+  entry_revenue        Decimal  @default(0) @db.Decimal(12, 2)
+  bar_revenue          Decimal  @default(0) @db.Decimal(12, 2)
+  cloakroom_revenue    Decimal  @default(0) @db.Decimal(12, 2)
+  table_revenue        Decimal  @default(0) @db.Decimal(12, 2)
+  total_revenue        Decimal  @default(0) @db.Decimal(12, 2)
+  generated_at         DateTime @default(now())
+  updated_at           DateTime @updatedAt
 
   @@unique([event_id, snapshot_date])
   @@index([venue_id, snapshot_date])
 }
 
 model event_forecasts {
-  id               String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  event_id         String       @db.Uuid
-  venue_id         String       @db.Uuid
-  forecast_type    ForecastType
-  model_version    String
-  predicted_value  Decimal      @db.Decimal(12,2)
-  lower_bound      Decimal?     @db.Decimal(12,2)
-  upper_bound      Decimal?     @db.Decimal(12,2)
-  confidence_score Decimal?     @db.Decimal(5,2)
+  id                String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  event_id          String       @db.Uuid
+  venue_id          String       @db.Uuid
+  forecast_type     ForecastType
+  model_version     String
+  predicted_value   Decimal      @db.Decimal(12, 2)
+  lower_bound       Decimal?     @db.Decimal(12, 2)
+  upper_bound       Decimal?     @db.Decimal(12, 2)
+  confidence_score  Decimal?     @db.Decimal(5, 2)
   features_snapshot Json?
-  generated_at     DateTime     @default(now())
+  generated_at      DateTime     @default(now())
 
   @@index([event_id, forecast_type, generated_at])
   @@index([venue_id, forecast_type, generated_at])
 }
 
 model user_copresence_edges {
-  id                      String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  venue_id                String?  @db.Uuid
-  user_a_id               String   @db.Uuid
-  user_b_id               String   @db.Uuid
+  id                      String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id                String?   @db.Uuid
+  user_a_id               String    @db.Uuid
+  user_b_id               String    @db.Uuid
   first_seen_at           DateTime?
   last_seen_at            DateTime?
-  same_event_count        Int      @default(0)
-  same_arrival_count      Int      @default(0)
-  same_table_count        Int      @default(0)
+  same_event_count        Int       @default(0)
+  same_arrival_count      Int       @default(0)
+  same_table_count        Int       @default(0)
   avg_arrival_gap_seconds Int?
-  strength_score          Decimal? @db.Decimal(8,2)
-  updated_at              DateTime @updatedAt
+  strength_score          Decimal?  @db.Decimal(8, 2)
+  updated_at              DateTime  @updatedAt
 
   @@unique([user_a_id, user_b_id, venue_id])
   @@index([venue_id, strength_score])
@@ -800,19 +1053,19 @@ model user_copresence_edges {
 // PROMOS
 // ===============================
 model promos {
-  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  venue_id       String        @db.Uuid
-  event_id       String?       @db.Uuid
+  id             String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id       String       @db.Uuid
+  event_id       String?      @db.Uuid
   title          String
   description    String?
   discount_type  DiscountType
   discount_value Decimal?
-  status         PromoStatus   @default(active)
-  created_at     DateTime      @default(now())
+  status         PromoStatus  @default(active)
+  created_at     DateTime     @default(now())
 
-  venue          venues        @relation(fields: [venue_id], references: [id])
-  event          events?       @relation(fields: [event_id], references: [id])
-  user_promos    user_promos[]
+  venue       venues        @relation(fields: [venue_id], references: [id])
+  event       events?       @relation(fields: [event_id], references: [id])
+  user_promos user_promos[]
 
   @@index([event_id, status, created_at])
   @@index([venue_id, created_at])
@@ -822,10 +1075,10 @@ model promos {
 // USER PROMOS
 // ===============================
 model user_promos {
-  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  user_id   String   @db.Uuid
-  promo_id  String   @db.Uuid
-  used_at   DateTime?
+  id       String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id  String    @db.Uuid
+  promo_id String    @db.Uuid
+  used_at  DateTime?
 
   user  users  @relation(fields: [user_id], references: [id])
   promo promos @relation(fields: [promo_id], references: [id])
@@ -837,32 +1090,33 @@ model user_promos {
 // RESERVATIONS
 // ===============================
 model reservations {
-  id           String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  user_id      String            @db.Uuid
-  event_id     String            @db.Uuid
-  venue_table_id String?         @db.Uuid
-  table_name   String?
-  meta         Json?
-  type         ReservationType
-  status       ReservationStatus @default(pending)
-  guests       Int
-  total_amount Decimal?
-  qr_token     String?           @unique
-  qr_payload   String?
-  checked_in_at DateTime?
-  checked_in_by_staff_id String? @db.Uuid
-  checkin_entry_id String?       @db.Uuid
-  created_at   DateTime          @default(now())
+  id                     String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id                String            @db.Uuid
+  event_id               String            @db.Uuid
+  venue_table_zone_id    String?           @db.Uuid
+  table_name             String?
+  meta                   Json?
+  type                   ReservationType
+  status                 ReservationStatus @default(pending)
+  guests                 Int
+  actual_guests          Int?
+  total_amount           Decimal?
+  qr_token               String?           @unique
+  qr_payload             String?
+  checked_in_at          DateTime?
+  checked_in_by_staff_id String?           @db.Uuid
+  checkin_entry_id       String?           @db.Uuid
+  created_at             DateTime          @default(now())
 
-  user  users  @relation(fields: [user_id], references: [id])
-  event events @relation(fields: [event_id], references: [id])
-  venue_table venue_tables? @relation(fields: [venue_table_id], references: [id])
-  ticket_order ticket_orders?
+  user                       users                  @relation(fields: [user_id], references: [id])
+  event                      events                 @relation(fields: [event_id], references: [id])
+  venue_table_zone           venue_table_zones?     @relation(fields: [venue_table_zone_id], references: [id])
+  ticket_order               ticket_orders?
   booked_from_group_proposal group_table_proposals? @relation("BookedProposalReservation")
 
   @@index([event_id])
   @@index([user_id])
-  @@index([venue_table_id])
+  @@index([venue_table_zone_id])
   @@index([event_id, created_at])
   @@index([user_id, created_at])
   @@index([event_id, type, status])
@@ -870,28 +1124,123 @@ model reservations {
 }
 
 model ticket_orders {
-  id                   String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  user_id              String            @db.Uuid
-  event_id             String            @db.Uuid
-  stripe_account_id    String
-  reservation_id       String?           @unique @db.Uuid
-  status               TicketOrderStatus @default(created)
-  quantity             Int               @default(1)
-  amount_total         Decimal
-  currency             String            @default("eur")
-  stripe_session_id    String            @unique
+  id                    String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id               String            @db.Uuid
+  event_id              String            @db.Uuid
+  stripe_account_id     String
+  reservation_id        String?           @unique @db.Uuid
+  status                TicketOrderStatus @default(created)
+  quantity              Int               @default(1)
+  amount_total          Decimal
+  currency              String            @default("eur")
+  stripe_session_id     String            @unique
   stripe_payment_intent String?
-  checkout_url         String?
-  paid_at              DateTime?
-  created_at           DateTime          @default(now())
-  updated_at           DateTime          @updatedAt
+  checkout_url          String?
+  paid_at               DateTime?
+  created_at            DateTime          @default(now())
+  updated_at            DateTime          @updatedAt
 
-  user                 users             @relation(fields: [user_id], references: [id])
-  event                events            @relation(fields: [event_id], references: [id])
-  reservation          reservations?     @relation(fields: [reservation_id], references: [id])
+  user        users         @relation(fields: [user_id], references: [id])
+  event       events        @relation(fields: [event_id], references: [id])
+  reservation reservations? @relation(fields: [reservation_id], references: [id])
 
   @@index([user_id, created_at])
   @@index([event_id, created_at])
   @@index([status, created_at])
   @@index([stripe_account_id, created_at])
+}
+
+// ===============================
+// BADGES
+// ===============================
+model badges {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code            String        @unique
+  category        BadgeCategory
+  rarity          BadgeRarity
+  icon            String
+  name            String
+  description     String
+  criteria        Json
+  is_secret       Boolean       @default(false)
+  is_public       Boolean       @default(true)
+  is_active       Boolean       @default(true)
+  sort_order      Int           @default(0)
+  available_from  DateTime?
+  available_until DateTime?
+  created_at      DateTime      @default(now())
+  updated_at      DateTime      @updatedAt
+
+  user_badges user_badges[]
+
+  @@index([category, sort_order])
+  @@index([is_active])
+}
+
+model user_badges {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id        String    @db.Uuid
+  badge_id       String    @db.Uuid
+  progress_value Int?
+  unlocked_at    DateTime  @default(now())
+  seen_at        DateTime?
+
+  user  users  @relation(fields: [user_id], references: [id])
+  badge badges @relation(fields: [badge_id], references: [id])
+
+  @@unique([user_id, badge_id])
+  @@index([badge_id])
+  @@index([user_id, unlocked_at])
+}
+
+// ===============================
+// MODERATION
+// ===============================
+enum ContentReportStatus {
+  pending
+  resolved
+  dismissed
+}
+
+// Minimal launch-scope moderation: report a user profile, admin resolves/dismisses (and
+// may suspend the reported user as part of resolving - see ModerationService.resolveReport,
+// which reuses AdminService.setUserActive rather than duplicating the suspend logic).
+// Deliberately not modeling other content types (photos, messages, etc.) yet - user
+// profile reports are the launch-blocking gap; broadening the `reported_type` enum is a
+// follow-up once there's a concrete second content type to moderate.
+model content_reports {
+  id                String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reporter_id       String              @db.Uuid
+  reported_user_id  String              @db.Uuid
+  reason            String
+  status            ContentReportStatus @default(pending)
+  resolution_note   String?
+  resolved_by_admin String?             @db.Uuid
+  resolved_at       DateTime?
+  created_at        DateTime            @default(now())
+
+  reporter      users @relation("ContentReportReporter", fields: [reporter_id], references: [id])
+  reported_user users @relation("ContentReportReported", fields: [reported_user_id], references: [id])
+
+  @@index([status, created_at])
+  @@index([reported_user_id])
+}
+
+// Records who did what to which record for the small set of destructive/high-impact admin
+// actions (venue delete, venue/user suspend-reactivate) - previously invisible: e.g.
+// deleting a venue had no trace of which admin did it or when. No FK to `users` on
+// purpose: the acting admin's account could itself later be deleted/anonymized (see
+// AuthService.deleteUser), and the log entry should survive that.
+model admin_audit_logs {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  admin_id    String   @db.Uuid
+  action      String
+  target_type String
+  target_id   String
+  metadata    Json?
+  created_at  DateTime @default(now())
+
+  @@index([target_type, target_id])
+  @@index([admin_id, created_at])
+  @@index([created_at])
 }

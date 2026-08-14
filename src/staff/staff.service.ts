@@ -16,6 +16,7 @@ import {
   table_sales,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { BadgesService } from '../badges/badges.service';
 import { RecordEntryDto } from './dto/record-entry.dto';
 import { RecordSaleDto } from './dto/record-sale.dto';
 import { UpdateTableHostessDto } from './dto/update-table-hostess.dto';
@@ -28,7 +29,13 @@ export class StaffService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly eventsService: EventsService,
+    private readonly badgesService: BadgesService,
   ) {}
+
+  private evaluateBadges(userId: string | null | undefined) {
+    if (!userId) return;
+    void this.badgesService.evaluateForUser(userId).catch(() => {});
+  }
 
   async assertEventBelongsToVenue(eventId: string, venueId: string) {
     const e = await this.prisma.events.findUnique({
@@ -135,10 +142,14 @@ export class StaffService {
 
       if (!station) throw new NotFoundException('Station not found');
       if (resolvedVenueId && station.venue_id !== resolvedVenueId) {
-        throw new BadRequestException('station_id does not belong to the event venue');
+        throw new BadRequestException(
+          'station_id does not belong to the event venue',
+        );
       }
       if (station.station_type !== params.stationType) {
-        throw new BadRequestException('station_id does not match the sale type');
+        throw new BadRequestException(
+          'station_id does not match the sale type',
+        );
       }
       if (!station.is_active) {
         throw new BadRequestException('station_id is not active');
@@ -179,11 +190,16 @@ export class StaffService {
     venueId?: string;
     staffId?: string;
     eventTableId?: string;
+    expectedVenueId?: string;
   }): Promise<string> {
-    const { eventId, venueId, staffId, eventTableId } = params;
+    const { eventId, venueId, staffId, eventTableId, expectedVenueId } = params;
 
     if (eventId) {
-      await this.ensureEvent(eventId);
+      // Existence + venue-ownership check combined into the one query instead of the
+      // caller doing a separate `assertEventBelongsToVenue` round trip afterward - this is
+      // the only branch where an explicit venue check is meaningful (the venueId/staffId
+      // branches below already resolve an event scoped to that venue by construction).
+      await this.ensureEvent(eventId, expectedVenueId);
       return eventId;
     }
 
@@ -230,91 +246,134 @@ export class StaffService {
     venueId?: string;
     staffId?: string;
     eventTableId?: string;
+    expectedVenueId?: string;
   }): Promise<string> {
     return this.resolveEventId(params);
   }
 
-  private async ensureEvent(event_id: string) {
+  private async ensureEvent(event_id: string, expectedVenueId?: string) {
     const exists = await this.prisma.events.findUnique({
       where: { id: event_id },
+      select: { id: true, venue_id: true },
     });
     if (!exists) throw new NotFoundException('Event not found');
+    if (expectedVenueId && exists.venue_id !== expectedVenueId) {
+      throw new ForbiddenException('Forbidden');
+    }
   }
 
+  // A table reservation targets a zone directly (`venue_table_zone_id`) and that IS the
+  // assignment - there's no physical "venue_tables" step anymore. `event_tables` is keyed
+  // per (event, zone) instead of per (event, physical table).
   private async ensureEventTablesSeeded(eventId: string) {
     if (!eventId) return;
 
-    const event = await this.prisma.events.findUnique({
-      where: { id: eventId },
-      select: { id: true, venue_id: true },
-    });
+    // All four reads are independent of each other. `venueZones` used to wait for `event`
+    // to resolve first (it needed `event.venue_id`) - filtering through the `venue.events`
+    // relation instead lets it query by `eventId` directly, so all 4 now run in a single
+    // `Promise.all` instead of 2 sequential batches.
+    const [event, existingEventTables, venueZones, grouped, groupedArrived] =
+      await Promise.all([
+        this.prisma.events.findUnique({
+          where: { id: eventId },
+          select: { id: true, venue_id: true },
+        }),
+        this.prisma.event_tables.findMany({
+          where: { event_id: eventId },
+          select: {
+            id: true,
+            venue_table_zone_id: true,
+            prenotati: true,
+            entrati: true,
+          },
+        }),
+        this.prisma.venue_table_zones.findMany({
+          where: { venue: { events: { some: { id: eventId } } } },
+          select: { id: true },
+        }),
+        this.prisma.reservations.groupBy({
+          by: ['venue_table_zone_id'],
+          where: {
+            event_id: eventId,
+            type: 'table',
+            status: { in: ['pending', 'confirmed', 'completed'] },
+            venue_table_zone_id: { not: null },
+          },
+          _sum: { guests: true },
+        }),
+        // `entrati` mirrors the headcount of reservations the hostess has actually checked
+        // in (status `completed`, set via ReservationsService.checkinTableReservation) - it's
+        // no longer a standalone manual tally, so it stays consistent with `reservations`.
+        // Uses `actual_guests` when the hostess corrected the headcount at check-in time
+        // (e.g. booked 7, only 5 showed up), falling back to the originally booked `guests`
+        // otherwise - a plain Prisma `_sum` can't express that per-row fallback.
+        this.prisma.$queryRaw<
+          { venue_table_zone_id: string; total: bigint | number }[]
+        >(Prisma.sql`
+          SELECT venue_table_zone_id, SUM(COALESCE(actual_guests, guests)) AS total
+          FROM reservations
+          WHERE event_id = ${eventId}::uuid
+            AND type = 'table'
+            AND status = 'completed'
+            AND venue_table_zone_id IS NOT NULL
+          GROUP BY venue_table_zone_id
+        `),
+      ]);
     if (!event) throw new NotFoundException('Event not found');
 
-    const venueTables = await this.prisma.venue_tables.findMany({
-      where: { venue_id: event.venue_id },
-      select: { id: true },
-    });
-    const existingEventTables = await this.prisma.event_tables.findMany({
-      where: { event_id: eventId },
-      select: { id: true, venue_table_id: true, prenotati: true },
-    });
+    const venueZoneCount = venueZones.length;
+    if (!venueZoneCount) return;
 
-    const venueTableCount = venueTables.length;
-    if (!venueTableCount) return;
-
-    // Aggregate prenotati from reservations
-    const grouped = await this.prisma.reservations.groupBy({
-      by: ['venue_table_id'],
-      where: {
-        event_id: eventId,
-        type: 'table',
-        status: { in: ['pending', 'confirmed', 'completed'] },
-        venue_table_id: { not: null },
-      },
-      _sum: { guests: true },
-    });
-
-    const prenotatiByVenueTableId = new Map<string, number>();
+    const prenotatiByZoneId = new Map<string, number>();
     for (const g of grouped) {
-      const venueTableId = g.venue_table_id;
-      if (!venueTableId) continue;
-      prenotatiByVenueTableId.set(venueTableId, Number(g._sum.guests ?? 0));
+      const zoneId = g.venue_table_zone_id;
+      if (!zoneId) continue;
+      prenotatiByZoneId.set(zoneId, Number(g._sum.guests ?? 0));
     }
 
-    const selectedVenueTableIds =
+    const entratiByZoneId = new Map<string, number>();
+    for (const row of groupedArrived) {
+      if (!row.venue_table_zone_id) continue;
+      entratiByZoneId.set(row.venue_table_zone_id, Number(row.total ?? 0));
+    }
+
+    const selectedZoneIds =
       existingEventTables.length > 0
-        ? existingEventTables.map((row) => row.venue_table_id)
-        : venueTables.map((vt) => vt.id);
+        ? existingEventTables.map((row) => row.venue_table_zone_id)
+        : venueZones.map((zone) => zone.id);
 
     if (existingEventTables.length === 0) {
+      // Rows are seeded with the correct `prenotati`/`entrati` inline, so there's nothing to
+      // reconcile afterward for this branch - no need to re-fetch what was just written.
       await this.prisma.event_tables.createMany({
-        data: selectedVenueTableIds.map((venueTableId) => ({
+        data: selectedZoneIds.map((zoneId) => ({
           event_id: eventId,
-          venue_table_id: venueTableId,
-          prenotati: prenotatiByVenueTableId.get(venueTableId) ?? 0,
-          entrati: 0,
+          venue_table_zone_id: zoneId,
+          prenotati: prenotatiByZoneId.get(zoneId) ?? 0,
+          entrati: entratiByZoneId.get(zoneId) ?? 0,
           pagato_totale: 0,
           stato: 'libero',
         })),
         skipDuplicates: true,
       });
+      return;
     }
 
-    // Sync prenotati for existing rows (idempotent)
-    const current = await this.prisma.event_tables.findMany({
-      where: { event_id: eventId },
-      select: { id: true, venue_table_id: true, prenotati: true },
-    });
-
+    // Sync prenotati/entrati for existing rows (idempotent). Nothing wrote to event_tables
+    // between the fetch above and here (the createMany branch above always returns early),
+    // so reuse that fetch instead of re-querying the same rows.
     const updates: Array<Prisma.PrismaPromise<unknown>> = [];
-    for (const row of current) {
-      const desired = prenotatiByVenueTableId.get(row.venue_table_id) ?? 0;
-      if ((row.prenotati ?? 0) !== desired) {
+    for (const row of existingEventTables) {
+      const desiredPrenotati =
+        prenotatiByZoneId.get(row.venue_table_zone_id) ?? 0;
+      const desiredEntrati = entratiByZoneId.get(row.venue_table_zone_id) ?? 0;
+      const data: Record<string, number> = {};
+      if ((row.prenotati ?? 0) !== desiredPrenotati)
+        data.prenotati = desiredPrenotati;
+      if ((row.entrati ?? 0) !== desiredEntrati) data.entrati = desiredEntrati;
+      if (Object.keys(data).length) {
         updates.push(
-          this.prisma.event_tables.update({
-            where: { id: row.id },
-            data: { prenotati: desired },
-          }),
+          this.prisma.event_tables.update({ where: { id: row.id }, data }),
         );
       }
     }
@@ -329,7 +388,9 @@ export class StaffService {
     return Gender.ALTRO;
   }
 
-  private normalizeGenderInput(gender?: RecordEntryDto['gender']): Gender | null {
+  private normalizeGenderInput(
+    gender?: RecordEntryDto['gender'],
+  ): Gender | null {
     if (gender === 'M') return Gender.M;
     if (gender === 'F') return Gender.F;
     if (gender === 'ALTRO') return Gender.ALTRO;
@@ -414,7 +475,8 @@ export class StaffService {
     const sesso = explicitGender ?? fallbackGender ?? Gender.ALTRO;
 
     const isComplimentary =
-      dto.is_complimentary ?? (dto.entry_type ? dto.entry_type === 'free' : false);
+      dto.is_complimentary ??
+      (dto.entry_type ? dto.entry_type === 'free' : false);
     const ageBucket = this.normalizeAgeBucketInput(dto.age_bucket);
     const method = dto.user_id ? EntryMethod.QR : EntryMethod.RAPIDO;
     const entryPrice = await resolveEntryUnitPrice({
@@ -457,6 +519,7 @@ export class StaffService {
     );
 
     await this.prisma.entries.createMany({ data: createData });
+    this.evaluateBadges(dto.user_id ?? null);
     const stats = await this.eventsService.recalculateEventStats(eventId);
 
     if (this.isDebugStaffEnabled()) {
@@ -469,15 +532,26 @@ export class StaffService {
     }
 
     if (dto.user_id) {
-      const user = await this.prisma.users.findUnique({
-        where: { id: dto.user_id },
-        select: { push_token: true },
-      });
-
-      const event = await this.prisma.events.findUnique({
-        where: { id: eventId },
-        include: { venue: true },
-      });
+      const [user, event] = await Promise.all([
+        this.prisma.users.findUnique({
+          where: { id: dto.user_id },
+          select: { push_token: true },
+        }),
+        this.prisma.events.findUnique({
+          where: { id: eventId },
+          select: {
+            venue: {
+              select: {
+                id: true,
+                name: true,
+                latitude: true,
+                longitude: true,
+                radius_geofence: true,
+              },
+            },
+          },
+        }),
+      ]);
 
       const venue = event?.venue ?? null;
       const latitude = venue?.latitude ? Number(venue.latitude) : null;
@@ -629,10 +703,16 @@ export class StaffService {
     return { sale, stats };
   }
 
+  // These lists are polled by staff UIs and are otherwise unbounded on append-only tables.
+  // `take` here is a safety net (well above any single event's realistic volume), not a
+  // real pagination UX — full pagination is a larger, separate change.
+  private static readonly MAX_LIST_ROWS = 5000;
+
   async listEntries(eventId?: string) {
     return this.prisma.entries.findMany({
       where: eventId ? { event_id: eventId } : undefined,
       orderBy: { created_at: 'desc' },
+      take: StaffService.MAX_LIST_ROWS,
     });
   }
 
@@ -640,6 +720,7 @@ export class StaffService {
     return this.prisma.bar_sales.findMany({
       where: eventId ? { event_id: eventId } : undefined,
       orderBy: { created_at: 'desc' },
+      take: StaffService.MAX_LIST_ROWS,
     });
   }
 
@@ -647,6 +728,7 @@ export class StaffService {
     return this.prisma.cloakroom_sales.findMany({
       where: eventId ? { event_id: eventId } : undefined,
       orderBy: { created_at: 'desc' },
+      take: StaffService.MAX_LIST_ROWS,
     });
   }
 
@@ -654,12 +736,15 @@ export class StaffService {
     return this.prisma.table_sales.findMany({
       where: eventId ? { event_table: { event_id: eventId } } : undefined,
       orderBy: { created_at: 'desc' },
+      take: StaffService.MAX_LIST_ROWS,
     });
   }
 
   private mapBottleOrder(order: any) {
     const tableLabel =
-      order.event_table?.assigned_number ?? order.event_table?.venue_table?.numero ?? null;
+      order.event_table?.assigned_number ??
+      order.event_table?.venue_table_zone?.sort_order ??
+      null;
 
     return {
       id: order.id,
@@ -683,8 +768,8 @@ export class StaffService {
             id: order.event_table.id,
             event_id: order.event_table.event_id,
             numero: tableLabel,
-            nome: order.event_table.venue_table?.nome ?? 'Tavolo',
-            zona: order.event_table.venue_table?.zona ?? null,
+            nome: order.event_table.venue_table_zone?.name ?? 'Tavolo',
+            zona: order.event_table.venue_table_zone?.name ?? null,
             table_name: order.event_table.table_name ?? null,
             prenotati: Number(order.event_table.prenotati ?? 0),
             entrati: Number(order.event_table.entrati ?? 0),
@@ -715,16 +800,15 @@ export class StaffService {
           select: {
             id: true,
             event_id: true,
-            venue_table_id: true,
+            venue_table_zone_id: true,
             assigned_number: true,
             prenotati: true,
             entrati: true,
             stato: true,
-            venue_table: {
+            venue_table_zone: {
               select: {
-                numero: true,
-                nome: true,
-                zona: true,
+                name: true,
+                sort_order: true,
                 venue_id: true,
               },
             },
@@ -734,11 +818,11 @@ export class StaffService {
     });
 
     if (!order) throw new NotFoundException('Bottle order not found');
-    if (venueId && order.event_table.venue_table?.venue_id !== venueId) {
+    if (venueId && order.event_table.venue_table_zone?.venue_id !== venueId) {
       throw new ForbiddenException('Forbidden');
     }
 
-    const tableNameByVenueTableId = await this.resolveReservationTableNames({
+    const tableNameByZoneId = await this.resolveReservationTableNames({
       eventId: order.event_table.event_id,
       venueId,
     });
@@ -748,7 +832,7 @@ export class StaffService {
       event_table: {
         ...order.event_table,
         table_name:
-          tableNameByVenueTableId.get(order.event_table.venue_table_id) ?? null,
+          tableNameByZoneId.get(order.event_table.venue_table_zone_id) ?? null,
       },
     });
   }
@@ -760,15 +844,15 @@ export class StaffService {
     const { eventId, venueId } = params;
 
     const venueFilter = venueId
-      ? Prisma.sql`AND vt.venue_id = ${venueId}::uuid`
+      ? Prisma.sql`AND vtz.venue_id = ${venueId}::uuid`
       : Prisma.empty;
 
     const rows = await this.prisma.$queryRaw<
-      Array<{ venue_table_id: string | null; table_name: string | null }>
+      Array<{ venue_table_zone_id: string | null; table_name: string | null }>
     >(Prisma.sql`
-      SELECT r.venue_table_id, r.table_name
+      SELECT r.venue_table_zone_id, r.table_name
       FROM reservations r
-      JOIN venue_tables vt ON vt.id = r.venue_table_id
+      JOIN venue_table_zones vtz ON vtz.id = r.venue_table_zone_id
       WHERE r.event_id = ${eventId}::uuid
         AND r.type = 'table'
         AND r.status IN ('pending', 'confirmed', 'completed')
@@ -778,19 +862,19 @@ export class StaffService {
       ORDER BY r.created_at DESC
     `);
 
-    const tableNameByVenueTableId = new Map<string, string>();
+    const tableNameByZoneId = new Map<string, string>();
     for (const row of rows) {
-      const venueTableId = row?.venue_table_id
-        ? String(row.venue_table_id)
+      const zoneId = row?.venue_table_zone_id
+        ? String(row.venue_table_zone_id)
         : '';
       const tableName = row?.table_name ? String(row.table_name).trim() : '';
-      if (!venueTableId || !tableName) continue;
-      if (!tableNameByVenueTableId.has(venueTableId)) {
-        tableNameByVenueTableId.set(venueTableId, tableName);
+      if (!zoneId || !tableName) continue;
+      if (!tableNameByZoneId.has(zoneId)) {
+        tableNameByZoneId.set(zoneId, tableName);
       }
     }
 
-    return tableNameByVenueTableId;
+    return tableNameByZoneId;
   }
 
   // Hostess tables
@@ -806,77 +890,87 @@ export class StaffService {
       return [];
     }
 
-    await this.ensureEventTablesSeeded(eventId);
+    // The reservations aggregate doesn't depend on ensureEventTablesSeeded's writes (it
+    // reads `reservations`, not `event_tables`), so it runs alongside the seeding instead
+    // of waiting for it.
+    const [, groupedReservations] = await Promise.all([
+      this.ensureEventTablesSeeded(eventId),
+      this.prisma.reservations.groupBy({
+        by: ['venue_table_zone_id'],
+        where: {
+          event_id: eventId,
+          type: 'table',
+          status: 'confirmed',
+          venue_table_zone_id: { not: null },
+          ...(venueId ? { venue_table_zone: { venue_id: venueId } } : {}),
+        },
+        _sum: { guests: true },
+      }),
+    ]);
 
-    const groupedReservations = await this.prisma.reservations.groupBy({
-      by: ['venue_table_id'],
-      where: {
-        event_id: eventId,
-        type: 'table',
-        status: 'confirmed',
-        venue_table_id: { not: null },
-        ...(venueId ? { venue_table: { venue_id: venueId } } : {}),
-      },
-      _sum: { guests: true },
-    });
-
-    const prenotatiByVenueTableId = new Map<string, number>();
+    const prenotatiByZoneId = new Map<string, number>();
     for (const reservation of groupedReservations) {
-      const venueTableId = reservation.venue_table_id;
-      if (!venueTableId) continue;
-      prenotatiByVenueTableId.set(
-        venueTableId,
-        Number(reservation._sum.guests ?? 0),
-      );
+      const zoneId = reservation.venue_table_zone_id;
+      if (!zoneId) continue;
+      prenotatiByZoneId.set(zoneId, Number(reservation._sum.guests ?? 0));
     }
 
-    const bookedVenueTableIds = Array.from(prenotatiByVenueTableId.keys());
-    if (!bookedVenueTableIds.length) {
+    const bookedZoneIds = Array.from(prenotatiByZoneId.keys());
+    if (!bookedZoneIds.length) {
       return [];
     }
 
-    const tables = await this.prisma.event_tables.findMany({
-      where: {
-        event_id: eventId,
-        venue_table_id: { in: bookedVenueTableIds },
-        ...(includeConfirmed ? {} : { confermato: false }),
-        ...(venueId ? { venue_table: { venue_id: venueId } } : {}),
-      },
-      include: { venue_table: true, event: true },
-      orderBy: [{ venue_table: { numero: 'asc' } }],
-    });
-
-    const tableNameByVenueTableId = await this.resolveReservationTableNames({
-      eventId,
-      venueId,
-    });
+    // Independent of each other (table_name resolution reads `reservations`, not the
+    // `event_tables` rows being fetched here), so they run concurrently.
+    const [tables, tableNameByZoneId] = await Promise.all([
+      this.prisma.event_tables.findMany({
+        where: {
+          event_id: eventId,
+          venue_table_zone_id: { in: bookedZoneIds },
+          ...(includeConfirmed ? {} : { confermato: false }),
+          ...(venueId ? { venue_table_zone: { venue_id: venueId } } : {}),
+        },
+        include: { venue_table_zone: true, event: true },
+        orderBy: [{ venue_table_zone: { sort_order: 'asc' } }],
+      }),
+      this.resolveReservationTableNames({ eventId, venueId }),
+    ]);
 
     return tables.map((t) => {
-      const prenotati = prenotatiByVenueTableId.get(t.venue_table_id) ?? 0;
-      const per_testa = t.per_testa_override ?? t.venue_table?.per_testa ?? 0;
+      const prenotati = prenotatiByZoneId.get(t.venue_table_zone_id) ?? 0;
+      const per_testa =
+        t.per_testa_override ?? t.venue_table_zone?.per_testa ?? 0;
       const costo_minimo =
-        t.costo_minimo_override ?? t.venue_table?.costo_minimo ?? null;
+        t.costo_minimo_override ?? t.venue_table_zone?.costo_minimo ?? null;
       const stato =
         t.entrati >= prenotati
           ? 'completo'
           : t.entrati > 0
             ? 'parziale'
             : 'attesa';
+      // spesa_minima is the guaranteed table spend (headcount actually walked in x cost per
+      // head); pagato_totale only ever holds extras the waiter adds on top (table_sales,
+      // bottle_orders, addTablePayment) - it's never seeded with the minimum itself. The
+      // amount the venue actually collects is the two added together.
+      const spesa_minima = this.toNumber(per_testa) * t.entrati;
+      const totale_incassato = spesa_minima + this.toNumber(t.pagato_totale);
 
       return {
         id: t.id,
         event_id: t.event_id,
-        venue_table_id: t.venue_table_id,
-        table_name: tableNameByVenueTableId.get(t.venue_table_id) ?? null,
+        venue_table_zone_id: t.venue_table_zone_id,
+        table_name: tableNameByZoneId.get(t.venue_table_zone_id) ?? null,
         prenotati,
         entrati: t.entrati,
         pagato_totale: t.pagato_totale,
+        spesa_minima,
+        totale_incassato,
         per_testa,
         costo_minimo,
         confermato: Boolean((t as any).confermato),
         stato,
-        numero: t.assigned_number ?? t.venue_table?.numero ?? null,
-        venue_table: t.venue_table,
+        numero: t.assigned_number ?? null,
+        venue_table_zone: t.venue_table_zone,
         event: t.event,
       };
     });
@@ -893,29 +987,33 @@ export class StaffService {
       return [];
     }
 
-    await this.ensureEventTablesSeeded(eventId);
+    // Table-name resolution reads `reservations`, independent of ensureEventTablesSeeded's
+    // writes to `event_tables`, so it runs alongside the seeding instead of after it.
+    const [, tableNameByZoneId] = await Promise.all([
+      this.ensureEventTablesSeeded(eventId),
+      this.resolveReservationTableNames({ eventId, venueId }),
+    ]);
 
     const rows = await this.prisma.event_tables.findMany({
       where: {
         event_id: eventId,
-        ...(venueId ? { venue_table: { venue_id: venueId } } : {}),
+        ...(venueId ? { venue_table_zone: { venue_id: venueId } } : {}),
         ...(onlyBooked ? { prenotati: { gt: 0 } } : {}),
       },
       select: {
         id: true,
         event_id: true,
-        venue_table_id: true,
+        venue_table_zone_id: true,
         assigned_number: true,
         per_testa_override: true,
         costo_minimo_override: true,
-        venue_table: {
+        venue_table_zone: {
           select: {
             venue_id: true,
-            nome: true,
-            zona: true,
+            name: true,
             per_testa: true,
             costo_minimo: true,
-            numero: true,
+            sort_order: true,
           },
         },
         prenotati: true,
@@ -944,38 +1042,42 @@ export class StaffService {
           },
         },
       },
-      orderBy: [{ venue_table: { numero: 'asc' } }],
-    });
-
-    const tableNameByVenueTableId = await this.resolveReservationTableNames({
-      eventId,
-      venueId,
+      orderBy: [{ venue_table_zone: { sort_order: 'asc' } }],
     });
 
     return rows.map((t) => {
       const is_saldato = (t.stato ?? '').toLowerCase() === 'saldato';
       const pagato_totale = t.pagato_totale;
-      const per_testa = t.per_testa_override ?? t.venue_table?.per_testa ?? 0;
+      const per_testa =
+        t.per_testa_override ?? t.venue_table_zone?.per_testa ?? 0;
       const costo_minimo =
-        t.costo_minimo_override ?? t.venue_table?.costo_minimo ?? null;
+        t.costo_minimo_override ?? t.venue_table_zone?.costo_minimo ?? null;
+      // spesa_minima is the guaranteed table spend (headcount actually walked in x cost per
+      // head); pagato_totale only ever holds extras the waiter adds on top (table_sales,
+      // bottle_orders, addTablePayment). What the venue actually collects is both added
+      // together.
+      const spesa_minima = this.toNumber(per_testa) * (t.entrati ?? 0);
+      const totale_incassato = spesa_minima + this.toNumber(pagato_totale);
 
       return {
         id: t.id,
         event_id: t.event_id,
-        venue_id: t.venue_table?.venue_id ?? null,
-        nome: t.venue_table?.nome ?? 'Tavolo',
-        table_name: tableNameByVenueTableId.get(t.venue_table_id) ?? null,
-        zona: t.venue_table?.zona ?? null,
+        venue_id: t.venue_table_zone?.venue_id ?? null,
+        nome: t.venue_table_zone?.name ?? 'Tavolo',
+        table_name: tableNameByZoneId.get(t.venue_table_zone_id) ?? null,
+        zona: t.venue_table_zone?.name ?? null,
         per_testa,
         costo_minimo,
         prenotati: t.prenotati ?? 0,
         entrati: t.entrati ?? 0,
-        numero: t.assigned_number ?? t.venue_table?.numero ?? null,
+        numero: t.assigned_number ?? null,
         pagato_iniziale: null,
         pagato_totale,
+        spesa_minima,
+        totale_incassato,
         stato_pagamento: is_saldato
           ? 'saldato'
-          : Number(pagato_totale ?? 0) > 0
+          : totale_incassato > 0
             ? 'parziale'
             : 'in_attesa',
         is_saldato,
@@ -1005,20 +1107,53 @@ export class StaffService {
     });
   }
 
+  private toNumber(value: unknown): number {
+    if (value == null) return 0;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+    if (typeof value === 'bigint') return Number(value);
+    if (
+      typeof value === 'object' &&
+      value !== null &&
+      'toNumber' in value &&
+      typeof (value as { toNumber: () => number }).toNumber === 'function'
+    ) {
+      return (value as { toNumber: () => number }).toNumber();
+    }
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  // Manual tap +/-1. Note `entrati` is now derived from checked-in reservations
+  // (see ensureEventTablesSeeded), so any manual change here is overwritten on the next
+  // hostess/waiter table list fetch - kept only for backward compatibility with old clients.
   async updateHostessTableEntrati(id: string, delta: number) {
     if (!delta) throw new BadRequestException('delta must be non-zero');
-    const table = await this.prisma.event_tables.findUnique({ where: { id } });
-    if (!table) throw new NotFoundException('Table not found');
-    const next = (table.entrati ?? 0) + delta;
-    if (next < 0) throw new BadRequestException('entrati cannot be negative');
-    const updated = await this.prisma.event_tables.update({
-      where: { id },
-      data: {
-        entrati: next,
-        ...(next < Number(table.prenotati ?? 0) ? { confermato: false } : {}),
-      },
+
+    // Lock the row for the duration of the read-modify-write so concurrent door-scan
+    // updates to the same table can't lose an increment/decrement.
+    return this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<
+        { id: string; entrati: number; prenotati: number }[]
+      >(Prisma.sql`
+        SELECT id, entrati, prenotati
+        FROM event_tables
+        WHERE id = ${id}
+        FOR UPDATE
+      `);
+      const table = locked[0];
+      if (!table) throw new NotFoundException('Table not found');
+
+      const next = Number(table.entrati ?? 0) + delta;
+      if (next < 0) throw new BadRequestException('entrati cannot be negative');
+
+      return tx.event_tables.update({
+        where: { id },
+        data: {
+          entrati: next,
+          ...(next < Number(table.prenotati ?? 0) ? { confermato: false } : {}),
+        },
+      });
     });
-    return updated;
   }
 
   async setHostessTableConfirmed(id: string, confirmed: boolean) {
@@ -1042,7 +1177,7 @@ export class StaffService {
 
     const table = await this.prisma.event_tables.findUnique({
       where: { id },
-      include: { venue_table: true },
+      include: { venue_table_zone: true },
     });
     if (!table) throw new NotFoundException('Table not found');
 
@@ -1064,7 +1199,7 @@ export class StaffService {
     const updatedEventTable = await this.prisma.event_tables.update({
       where: { id },
       data: { assigned_number: numero },
-      include: { venue_table: true },
+      include: { venue_table_zone: true },
     });
 
     return updatedEventTable;
@@ -1081,6 +1216,7 @@ export class StaffService {
       if (dto.entrati < 0) {
         throw new BadRequestException('entrati cannot be negative');
       }
+      // Overwritten on the next list fetch - see updateHostessTableEntrati.
       updateData.entrati = dto.entrati;
     }
 
@@ -1188,15 +1324,20 @@ export class StaffService {
         : [];
 
       const selectedBottle = catalog.find(
-        (item) => typeof item?.key === 'string' && item.key.trim() === bottleKey,
+        (item) =>
+          typeof item?.key === 'string' && item.key.trim() === bottleKey,
       );
 
       bottleName =
-        typeof selectedBottle?.label === 'string' ? selectedBottle.label.trim() : '';
+        typeof selectedBottle?.label === 'string'
+          ? selectedBottle.label.trim()
+          : '';
       unitPrice = Number(selectedBottle?.price ?? 0);
 
       if (!bottleName || !Number.isFinite(unitPrice) || unitPrice <= 0) {
-        throw new BadRequestException('Selected bottle is not available for this venue');
+        throw new BadRequestException(
+          'Selected bottle is not available for this venue',
+        );
       }
     } else {
       if (!bottleName) {
@@ -1276,9 +1417,9 @@ export class StaffService {
       return [];
     }
 
-    await this.ensureEventTablesSeeded(eventId);
-
-    const normalizedStatus = String(status ?? '').trim().toLowerCase();
+    const normalizedStatus = String(status ?? '')
+      .trim()
+      .toLowerCase();
     const statusFilter =
       normalizedStatus === 'requested' ||
       normalizedStatus === 'preparing' ||
@@ -1286,63 +1427,67 @@ export class StaffService {
         ? (normalizedStatus as TableBottleOrderStatus)
         : undefined;
 
-    const rows = await this.prisma.table_bottle_orders.findMany({
-      where: {
-        ...(statusFilter ? { status: statusFilter } : {}),
-        event_table: {
-          event_id: eventId,
-          ...(venueId ? { venue_table: { venue_id: venueId } } : {}),
+    // Bottle orders only ever reference event_tables that already exist (created at
+    // order-creation time, which does its own seeding), and table-name resolution reads
+    // `reservations` - neither depends on ensureEventTablesSeeded's writes, so all three
+    // run concurrently instead of seeding-then-fetch-then-fetch.
+    const [, rows, tableNameByZoneId] = await Promise.all([
+      this.ensureEventTablesSeeded(eventId),
+      this.prisma.table_bottle_orders.findMany({
+        where: {
+          ...(statusFilter ? { status: statusFilter } : {}),
+          event_table: {
+            event_id: eventId,
+            ...(venueId ? { venue_table_zone: { venue_id: venueId } } : {}),
+          },
         },
-      },
-      orderBy: [{ created_at: 'desc' }],
-      select: {
-        id: true,
-        event_table_id: true,
-        requested_by_staff_id: true,
-        prepared_by_staff_id: true,
-        delivered_by_staff_id: true,
-        bottle_name: true,
-        quantity: true,
-        unit_price: true,
-        total_price: true,
-        status: true,
-        note: true,
-        created_at: true,
-        prepared_at: true,
-        delivered_at: true,
-        event_table: {
-          select: {
-            id: true,
-            event_id: true,
-            venue_table_id: true,
-            assigned_number: true,
-            prenotati: true,
-            entrati: true,
-            stato: true,
-            venue_table: {
-              select: {
-                numero: true,
-                nome: true,
-                zona: true,
-                venue_id: true,
+        orderBy: [{ created_at: 'desc' }],
+        select: {
+          id: true,
+          event_table_id: true,
+          requested_by_staff_id: true,
+          prepared_by_staff_id: true,
+          delivered_by_staff_id: true,
+          bottle_name: true,
+          quantity: true,
+          unit_price: true,
+          total_price: true,
+          status: true,
+          note: true,
+          created_at: true,
+          prepared_at: true,
+          delivered_at: true,
+          event_table: {
+            select: {
+              id: true,
+              event_id: true,
+              venue_table_zone_id: true,
+              assigned_number: true,
+              prenotati: true,
+              entrati: true,
+              stato: true,
+              venue_table_zone: {
+                select: {
+                  name: true,
+                  sort_order: true,
+                  venue_id: true,
+                },
               },
             },
           },
         },
-      },
-    });
-
-    const tableNameByVenueTableId = await this.resolveReservationTableNames({
-      eventId,
-      venueId,
-    });
+      }),
+      this.resolveReservationTableNames({ eventId, venueId }),
+    ]);
 
     return rows.map((order) =>
       this.mapBottleOrder({
         ...order,
         event_table: {
           ...order.event_table,
-          table_name: tableNameByVenueTableId.get(order.event_table.venue_table_id) ?? null,
+          table_name:
+            tableNameByZoneId.get(order.event_table.venue_table_zone_id) ??
+            null,
         },
       }),
     );
@@ -1364,7 +1509,10 @@ export class StaffService {
     if (!existing) throw new NotFoundException('Bottle order not found');
 
     if (existing.status !== TableBottleOrderStatus.requested) {
-      return this.getBottleOrderById(orderId, existing.event_table.event.venue_id);
+      return this.getBottleOrderById(
+        orderId,
+        existing.event_table.event.venue_id,
+      );
     }
 
     await this.prisma.table_bottle_orders.update({
@@ -1376,7 +1524,10 @@ export class StaffService {
       },
     });
 
-    return this.getBottleOrderById(orderId, existing.event_table.event.venue_id);
+    return this.getBottleOrderById(
+      orderId,
+      existing.event_table.event.venue_id,
+    );
   }
 
   async markBottleOrderDelivered(orderId: string, staffId?: string) {
@@ -1413,7 +1564,9 @@ export class StaffService {
           },
         });
 
-        if (String(existing.event_table.stato ?? '').toLowerCase() !== 'saldato') {
+        if (
+          String(existing.event_table.stato ?? '').toLowerCase() !== 'saldato'
+        ) {
           await tx.event_tables.update({
             where: { id: existing.event_table_id },
             data: { stato: 'saldato' },
@@ -1422,7 +1575,10 @@ export class StaffService {
       });
     }
 
-    return this.getBottleOrderById(orderId, existing.event_table.event.venue_id);
+    return this.getBottleOrderById(
+      orderId,
+      existing.event_table.event.venue_id,
+    );
   }
 
   // Cameriere: salda il tavolo (segna come completamente pagato)

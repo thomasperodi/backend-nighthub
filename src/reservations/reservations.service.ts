@@ -8,12 +8,37 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AgeBucket, EntryMethod, Gender, Prisma } from '@prisma/client';
 import { randomUUID } from 'crypto';
 import { resolveEntryUnitPrice } from '../common/entry-pricing';
+import { BadgesService } from '../badges/badges.service';
 
 type QrCheckInResult = {
   success: boolean;
   alreadyCheckedIn: boolean;
   reservation: unknown;
   entry?: unknown;
+};
+
+type ParsedQrData = {
+  qrToken?: string;
+  reservationId?: string;
+  userId?: string;
+  eventId?: string;
+  passType?: string;
+  passId?: string;
+  passVenueId?: string;
+  passMembershipId?: string;
+};
+
+type PrSeasonPassLookupRow = {
+  id: string;
+  venue_id: string;
+  pr_membership_id: string;
+  user_id: string;
+  status: 'active' | 'revoked' | 'expired';
+  valid_from: Date;
+  valid_until: Date;
+  revoked_at: Date | null;
+  qr_token: string;
+  membership_is_active: boolean;
 };
 
 type TableInvitationStatus = 'pending' | 'accepted' | 'declined';
@@ -69,8 +94,8 @@ const incomingTableInvitationReservationSelect =
         venue_id: true,
       },
     },
-    venue_table: {
-      select: { id: true, nome: true, zona: true },
+    venue_table_zone: {
+      select: { id: true, name: true },
     },
   });
 
@@ -101,14 +126,27 @@ const tableInvitationResponseReservationSelect =
         venue_id: true,
       },
     },
-    venue_table: {
-      select: { id: true, nome: true, zona: true },
+    venue_table_zone: {
+      select: { id: true, name: true },
     },
   });
 
 @Injectable()
 export class ReservationsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly badgesService: BadgesService,
+  ) {}
+
+  private evaluateBadges(userId: string | null | undefined) {
+    if (!userId) return;
+    void this.badgesService.evaluateForUser(userId).catch((error) => {
+      this.logger.error(
+        `Badge evaluation failed for user ${userId}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    });
+  }
   private readonly logger = new Logger(ReservationsService.name);
 
   private maskToken(token: string) {
@@ -171,7 +209,8 @@ export class ReservationsService {
   }
 
   private asObjectRecord(value: unknown): Record<string, unknown> | null {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+      return null;
     return value as Record<string, unknown>;
   }
 
@@ -224,7 +263,9 @@ export class ReservationsService {
   }
 
   private roleHasDefaultPrComplimentary(role: unknown): boolean {
-    const normalized = String(role ?? '').trim().toLowerCase();
+    const normalized = String(role ?? '')
+      .trim()
+      .toLowerCase();
     return (
       normalized === 'responsabile' ||
       normalized === 'capo_squadra' ||
@@ -400,13 +441,11 @@ export class ReservationsService {
   }
 
   private resolveZoneLabel(reservation: {
-    venue_table?: { zona?: string | null; nome?: string | null } | null;
+    venue_table_zone?: { name?: string | null } | null;
     meta?: unknown;
   }) {
-    const explicitZone = String(reservation.venue_table?.zona ?? '').trim();
-    if (explicitZone) return explicitZone;
-    const tableName = String(reservation.venue_table?.nome ?? '').trim();
-    if (tableName) return tableName;
+    const zoneName = String(reservation.venue_table_zone?.name ?? '').trim();
+    if (zoneName) return zoneName;
     return this.parseTableReservationMeta(reservation.meta)?.zone_label ?? null;
   }
 
@@ -531,23 +570,24 @@ export class ReservationsService {
     }
   }
 
-  async listBookedTableIdsForEvent(eventId: string): Promise<string[]> {
+  async listBookedZoneIdsForEvent(eventId: string): Promise<string[]> {
     const rows = await this.prisma.reservations.findMany({
       where: {
         event_id: eventId,
         type: 'table',
-        // Cancelled reservations should not block the table.
         status: { not: 'cancelled' },
-        venue_table_id: { not: null },
+        venue_table_zone_id: { not: null },
       },
-      select: { venue_table_id: true },
+      select: { venue_table_zone_id: true },
     });
 
-    const out = new Set<string>();
-    for (const r of rows) {
-      if (r.venue_table_id) out.add(r.venue_table_id);
-    }
-    return Array.from(out);
+    return Array.from(
+      new Set(
+        rows
+          .map((row) => row.venue_table_zone_id)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    );
   }
 
   private reservationSelect() {
@@ -555,12 +595,13 @@ export class ReservationsService {
       id: true,
       user_id: true,
       event_id: true,
-      venue_table_id: true,
+      venue_table_zone_id: true,
       table_name: true,
       meta: true,
       type: true,
       status: true,
       guests: true,
+      actual_guests: true,
       total_amount: true,
       qr_token: true,
       qr_payload: true,
@@ -592,20 +633,20 @@ export class ReservationsService {
               address: true,
               latitude: true,
               longitude: true,
+              image: true,
             },
           },
         },
       },
-      venue_table: {
+      venue_table_zone: {
         select: {
           id: true,
           venue_id: true,
-          nome: true,
-          zona: true,
-          numero: true,
-          persone_max: true,
+          name: true,
           per_testa: true,
           costo_minimo: true,
+          persone_max: true,
+          booking_policy: true,
         },
       },
     } satisfies Prisma.reservationsSelect;
@@ -628,12 +669,7 @@ export class ReservationsService {
     };
   }
 
-  private parseQrData(raw: string): {
-    qrToken?: string;
-    reservationId?: string;
-    userId?: string;
-    eventId?: string;
-  } {
+  private parseQrData(raw: string): ParsedQrData {
     const value = String(raw ?? '').trim();
     if (!value) return {};
 
@@ -641,6 +677,14 @@ export class ReservationsService {
       try {
         const parsed = JSON.parse(value) as Record<string, unknown>;
         return {
+          passType:
+            (typeof parsed.type === 'string' && parsed.type) ||
+            (typeof parsed.pass_type === 'string' && parsed.pass_type) ||
+            undefined,
+          passId:
+            (typeof parsed.pass_id === 'string' && parsed.pass_id) ||
+            (typeof parsed.passId === 'string' && parsed.passId) ||
+            undefined,
           qrToken:
             (typeof parsed.qr_token === 'string' && parsed.qr_token) ||
             (typeof parsed.qrToken === 'string' && parsed.qrToken) ||
@@ -660,6 +704,16 @@ export class ReservationsService {
             (typeof parsed.event_id === 'string' && parsed.event_id) ||
             (typeof parsed.eventId === 'string' && parsed.eventId) ||
             undefined,
+          passVenueId:
+            (typeof parsed.venue_id === 'string' && parsed.venue_id) ||
+            (typeof parsed.venueId === 'string' && parsed.venueId) ||
+            undefined,
+          passMembershipId:
+            (typeof parsed.pr_membership_id === 'string' &&
+              parsed.pr_membership_id) ||
+            (typeof parsed.prMembershipId === 'string' &&
+              parsed.prMembershipId) ||
+            undefined,
         };
       } catch {
         return {};
@@ -676,10 +730,9 @@ export class ReservationsService {
     event_id?: string;
     type?: 'table' | 'entry';
     guests?: unknown;
-    venue_table_id?: string | null;
+    venue_table_zone_id?: string | null;
     table_name?: unknown;
     meta?: unknown;
-    status?: 'pending' | 'confirmed' | 'cancelled' | 'completed';
     total_amount?: unknown;
   } {
     const payload = dto ?? {};
@@ -698,39 +751,25 @@ export class ReservationsService {
       payload.guestsCount ??
       payload.seats ??
       payload.people;
-    const venue_table_id =
+    const venue_table_zone_id =
       this.normalizeStringValue(
         payload.venue_zone_id ??
           payload.venueZoneId ??
-          payload.venue_table_id ??
-          payload.venueTableId ??
-          payload.table_id ??
-          payload.tableId,
+          payload.venue_table_zone_id ??
+          payload.venueTableZoneId,
       ) || null;
     const total_amount = payload.total_amount ?? payload.totalAmount;
     const table_name = payload.table_name ?? payload.tableName;
     const meta = payload.meta;
-
-    let status = payload.status;
-    if (status === 'reserved') status = 'confirmed';
-
-    const normalizedStatus =
-      status === 'pending' ||
-      status === 'confirmed' ||
-      status === 'cancelled' ||
-      status === 'completed'
-        ? status
-        : undefined;
 
     return {
       user_id,
       event_id,
       type,
       guests,
-      venue_table_id,
+      venue_table_zone_id,
       table_name,
       meta,
-      status: normalizedStatus,
       total_amount,
     };
   }
@@ -772,19 +811,6 @@ export class ReservationsService {
     return this.normalizeGuests(this.unwrapSetField(value));
   }
 
-  private parseTableIdUpdateValue(value: unknown): string | null | undefined {
-    if (value === undefined) return undefined;
-    const raw = this.unwrapSetField(value);
-    if (raw === null) return null;
-
-    if (typeof raw !== 'string' && typeof raw !== 'number') {
-      throw new BadRequestException('venue_table_id must be a string');
-    }
-
-    const next = String(raw).trim();
-    return next.length ? next : null;
-  }
-
   private parseTotalAmountUpdateValue(
     value: unknown,
   ): number | null | undefined {
@@ -798,14 +824,84 @@ export class ReservationsService {
     return n;
   }
 
-  private async computeTableTotalAmount(params: {
+  private normalizeReservationStatusUpdate(
+    value: unknown,
+  ): 'pending' | 'confirmed' | 'cancelled' | 'completed' | undefined {
+    if (value === undefined) return undefined;
+    const raw = this.unwrapSetField(value);
+    if (raw === undefined) return undefined;
+
+    if (typeof raw !== 'string') {
+      throw new BadRequestException(
+        'status must be pending|confirmed|cancelled|completed',
+      );
+    }
+
+    const status = raw.trim().toLowerCase();
+    if (
+      status === 'pending' ||
+      status === 'confirmed' ||
+      status === 'cancelled' ||
+      status === 'completed'
+    ) {
+      return status;
+    }
+
+    throw new BadRequestException(
+      'status must be pending|confirmed|cancelled|completed',
+    );
+  }
+
+  // `cancelled` and `completed` are terminal - allowing a PATCH to move a reservation back
+  // out of either (e.g. `cancelled` -> `confirmed`) risks reviving a booking whose table/
+  // slot may already be re-sold to someone else (the partial-unique booking index only
+  // excludes `status <> 'cancelled'` rows, so an "un-cancel" can collide with a newer
+  // booking instead of being rejected cleanly up front). checkinTableReservation already
+  // enforces this for its own transition; this centralizes the same rule for the generic
+  // PATCH path.
+  private static readonly RESERVATION_STATUS_TRANSITIONS: Record<
+    'pending' | 'confirmed' | 'cancelled' | 'completed',
+    ReadonlyArray<'pending' | 'confirmed' | 'cancelled' | 'completed'>
+  > = {
+    pending: ['confirmed', 'cancelled'],
+    confirmed: ['completed', 'cancelled'],
+    cancelled: [],
+    completed: [],
+  };
+
+  private assertValidReservationStatusTransition(
+    from: 'pending' | 'confirmed' | 'cancelled' | 'completed',
+    to: 'pending' | 'confirmed' | 'cancelled' | 'completed',
+  ) {
+    if (from === to) return;
+    const allowed =
+      ReservationsService.RESERVATION_STATUS_TRANSITIONS[from] ?? [];
+    if (!allowed.includes(to)) {
+      throw new BadRequestException(
+        `Impossibile passare una prenotazione da "${from}" a "${to}".`,
+      );
+    }
+  }
+
+  private isActiveTableReservationStatus(status: string | null | undefined) {
+    return (
+      String(status ?? '')
+        .trim()
+        .toLowerCase() !== 'cancelled'
+    );
+  }
+
+  // Repricing helper for guests changing on an already-booked zone (the zone itself can no
+  // longer be reassigned via update - see updateReservation - only guests/total_amount can
+  // change on an existing table reservation).
+  private async computeZoneTotalAmount(params: {
     eventId: string;
-    venueTableId: string;
+    venueTableZoneId: string;
     guests: number;
   }): Promise<Prisma.Decimal | null> {
-    const [table, eventTableCount, eventTableRows] = await Promise.all([
-      this.prisma.venue_tables.findUnique({
-        where: { id: params.venueTableId },
+    const [zone, eventZoneRow] = await Promise.all([
+      this.prisma.venue_table_zones.findUnique({
+        where: { id: params.venueTableZoneId },
         select: {
           id: true,
           venue_id: true,
@@ -814,52 +910,42 @@ export class ReservationsService {
           persone_max: true,
         },
       }),
-      this.prisma.event_tables.count({
-        where: { event_id: params.eventId },
-      }),
-      this.prisma.event_tables.findMany({
+      this.prisma.event_tables.findFirst({
         where: {
           event_id: params.eventId,
-          venue_table_id: params.venueTableId,
+          venue_table_zone_id: params.venueTableZoneId,
         },
         select: {
           per_testa_override: true,
           costo_minimo_override: true,
           persone_max_override: true,
         },
-        take: 1,
       }),
     ]);
 
-    if (!table) throw new NotFoundException('Table not found');
+    if (!zone) throw new NotFoundException('Zone not found');
 
-    const eventTable = eventTableRows[0] ?? null;
-    if (eventTableCount > 0 && !eventTable) {
-      throw new BadRequestException(
-        'Selected table is not enabled for this event',
-      );
-    }
-
-    const eventOverridePerTesta: unknown = eventTable?.per_testa_override;
-    const eventOverrideCostoMinimo: unknown = eventTable?.costo_minimo_override;
-    const eventOverridePersoneMax: unknown = eventTable?.persone_max_override;
+    const eventOverridePerTesta: unknown = eventZoneRow?.per_testa_override;
+    const eventOverrideCostoMinimo: unknown =
+      eventZoneRow?.costo_minimo_override;
+    const eventOverridePersoneMax: unknown = eventZoneRow?.persone_max_override;
 
     const effectivePerTesta: Prisma.Decimal | null =
       eventOverridePerTesta === null || eventOverridePerTesta === undefined
-        ? (table.per_testa ?? null)
+        ? (zone.per_testa ?? null)
         : (eventOverridePerTesta as Prisma.Decimal);
     const effectiveCostoMinimo: Prisma.Decimal | null =
       eventOverrideCostoMinimo === null ||
       eventOverrideCostoMinimo === undefined
-        ? (table.costo_minimo ?? null)
+        ? (zone.costo_minimo ?? null)
         : (eventOverrideCostoMinimo as Prisma.Decimal);
     const effectivePersoneMax: number | null =
       eventOverridePersoneMax === null || eventOverridePersoneMax === undefined
-        ? (table.persone_max ?? null)
+        ? (zone.persone_max ?? null)
         : Number(eventOverridePersoneMax);
 
     if (effectivePersoneMax && params.guests > effectivePersoneMax) {
-      throw new BadRequestException('guests exceeds table persone_max');
+      throw new BadRequestException('guests exceeds zone persone_max');
     }
 
     if (effectivePerTesta) {
@@ -877,6 +963,111 @@ export class ReservationsService {
     return null;
   }
 
+  /** Scalar-only fields of `reservationSelect()` - no nested relations. */
+  private reservationScalarSelect() {
+    return {
+      id: true,
+      user_id: true,
+      event_id: true,
+      venue_table_zone_id: true,
+      table_name: true,
+      meta: true,
+      type: true,
+      status: true,
+      guests: true,
+      actual_guests: true,
+      total_amount: true,
+      qr_token: true,
+      qr_payload: true,
+      checked_in_at: true,
+      checked_in_by_staff_id: true,
+      checkin_entry_id: true,
+      created_at: true,
+    } satisfies Prisma.reservationsSelect;
+  }
+
+  /**
+   * Attaches `user`/`event`(+venue)/`venue_table_zone` to a batch of scalar reservation
+   * rows via batched `findMany({ where: { id: { in: [...] } } })` lookups instead of Prisma
+   * resolving them as nested joins per row. For a small row count this turns 1 query with
+   * nested relations (measured ~600ms+ even for a handful of rows) into flat, independent
+   * queries running concurrently (~1 query's worth of latency).
+   */
+  private async hydrateReservations<
+    T extends {
+      user_id: string;
+      event_id: string;
+      venue_table_zone_id: string | null;
+    },
+  >(rows: T[]) {
+    const userIds = Array.from(new Set(rows.map((r) => r.user_id)));
+    const eventIds = Array.from(new Set(rows.map((r) => r.event_id)));
+    const zoneIds = Array.from(
+      new Set(
+        rows
+          .map((r) => r.venue_table_zone_id)
+          .filter((id): id is string => !!id),
+      ),
+    );
+
+    // `{ in: [] }` is a well-defined empty-result Prisma query (not an error), so these
+    // always run rather than being conditionally skipped - simpler and just as cheap when a
+    // batch happens to have no rows of that kind.
+    const [users, events, zones] = await Promise.all([
+      this.prisma.users.findMany({
+        where: { id: { in: userIds } },
+        select: { id: true, name: true, email: true, phone: true },
+      }),
+      this.prisma.events.findMany({
+        where: { id: { in: eventIds } },
+        select: {
+          id: true,
+          venue_id: true,
+          name: true,
+          date: true,
+          start_time: true,
+          end_time: true,
+          venue: {
+            select: {
+              id: true,
+              name: true,
+              city: true,
+              address: true,
+              latitude: true,
+              longitude: true,
+              image: true,
+            },
+          },
+        },
+      }),
+      this.prisma.venue_table_zones.findMany({
+        where: { id: { in: zoneIds } },
+        select: {
+          id: true,
+          venue_id: true,
+          name: true,
+          per_testa: true,
+          costo_minimo: true,
+          persone_max: true,
+          booking_policy: true,
+        },
+      }),
+    ]);
+
+    const userById = new Map(users.map((u) => [u.id, u]));
+    const eventById = new Map(events.map((e) => [e.id, e]));
+    const zoneById = new Map(zones.map((z) => [z.id, z]));
+
+    return rows.map((row) => ({
+      ...row,
+      user: userById.get(row.user_id) ?? null,
+      event: eventById.get(row.event_id) ?? null,
+      venue_table_zone: row.venue_table_zone_id
+        ? (zoneById.get(row.venue_table_zone_id) ?? null)
+        : null,
+    }));
+  }
+
   async listReservations(params?: {
     eventId?: string;
     userId?: string;
@@ -888,11 +1079,15 @@ export class ReservationsService {
     if (params?.userId) where.user_id = params.userId;
     if (params?.venueId) where.event = { venue_id: params.venueId };
     // date filtering not supported by current schema (no date column)
-    return this.prisma.reservations.findMany({
+    const rows = await this.prisma.reservations.findMany({
       where,
       orderBy: { created_at: 'desc' },
-      select: this.reservationSelect(),
+      // Safety-net cap: unfiltered admin queries (no event_id/user_id) would otherwise scan
+      // every reservation ever made. Callers needing more should use the paginated variant.
+      take: 1000,
+      select: this.reservationScalarSelect(),
     });
+    return this.hydrateReservations(rows);
   }
 
   async listReservationsPaginated(
@@ -952,17 +1147,18 @@ export class ReservationsService {
 
     const guests = this.normalizeGuests(normalized.guests);
 
-    const event = await this.prisma.events.findUnique({
-      where: { id: eventId },
-      select: { id: true, venue_id: true },
-    });
+    const [event, userRecord] = await Promise.all([
+      this.prisma.events.findUnique({
+        where: { id: eventId },
+        select: { id: true, venue_id: true },
+      }),
+      // ❗ Saltiamo il controllo duplicati se è un account venue
+      this.prisma.users.findUnique({
+        where: { id: userId },
+        select: { role: true },
+      }),
+    ]);
     if (!event) throw new NotFoundException('Event not found');
-
-    // ❗ Saltiamo il controllo duplicati se è un account venue
-    const userRecord = await this.prisma.users.findUnique({
-      where: { id: userId },
-      select: { role: true },
-    });
 
     if (userRecord?.role !== 'venue') {
       const existingReservationForEvent =
@@ -970,6 +1166,7 @@ export class ReservationsService {
           where: {
             user_id: userId,
             event_id: eventId,
+            type,
             status: { in: ['pending', 'confirmed', 'completed'] },
           },
           select: { id: true },
@@ -977,14 +1174,19 @@ export class ReservationsService {
 
       if (existingReservationForEvent) {
         throw new BadRequestException(
-          'Hai già una prenotazione per questa serata',
+          type === 'table'
+            ? 'Hai già un tavolo prenotato per questa serata'
+            : 'Sei già in lista per questa serata',
         );
       }
     }
 
     const incomingMeta = this.asObjectRecord(normalized.meta);
     const referralCode = this.parseTrackingCodeFromMeta(incomingMeta);
-    const invitedByUserId = this.readMetaString(incomingMeta, 'inviter_user_id');
+    const invitedByUserId = this.readMetaString(
+      incomingMeta,
+      'inviter_user_id',
+    );
     const prMembershipOrFilters: Prisma.venue_pr_membershipsWhereInput[] = [
       ...(referralCode
         ? [{ ref_code: { equals: referralCode, mode: 'insensitive' as const } }]
@@ -1011,7 +1213,9 @@ export class ReservationsService {
 
     const isPrComplimentaryEntry =
       type === 'entry' &&
-      Boolean(prMembership && this.roleHasDefaultPrComplimentary(prMembership.role));
+      Boolean(
+        prMembership && this.roleHasDefaultPrComplimentary(prMembership.role),
+      );
 
     const referralMeta: ReservationReferralMeta | null =
       prMembership || referralCode || invitedByUserId
@@ -1028,8 +1232,8 @@ export class ReservationsService {
           }
         : null;
 
-    const venueTableId: string | null | undefined =
-      normalized.venue_table_id ?? null;
+    const venueTableZoneId: string | null | undefined =
+      normalized.venue_table_zone_id ?? null;
     const tableName = this.normalizeTableName(normalized.table_name);
     const tableReservationMeta =
       type === 'table'
@@ -1057,72 +1261,34 @@ export class ReservationsService {
     }
 
     if (type === 'table') {
-      if (!venueTableId) {
+      if (!venueTableZoneId) {
         throw new BadRequestException(
           'venue_zone_id required for table reservations',
         );
       }
 
-      const [table, eventTableCount, eventTableRows] = await Promise.all([
-        this.prisma.venue_tables.findUnique({
-          where: { id: venueTableId },
-          select: {
-            id: true,
-            venue_id: true,
-            per_testa: true,
-            costo_minimo: true,
-            persone_max: true,
-          },
-        }),
-        this.prisma.event_tables.count({
-          where: { event_id: eventId },
-        }),
-        this.prisma.event_tables.findMany({
-          where: {
-            event_id: eventId,
-            venue_table_id: venueTableId,
-          },
-          select: {
-            per_testa_override: true,
-            costo_minimo_override: true,
-            persone_max_override: true,
-          },
-          take: 1,
-        }),
-      ]);
-      const eventTable = eventTableRows[0] ?? null;
-      if (!table) throw new NotFoundException('Table not found');
-      if (table.venue_id !== event.venue_id) {
+      const zone = await this.prisma.venue_table_zones.findUnique({
+        where: { id: venueTableZoneId },
+        select: {
+          id: true,
+          venue_id: true,
+          per_testa: true,
+          costo_minimo: true,
+          persone_max: true,
+          is_active: true,
+        },
+      });
+      if (!zone) throw new NotFoundException('Zone not found');
+      if (!zone.is_active) throw new BadRequestException('Zone is not active');
+      if (zone.venue_id !== event.venue_id) {
         throw new BadRequestException(
-          'Selected table does not belong to this event venue',
+          'Selected zone does not belong to this event venue',
         );
       }
 
-      if (eventTableCount > 0 && !eventTable) {
-        throw new BadRequestException(
-          'Selected table is not enabled for this event',
-        );
-      }
-
-      const eventOverridePerTesta: unknown = eventTable?.per_testa_override;
-      const eventOverrideCostoMinimo: unknown =
-        eventTable?.costo_minimo_override;
-      const eventOverridePersoneMax: unknown = eventTable?.persone_max_override;
-
-      const effectivePerTesta: Prisma.Decimal | null =
-        eventOverridePerTesta === null || eventOverridePerTesta === undefined
-          ? (table.per_testa ?? null)
-          : (eventOverridePerTesta as Prisma.Decimal);
-      const effectiveCostoMinimo: Prisma.Decimal | null =
-        eventOverrideCostoMinimo === null ||
-        eventOverrideCostoMinimo === undefined
-          ? (table.costo_minimo ?? null)
-          : (eventOverrideCostoMinimo as Prisma.Decimal);
-      const effectivePersoneMax: number | null =
-        eventOverridePersoneMax === null ||
-        eventOverridePersoneMax === undefined
-          ? (table.persone_max ?? null)
-          : Number(eventOverridePersoneMax);
+      const effectivePerTesta = zone.per_testa ?? null;
+      const effectiveCostoMinimo = zone.costo_minimo ?? null;
+      const effectivePersoneMax = zone.persone_max ?? null;
 
       if (effectivePersoneMax && guests > effectivePersoneMax) {
         throw new BadRequestException('guests exceeds table persone_max');
@@ -1145,18 +1311,12 @@ export class ReservationsService {
       }
     }
 
-    const status = normalized?.status;
-    if (
-      status !== undefined &&
-      status !== 'pending' &&
-      status !== 'confirmed' &&
-      status !== 'cancelled' &&
-      status !== 'completed'
-    ) {
-      throw new BadRequestException(
-        'status must be pending|confirmed|cancelled|completed',
-      );
-    }
+    // Entry (lista) reservations don't require venue approval, so they're confirmed
+    // immediately; the venue confirms table reservations explicitly before they occupy
+    // the zone. Neither can be set by the caller - see checkinTableReservation() for how
+    // a table reservation later becomes `completed`, and scanEntryQr() for entries.
+    const status: 'pending' | 'confirmed' =
+      type === 'entry' ? 'confirmed' : 'pending';
 
     const qrToken = type === 'entry' ? randomUUID() : undefined;
 
@@ -1166,7 +1326,7 @@ export class ReservationsService {
           data: {
             user_id: userId,
             event_id: eventId,
-            venue_table_id: type === 'table' ? venueTableId : null,
+            venue_table_zone_id: type === 'table' ? venueTableZoneId : null,
             table_name: type === 'table' ? tableName : null,
             meta: reservationMeta,
             type,
@@ -1175,40 +1335,24 @@ export class ReservationsService {
             total_amount: totalAmount,
             qr_token: qrToken,
           },
-          include: {
-            user: {
-              select: {
-                id: true,
-                name: true,
-                email: true,
-                phone: true,
-              },
-            },
-            event: {
-              select: {
-                id: true,
-                venue_id: true,
-                name: true,
-                date: true,
-                start_time: true,
-                end_time: true,
-              },
-            },
-            venue_table: true,
-          },
+          select: this.reservationSelect(),
         });
       } catch (error: unknown) {
         const { code: prismaCode, message } = this.getErrorDetails(error);
         const errorMessage = message.toLowerCase();
         if (
           prismaCode === 'P2002' ||
-          errorMessage.includes('reservations_unique_active_user_event_idx') ||
+          errorMessage.includes(
+            'reservations_unique_active_user_event_type_idx',
+          ) ||
           errorMessage.includes(
             'duplicate key value violates unique constraint',
           )
         ) {
           throw new BadRequestException(
-            'Hai già una prenotazione per questa serata',
+            type === 'table'
+              ? 'Hai già un tavolo prenotato per questa serata'
+              : 'Sei già in lista per questa serata',
           );
         }
         throw error;
@@ -1218,9 +1362,20 @@ export class ReservationsService {
     const createdId = createdReservation.id;
     let finalReservation = createdReservation;
 
+    this.evaluateBadges(userId);
+
     if (type === 'table') {
       const createdWithMeta = await this.getReservation(createdId);
-      await this.notifyInvitedFriendsOfNewTableReservation(createdWithMeta);
+
+      void this.notifyInvitedFriendsOfNewTableReservation(
+        createdWithMeta,
+      ).catch((error) => {
+        this.logger.error(
+          `Failed to notify invited friends for reservation ${createdId}`,
+          error instanceof Error ? error.stack : undefined,
+        );
+      });
+
       finalReservation = createdWithMeta;
     }
 
@@ -1238,27 +1393,7 @@ export class ReservationsService {
     return this.prisma.reservations.update({
       where: { id: createdId },
       data: { qr_payload: qrPayload },
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            phone: true,
-          },
-        },
-        event: {
-          select: {
-            id: true,
-            venue_id: true,
-            name: true,
-            date: true,
-            start_time: true,
-            end_time: true,
-          },
-        },
-        venue_table: true,
-      },
+      select: this.reservationSelect(),
     });
   }
 
@@ -1276,6 +1411,15 @@ export class ReservationsService {
     if (!qrData) throw new BadRequestException('qr_data required');
 
     const parsed = this.parseQrData(qrData);
+
+    if (parsed.passType === 'pr_season_pass') {
+      return this.checkInPrSeasonPassByQr({
+        eventId,
+        staffId,
+        qrData,
+        parsed,
+      });
+    }
 
     let reservation =
       (parsed.qrToken
@@ -1299,7 +1443,9 @@ export class ReservationsService {
           user: {
             select: { id: true, sesso: true, name: true, birth_date: true },
           },
-          event: { select: { id: true, name: true, venue_id: true, date: true } },
+          event: {
+            select: { id: true, name: true, venue_id: true, date: true },
+          },
         },
       });
     }
@@ -1317,7 +1463,9 @@ export class ReservationsService {
           user: {
             select: { id: true, sesso: true, name: true, birth_date: true },
           },
-          event: { select: { id: true, name: true, venue_id: true, date: true } },
+          event: {
+            select: { id: true, name: true, venue_id: true, date: true },
+          },
         },
       });
     }
@@ -1370,6 +1518,25 @@ export class ReservationsService {
     });
 
     const result = await this.prisma.$transaction(async (tx) => {
+      // Atomically claims the check-in: `checked_in_at: null` in the WHERE is what makes
+      // this a compare-and-swap instead of a plain write. Two near-simultaneous scans of
+      // the same QR can both pass the pre-transaction guard above (it reads before either
+      // has written), but only one of them can match this WHERE clause once the other has
+      // already flipped `checked_in_at` - the loser gets `count: 0` and backs off instead
+      // of creating a second `entries` row for the same reservation.
+      const claim = await tx.reservations.updateMany({
+        where: { id: reservation.id, checked_in_at: null },
+        data: {
+          status: 'completed',
+          checked_in_at: new Date(),
+          checked_in_by_staff_id: staffId,
+        },
+      });
+
+      if (claim.count === 0) {
+        return { alreadyCheckedIn: true as const };
+      }
+
       const createdEntry = await tx.entries.create({
         data: {
           event_id: eventId,
@@ -1385,12 +1552,7 @@ export class ReservationsService {
 
       const updatedReservation = await tx.reservations.update({
         where: { id: reservation.id },
-        data: {
-          status: 'completed',
-          checked_in_at: new Date(),
-          checked_in_by_staff_id: staffId,
-          checkin_entry_id: createdEntry.id,
-        },
+        data: { checkin_entry_id: createdEntry.id },
         include: {
           user: { select: { id: true, name: true, email: true, phone: true } },
           event: {
@@ -1403,18 +1565,259 @@ export class ReservationsService {
               end_time: true,
             },
           },
-          venue_table: true,
+          venue_table_zone: true,
         },
       });
 
-      return { createdEntry, updatedReservation };
+      return { alreadyCheckedIn: false as const, createdEntry, updatedReservation };
     });
+
+    if (result.alreadyCheckedIn) {
+      return {
+        success: true,
+        alreadyCheckedIn: true,
+        reservation,
+      };
+    }
+
+    this.evaluateBadges(reservation.user_id);
 
     return {
       success: true,
       alreadyCheckedIn: false,
       reservation: result.updatedReservation,
       entry: result.createdEntry,
+    };
+  }
+
+  private async checkInPrSeasonPassByQr(params: {
+    eventId: string;
+    staffId: string;
+    qrData: string;
+    parsed: ParsedQrData;
+  }): Promise<QrCheckInResult> {
+    const event = await this.prisma.events.findUnique({
+      where: { id: params.eventId },
+      select: { id: true, venue_id: true, date: true },
+    });
+    if (!event) {
+      throw new NotFoundException('Event not found');
+    }
+
+    const token = String(params.parsed.qrToken || '').trim();
+    const passId = String(params.parsed.passId || '').trim();
+    const normalizedPassId = /^[0-9a-fA-F-]{36}$/.test(passId) ? passId : '';
+    const passRows = token
+      ? await this.prisma.$queryRaw<PrSeasonPassLookupRow[]>(Prisma.sql`
+          SELECT
+            p.id,
+            p.venue_id,
+            p.pr_membership_id,
+            p.user_id,
+            p.status::text AS status,
+            p.valid_from,
+            p.valid_until,
+            p.revoked_at,
+            p.qr_token,
+            m.is_active AS membership_is_active
+          FROM venue_pr_membership_passes p
+          JOIN venue_pr_memberships m ON m.id = p.pr_membership_id
+          WHERE p.qr_token = ${token}
+          LIMIT 1
+        `)
+      : normalizedPassId
+        ? await this.prisma.$queryRaw<PrSeasonPassLookupRow[]>(Prisma.sql`
+            SELECT
+              p.id,
+              p.venue_id,
+              p.pr_membership_id,
+              p.user_id,
+              p.status::text AS status,
+              p.valid_from,
+              p.valid_until,
+              p.revoked_at,
+              p.qr_token,
+              m.is_active AS membership_is_active
+            FROM venue_pr_membership_passes p
+            JOIN venue_pr_memberships m ON m.id = p.pr_membership_id
+            WHERE p.id = ${normalizedPassId}::uuid
+            LIMIT 1
+          `)
+        : [];
+
+    const pass = passRows[0] ?? null;
+    if (!pass) {
+      throw new NotFoundException('Season pass not found for this QR');
+    }
+
+    if (pass.venue_id !== event.venue_id) {
+      throw new BadRequestException(
+        'Season pass does not belong to this venue',
+      );
+    }
+
+    if (!pass.membership_is_active) {
+      throw new BadRequestException('Season pass membership is not active');
+    }
+
+    if (pass.status === 'revoked' || pass.revoked_at) {
+      throw new BadRequestException('Season pass revoked');
+    }
+
+    const now = new Date();
+    if (pass.valid_from.getTime() > now.getTime()) {
+      throw new BadRequestException('Season pass is not valid yet');
+    }
+    if (
+      pass.status === 'expired' ||
+      pass.valid_until.getTime() < now.getTime()
+    ) {
+      throw new BadRequestException('Season pass expired');
+    }
+
+    const existingScanRows = await this.prisma.$queryRaw<
+      { id: string; entry_id: string | null }[]
+    >(Prisma.sql`
+      SELECT id, entry_id
+      FROM venue_pr_membership_pass_scans
+      WHERE pass_id = ${pass.id}::uuid
+        AND event_id = ${event.id}::uuid
+        AND scan_result = 'accepted'
+      ORDER BY scanned_at DESC
+      LIMIT 1
+    `);
+
+    const existingScan = existingScanRows[0] ?? null;
+    if (existingScan) {
+      const existingEntry = existingScan.entry_id
+        ? await this.prisma.entries.findUnique({
+            where: { id: existingScan.entry_id },
+          })
+        : null;
+      return {
+        success: true,
+        alreadyCheckedIn: true,
+        reservation: null,
+        entry: existingEntry ?? undefined,
+      };
+    }
+
+    const userProfile = await this.prisma.users.findUnique({
+      where: { id: pass.user_id },
+      select: { id: true, sesso: true, birth_date: true },
+    });
+
+    const gender =
+      userProfile?.sesso === 'M'
+        ? Gender.M
+        : userProfile?.sesso === 'F'
+          ? Gender.F
+          : Gender.ALTRO;
+
+    const ageBucket = this.ageBucketFromBirthDate(
+      userProfile?.birth_date ?? null,
+      new Date(),
+    );
+
+    const entryPrice = await resolveEntryUnitPrice({
+      prisma: this.prisma,
+      eventId: event.id,
+      gender,
+      isComplimentary: true,
+    });
+
+    let createdEntry;
+    try {
+      createdEntry = await this.prisma.$transaction(async (tx) => {
+        const entry = await tx.entries.create({
+          data: {
+            event_id: event.id,
+            user_id: pass.user_id,
+            staff_id: params.staffId,
+            pr_membership_id: pass.pr_membership_id,
+            sesso: gender,
+            age_bucket: ageBucket,
+            price: entryPrice,
+            is_complimentary: true,
+            method: EntryMethod.QR,
+          },
+        });
+
+        // A unique partial index on (pass_id, event_id) WHERE scan_result='accepted' is
+        // the real guard here (migration 20260814130000) - the pre-check above ran before
+        // this transaction, so it can't stop two near-simultaneous scans on its own. The
+        // loser of the race hits a unique-violation on this insert instead.
+        await tx.$executeRaw(Prisma.sql`
+          INSERT INTO venue_pr_membership_pass_scans (
+            id,
+            pass_id,
+            venue_id,
+            event_id,
+            pr_membership_id,
+            scanned_by_user_id,
+            entry_id,
+            scan_result,
+            qr_payload,
+            scanned_at,
+            created_at
+          )
+          VALUES (
+            ${randomUUID()}::uuid,
+            ${pass.id}::uuid,
+            ${pass.venue_id}::uuid,
+            ${event.id}::uuid,
+            ${pass.pr_membership_id}::uuid,
+            ${params.staffId}::uuid,
+            ${entry.id}::uuid,
+            'accepted',
+            ${params.qrData},
+            NOW(),
+            NOW()
+          )
+        `);
+
+        return entry;
+      });
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2010' &&
+        String((error.meta as { code?: string } | undefined)?.code) === '23505'
+      ) {
+        const winnerRows = await this.prisma.$queryRaw<
+          { id: string; entry_id: string | null }[]
+        >(Prisma.sql`
+          SELECT id, entry_id
+          FROM venue_pr_membership_pass_scans
+          WHERE pass_id = ${pass.id}::uuid
+            AND event_id = ${event.id}::uuid
+            AND scan_result = 'accepted'
+          ORDER BY scanned_at DESC
+          LIMIT 1
+        `);
+        const winner = winnerRows[0] ?? null;
+        const winnerEntry = winner?.entry_id
+          ? await this.prisma.entries.findUnique({
+              where: { id: winner.entry_id },
+            })
+          : null;
+        return {
+          success: true,
+          alreadyCheckedIn: true,
+          reservation: null,
+          entry: winnerEntry ?? undefined,
+        };
+      }
+      throw error;
+    }
+
+    this.evaluateBadges(pass.user_id);
+
+    return {
+      success: true,
+      alreadyCheckedIn: false,
+      reservation: null,
+      entry: createdEntry,
     };
   }
 
@@ -1441,10 +1844,9 @@ export class ReservationsService {
         end_time?: Date | string | null;
         venue_id?: string | null;
       } | null;
-      venue_table?: {
+      venue_table_zone?: {
         id: string;
-        nome?: string | null;
-        zona?: string | null;
+        name?: string | null;
       } | null;
     };
     invite: TableInviteMetaItem;
@@ -1544,22 +1946,28 @@ export class ReservationsService {
 
   private async notifyTableInviteesAboutStatusChange(reservation: {
     id: string;
+    user_id: string;
     status: string;
     table_name?: string | null;
     meta?: unknown;
     event?: { name: string | null } | null;
   }) {
     const meta = this.parseTableReservationMeta(reservation.meta);
-    if (!meta?.table_invites.length) return;
-
-    const activeInviteeIds = meta.table_invites
+    const activeInviteeIds = (meta?.table_invites ?? [])
       .filter((invite) => invite.status !== 'declined')
       .map((invite) => invite.user_id);
-    if (!activeInviteeIds.length) return;
+
+    // Notify the person who actually made the booking too, not just the invitees they
+    // added - this used to be silently skipped, so a venue confirming/cancelling a
+    // reservation never reached the booker themselves, only whoever they'd invited.
+    const recipientIds = Array.from(
+      new Set([reservation.user_id, ...activeInviteeIds]),
+    );
+    if (!recipientIds.length) return;
 
     const recipients = await this.prisma.users.findMany({
       where: {
-        id: { in: activeInviteeIds },
+        id: { in: recipientIds },
         push_token: { not: null },
       },
       select: { push_token: true },
@@ -1602,9 +2010,13 @@ export class ReservationsService {
   }
 
   async listIncomingTableInvitations(userId: string) {
+    // Invite membership lives inside the JSON `meta` column, so it can't be filtered in
+    // SQL directly. Scope to non-cancelled reservations (cancelled invites are no longer
+    // "incoming") and cap the scan so this stays bounded as the table grows.
     const reservations = await this.prisma.reservations.findMany({
-      where: { type: 'table' },
+      where: { type: 'table', status: { not: 'cancelled' } },
       orderBy: { created_at: 'desc' },
+      take: 2000,
       select: incomingTableInvitationReservationSelect,
     });
 
@@ -1768,32 +2180,36 @@ export class ReservationsService {
     updates: Prisma.reservationsUpdateInput & { status?: unknown },
   ) {
     const existing = await this.getReservation(id);
+    const nextStatus = this.normalizeReservationStatusUpdate(
+      (updates as Record<string, unknown>).status,
+    );
+    if (nextStatus !== undefined) {
+      this.assertValidReservationStatusTransition(
+        existing.status as 'pending' | 'confirmed' | 'cancelled' | 'completed',
+        nextStatus,
+      );
+      updates.status = nextStatus;
+    }
 
     if (existing.type === 'table') {
       const nextGuests = this.parseGuestsUpdateValue(
         (updates as Record<string, unknown>).guests,
-      );
-      const nextTableId = this.parseTableIdUpdateValue(
-        (updates as Record<string, unknown>).venue_table_id,
       );
       const nextTotalAmount = this.parseTotalAmountUpdateValue(
         (updates as Record<string, unknown>).total_amount,
       );
 
       const effectiveGuests = nextGuests ?? existing.guests;
-      const effectiveTableId =
-        nextTableId === undefined ? existing.venue_table_id : nextTableId;
+      const effectiveStatus = nextStatus ?? existing.status;
 
       const hasPricingRelevantUpdate =
-        nextGuests !== undefined ||
-        nextTableId !== undefined ||
-        nextTotalAmount !== undefined;
+        nextGuests !== undefined || nextTotalAmount !== undefined;
 
       if (hasPricingRelevantUpdate) {
-        if (effectiveTableId) {
-          const computedTotal = await this.computeTableTotalAmount({
+        if (nextGuests !== undefined && existing.venue_table_zone_id) {
+          const computedTotal = await this.computeZoneTotalAmount({
             eventId: existing.event_id,
-            venueTableId: effectiveTableId,
+            venueTableZoneId: existing.venue_table_zone_id,
             guests: effectiveGuests,
           });
 
@@ -1804,11 +2220,7 @@ export class ReservationsService {
               nextTotalAmount === null
                 ? null
                 : new Prisma.Decimal(nextTotalAmount);
-          } else if (
-            nextGuests !== undefined &&
-            existing.total_amount !== null &&
-            existing.guests > 0
-          ) {
+          } else if (existing.total_amount !== null && existing.guests > 0) {
             const scaled =
               Number(existing.total_amount) *
               (effectiveGuests / existing.guests);
@@ -1833,33 +2245,60 @@ export class ReservationsService {
           }
         }
       }
+
+      if (
+        this.isActiveTableReservationStatus(effectiveStatus) &&
+        !existing.venue_table_zone_id
+      ) {
+        throw new BadRequestException(
+          'venue_table_zone_id required for table reservations',
+        );
+      }
     }
 
-    const updated = await this.prisma.reservations.update({
-      where: { id },
-      data: updates,
-      include: {
-        user: {
-          select: { id: true, name: true, email: true, phone: true },
-        },
-        event: {
-          select: {
-            id: true,
-            venue_id: true,
-            name: true,
-            date: true,
-            start_time: true,
-            end_time: true,
+    const updated = await (async () => {
+      try {
+        return await this.prisma.reservations.update({
+          where: { id },
+          data: updates,
+          include: {
+            user: {
+              select: { id: true, name: true, email: true, phone: true },
+            },
+            event: {
+              select: {
+                id: true,
+                venue_id: true,
+                name: true,
+                date: true,
+                start_time: true,
+                end_time: true,
+              },
+            },
+            venue_table_zone: true,
           },
-        },
-        venue_table: true,
-      },
-    });
+        });
+      } catch (error: unknown) {
+        const { code: prismaCode, message } = this.getErrorDetails(error);
+        const errorMessage = message.toLowerCase();
+        if (
+          prismaCode === 'P2002' ||
+          errorMessage.includes(
+            'reservations_unique_active_user_event_type_idx',
+          ) ||
+          errorMessage.includes(
+            'duplicate key value violates unique constraint',
+          )
+        ) {
+          throw new BadRequestException(
+            'Hai già un tavolo prenotato per questa serata',
+          );
+        }
+        throw error;
+      }
+    })();
 
     const updatedFull = await this.getReservation(updated.id);
-
-    const nextStatus =
-      typeof updates.status === 'string' ? updates.status : undefined;
 
     if (
       existing.type === 'table' &&
@@ -1891,7 +2330,7 @@ export class ReservationsService {
             end_time: true,
           },
         },
-        venue_table: true,
+        venue_table_zone: true,
       },
     });
 
@@ -1901,6 +2340,94 @@ export class ReservationsService {
       await this.notifyTableInviteesAboutStatusChange(updatedFull);
     }
 
+    return updatedFull;
+  }
+
+  // Called by the sync-status cron endpoint. A table reservation the venue never responds
+  // to (still `pending`) has no natural end otherwise - this is what gives it one. Entry
+  // reservations don't need this: they're created directly `confirmed` in the common case
+  // (see createReservation) and aren't awaiting venue approval the same way.
+  private static readonly PENDING_RESERVATION_TTL_HOURS = 24;
+
+  async expireStalePendingReservations() {
+    const cutoff = new Date(
+      Date.now() -
+        ReservationsService.PENDING_RESERVATION_TTL_HOURS * 60 * 60 * 1000,
+    );
+
+    const { count } = await this.prisma.reservations.updateMany({
+      where: {
+        type: 'table',
+        status: 'pending',
+        created_at: { lt: cutoff },
+      },
+      data: { status: 'cancelled' },
+    });
+
+    return { success: true, expired: count };
+  }
+
+  // Hostess: marks a confirmed table reservation as arrived at the venue - this is what
+  // flips a table from "confirmed" to "completed" (entries instead become `completed` via
+  // scanEntryQr()). Only confirmed tables can arrive: pending ones haven't been approved by
+  // the venue yet, and cancelled/already-completed ones can't transition again.
+  async checkinTableReservation(
+    id: string,
+    staffId: string,
+    actualGuests?: unknown,
+  ) {
+    const existing = await this.getReservation(id);
+
+    if (existing.type !== 'table') {
+      throw new BadRequestException(
+        'Only table reservations can be checked in this way',
+      );
+    }
+    if (existing.status !== 'confirmed') {
+      throw new BadRequestException(
+        'Only confirmed table reservations can be marked as arrived',
+      );
+    }
+
+    let normalizedActualGuests: number | undefined;
+    if (actualGuests !== undefined && actualGuests !== null) {
+      const n = Number(actualGuests);
+      if (!Number.isInteger(n) || n < 0) {
+        throw new BadRequestException('actual_guests must be an integer >= 0');
+      }
+      normalizedActualGuests = n;
+    }
+
+    const updated = await this.prisma.reservations.update({
+      where: { id },
+      data: {
+        status: 'completed',
+        checked_in_at: new Date(),
+        checked_in_by_staff_id: staffId,
+        ...(normalizedActualGuests !== undefined
+          ? { actual_guests: normalizedActualGuests }
+          : {}),
+      },
+      include: {
+        user: {
+          select: { id: true, name: true, email: true, phone: true },
+        },
+        event: {
+          select: {
+            id: true,
+            venue_id: true,
+            name: true,
+            date: true,
+            start_time: true,
+            end_time: true,
+          },
+        },
+        venue_table_zone: true,
+      },
+    });
+
+    const updatedFull = await this.getReservation(updated.id);
+    await this.notifyTableInviteesAboutStatusChange(updatedFull);
     return updatedFull;
   }
 }

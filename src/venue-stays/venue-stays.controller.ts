@@ -1,4 +1,11 @@
-import { BadRequestException, Controller, Get, Post, Query, Body } from '@nestjs/common';
+import {
+  BadRequestException,
+  Controller,
+  Get,
+  Post,
+  Query,
+  Body,
+} from '@nestjs/common';
 import { VenueStaysService } from './venue-stays.service';
 import { VenueStayCheckpointDto } from './dto/venue-stay-checkpoint.dto';
 import { Roles } from '../auth/roles.decorator';
@@ -11,7 +18,10 @@ export class VenueStaysController {
 
   @Post('checkpoint')
   @Roles('client')
-  checkpoint(@Body() body: VenueStayCheckpointDto, @CurrentUser() user: RequestUser) {
+  checkpoint(
+    @Body() body: VenueStayCheckpointDto,
+    @CurrentUser() user: RequestUser,
+  ) {
     return this.venueStaysService.checkpoint({
       user_id: user.id,
       venue_id: body.venue_id,
@@ -38,7 +48,8 @@ export class VenueStaysController {
 
     if (user.role === 'venue') {
       const scopedVenueId = user.venue_id ?? undefined;
-      if (!scopedVenueId) throw new BadRequestException('Missing venue_id for this user');
+      if (!scopedVenueId)
+        throw new BadRequestException('Missing venue_id for this user');
       return this.venueStaysService.list({
         venue_id: scopedVenueId,
         event_id: eventId,

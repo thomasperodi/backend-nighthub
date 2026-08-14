@@ -13,5 +13,19 @@
       "source": "/(.*)",
       "destination": "/api/index"
     }
+  ],
+  "crons": [
+    {
+      "path": "/events/sync-status",
+      "schedule": "*/15 * * * *"
+    },
+    {
+      "path": "/reservations/sync-status",
+      "schedule": "0 * * * *"
+    },
+    {
+      "path": "/auth/cleanup-tokens",
+      "schedule": "0 4 * * *"
+    }
   ]
 }

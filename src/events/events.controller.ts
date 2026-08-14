@@ -16,7 +16,7 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
-import { JwtService } from '@nestjs/jwt';
+import { AuthService } from '../auth/auth.service';
 import { EventsService } from './events.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { UpdateEventDto } from './dto/update-event.dto';
@@ -25,26 +25,29 @@ import { Roles } from '../auth/roles.decorator';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { RequestUser } from '../auth/types';
 
+type UploadedPosterFile = {
+  originalname?: string;
+  mimetype?: string;
+  buffer: Buffer;
+};
+
 @Controller()
 export class EventsController {
   constructor(
     private readonly eventsService: EventsService,
-    private readonly jwtService: JwtService,
+    private readonly authService: AuthService,
   ) {}
 
+  // Reuses AuthService.verifyAccessToken (the same verification JwtAuthGuard uses for every
+  // other request) instead of re-implementing JWT verification here - this endpoint is
+  // @Public() (see syncStatus below) specifically so it can also be called by a scheduler
+  // with a shared secret, which is why it can't just rely on the global guard.
   private assertStaffAuth(authorization?: string) {
     const token = authorization?.replace(/^Bearer\s+/i, '') || undefined;
     if (!token) throw new UnauthorizedException('Missing Authorization token');
 
-    let payload: { role?: string };
-    try {
-      payload = this.jwtService.verify<{ role?: string }>(token);
-    } catch {
-      throw new UnauthorizedException('Invalid token');
-    }
-
-    const role = String(payload?.role || '').toLowerCase();
-    if (!role || role === 'client') {
+    const user = this.authService.verifyAccessToken(token);
+    if (!user.role || user.role === 'client') {
       throw new ForbiddenException('Insufficient permissions');
     }
   }
@@ -54,21 +57,25 @@ export class EventsController {
     headerSecret?: string;
     authorization?: string;
   }) {
-    // Prefer staff auth if provided
+    // Vercel Cron Jobs automatically send `Authorization: Bearer <CRON_SECRET>` on every
+    // invocation - check that match first (cheap, no crypto) before falling back to
+    // treating `authorization` as a staff JWT, which is how this endpoint can also be
+    // triggered manually by staff.
+    const expected = process.env.CRON_SECRET || '';
+    const bearerMatch = /^Bearer\s+(.+)$/i.exec(params.authorization || '');
+    const providedSecret =
+      params.headerSecret || bearerMatch?.[1] || params.token || '';
+    if (expected && providedSecret === expected) return;
+
     if (params.authorization) {
       this.assertStaffAuth(params.authorization);
       return;
     }
 
-    const expected = process.env.CRON_SECRET || '';
     if (!expected) {
       throw new ForbiddenException('CRON_SECRET is not configured');
     }
-
-    const provided = params.headerSecret || params.token || '';
-    if (!provided || provided !== expected) {
-      throw new ForbiddenException('Invalid cron secret');
-    }
+    throw new ForbiddenException('Invalid cron secret');
   }
 
   @Get('events')
@@ -101,6 +108,34 @@ export class EventsController {
     return this.eventsService.listEvents({ venue_id, status, date });
   }
 
+  // Used by Vercel Cron (or other scheduler) to keep DB status up-to-date even with no
+  // client traffic. Must be registered before `events/:id` below - Nest/Express match
+  // routes in registration order, and `:id` would otherwise swallow this literal path
+  // (a request to /events/sync-status would be treated as getOne(id="sync-status") and
+  // fail with a Prisma "invalid UUID" error instead of ever reaching this handler).
+  @Get('events/sync-status')
+  @Public()
+  async syncStatus(
+    @Query('token') token?: string,
+    @Headers('x-cron-secret') headerSecret?: string,
+    @Headers('authorization') authorization?: string,
+  ) {
+    this.assertCronAuth({ token, headerSecret, authorization });
+    const [statusResult, autoFeaturedResult] = await Promise.all([
+      this.eventsService.syncEventStatusesNow({
+        daysBack: 2,
+        daysForward: 2,
+      }),
+      this.eventsService.evaluateAutoFeaturedEvents(),
+    ]);
+
+    return {
+      success: statusResult.success && autoFeaturedResult.success,
+      statusUpdated: statusResult.updated,
+      autoFeaturedUpdated: autoFeaturedResult.updated,
+    };
+  }
+
   @Get('events/:id')
   @Public()
   getOne(@Param('id') id: string, @Res({ passthrough: true }) res?: Response) {
@@ -109,6 +144,12 @@ export class EventsController {
       'public, max-age=0, s-maxage=60, stale-while-revalidate=600',
     );
     return this.eventsService.getEvent(id);
+  }
+
+  @Get('events/:id/friends-going')
+  @Roles('client')
+  getFriendsGoing(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    return this.eventsService.getFriendsGoing(id, user.id);
   }
 
   @Get('events/:id/stats')
@@ -127,6 +168,9 @@ export class EventsController {
     if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       dto.venue_id = user.venue_id;
+      // Paid featured placement is admin-granted, not something a venue can set on its own
+      // event - see the doc comment on `is_featured` in schema.prisma.
+      dto.is_featured = false;
     }
     return this.eventsService.createEvent(dto);
   }
@@ -136,7 +180,7 @@ export class EventsController {
   @Post('events/poster')
   @Roles('venue', 'admin')
   @UseInterceptors(FileInterceptor('file'))
-  uploadPoster(@UploadedFile() file?: Express.Multer.File) {
+  uploadPoster(@UploadedFile() file?: UploadedPosterFile) {
     return this.eventsService.uploadEventPoster(file);
   }
 
@@ -164,8 +208,22 @@ export class EventsController {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       await this.eventsService.assertEventBelongsToVenue(id, user.venue_id);
       dto.venue_id = user.venue_id;
+      // Same reasoning as create(): a venue can't grant itself is_featured - leaving the
+      // field undefined (not false) means EventsService.updateEvent leaves whatever value
+      // is already there untouched, instead of silently un-featuring an admin/auto grant.
+      delete dto.is_featured;
     }
     return this.eventsService.updateEvent(id, dto);
+  }
+
+  @Post('events/:id/cancel')
+  @Roles('venue', 'admin')
+  async cancel(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    if (user.role !== 'admin') {
+      if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
+      await this.eventsService.assertEventBelongsToVenue(id, user.venue_id);
+    }
+    return this.eventsService.cancelEvent(id);
   }
 
   @Delete('events/:id')
@@ -176,20 +234,5 @@ export class EventsController {
       await this.eventsService.assertEventBelongsToVenue(id, user.venue_id);
     }
     return this.eventsService.deleteEvent(id);
-  }
-
-  // Used by Vercel Cron (or other scheduler) to keep DB status up-to-date even with no client traffic.
-  @Get('events/sync-status')
-  @Public()
-  syncStatus(
-    @Query('token') token?: string,
-    @Headers('x-cron-secret') headerSecret?: string,
-    @Headers('authorization') authorization?: string,
-  ) {
-    this.assertCronAuth({ token, headerSecret, authorization });
-    return this.eventsService.syncEventStatusesNow({
-      daysBack: 2,
-      daysForward: 2,
-    });
   }
 }
