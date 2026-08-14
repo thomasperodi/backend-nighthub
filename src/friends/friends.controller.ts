@@ -18,6 +18,7 @@ import { VoteGroupTableProposalDto } from './dto/vote-group-table-proposal.dto';
 import { BookGroupTableProposalDto } from './dto/book-group-table-proposal.dto';
 import { FriendLocationUpdateDto } from './dto/friend-location-update.dto';
 import { FriendLocationSharingDto } from './dto/friend-location-sharing.dto';
+import { Throttle } from '@nestjs/throttler';
 import { Roles } from '../auth/roles.decorator';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { RequestUser } from '../auth/types';
@@ -28,6 +29,7 @@ export class FriendsController {
 
   @Get('friends/search')
   @Roles('client')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   search(@Query('query') query: string, @CurrentUser() user: RequestUser) {
     return this.friendsService.searchUsers(query, user.id);
   }

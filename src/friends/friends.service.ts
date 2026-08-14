@@ -9,6 +9,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ReservationsService } from '../reservations/reservations.service';
 import { BadgesService } from '../badges/badges.service';
+import { PushDispatchService } from '../common/push/push-dispatch.service';
 
 @Injectable()
 export class FriendsService {
@@ -16,6 +17,7 @@ export class FriendsService {
     private readonly prisma: PrismaService,
     private readonly reservationsService: ReservationsService,
     private readonly badgesService: BadgesService,
+    private readonly pushDispatch: PushDispatchService,
   ) {}
   private readonly logger = new Logger(FriendsService.name);
 
@@ -28,18 +30,11 @@ export class FriendsService {
       );
     });
   }
-  private readonly pushDebug = process.env.PUSH_DEBUG === '1';
   private readonly onlineActivityMinutes = 2;
   private readonly staleLocationMinutes = 30;
   private readonly hideLocationAfterHours = 24 * 7;
   private readonly hotspotMinFriends = 2;
   private readonly nearbyVenueMultiplier = 1.5;
-
-  private maskToken(token: string) {
-    if (!token) return 'empty';
-    if (token.length <= 14) return token;
-    return `${token.slice(0, 10)}...${token.slice(-4)}`;
-  }
 
   private decimalToNumber(
     value: Prisma.Decimal | number | string | null | undefined,
@@ -166,71 +161,6 @@ export class FriendsService {
     };
   }
 
-  private async sendExpoPush(params: {
-    token: string;
-    title: string;
-    body: string;
-    data?: Record<string, unknown>;
-  }) {
-    const token = String(params.token || '').trim();
-    const isExpoToken = /^Expo(?:nent)?PushToken\[[^\]]+\]$/.test(token);
-    if (!isExpoToken) {
-      this.logger.warn(
-        `Push skipped: invalid Expo token format (${this.maskToken(token)})`,
-      );
-      return;
-    }
-
-    try {
-      const response = await fetch('https://exp.host/--/api/v2/push/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          to: token,
-          title: params.title,
-          body: params.body,
-          sound: 'default',
-          priority: 'high',
-          content_available: true,
-          data: params.data ?? {},
-        }),
-      });
-
-      let payload: any = null;
-      try {
-        payload = await response.json();
-      } catch {
-        payload = null;
-      }
-
-      if (!response.ok) {
-        this.logger.error(
-          `Expo push HTTP ${response.status} for ${this.maskToken(token)}: ${JSON.stringify(payload)}`,
-        );
-        return;
-      }
-
-      const ticketStatus = payload?.data?.status;
-      if (ticketStatus && ticketStatus !== 'ok') {
-        this.logger.error(
-          `Expo push rejected for ${this.maskToken(token)}: ${JSON.stringify(payload?.data)}`,
-        );
-        return;
-      }
-
-      if (this.pushDebug) {
-        this.logger.log(
-          `Expo push sent (${this.maskToken(token)}) type=${String(params.data?.type ?? 'unknown')}`,
-        );
-      }
-    } catch (error) {
-      this.logger.error(
-        `Expo push exception for ${this.maskToken(token)}`,
-        error instanceof Error ? error.stack : undefined,
-      );
-    }
-  }
-
   private async notifyUsersAddedToGroup(params: {
     ownerId: string;
     groupId: string;
@@ -244,42 +174,25 @@ export class FriendsService {
     );
     if (uniqueMemberIds.length === 0) return;
 
-    const [owner, recipients] = await Promise.all([
-      this.prisma.users.findUnique({
-        where: { id: params.ownerId },
-        select: { name: true, username: true },
-      }),
-      this.prisma.users.findMany({
-        where: {
-          id: { in: uniqueMemberIds },
-          push_token: { not: null },
-        },
-        select: { id: true, push_token: true },
-      }),
-    ]);
-
-    if (recipients.length === 0) return;
+    const owner = await this.prisma.users.findUnique({
+      where: { id: params.ownerId },
+      select: { name: true, username: true },
+    });
 
     const ownerDisplayName = owner?.name || owner?.username || 'Un tuo amico';
 
     await Promise.allSettled(
-      recipients
-        .map((recipient) => ({ id: recipient.id, token: recipient.push_token }))
-        .filter((recipient): recipient is { id: string; token: string } =>
-          Boolean(recipient.token),
-        )
-        .map((recipient) =>
-          this.sendExpoPush({
-            token: recipient.token,
-            title: 'Nuovo gruppo amici',
-            body: `${ownerDisplayName} ti ha aggiunto al gruppo "${params.groupName}".`,
-            data: {
-              type: 'friend_group_added',
-              group_id: params.groupId,
-              added_by_user_id: params.ownerId,
-            },
-          }),
-        ),
+      uniqueMemberIds.map((memberId) =>
+        this.pushDispatch.notifyUser(memberId, {
+          title: 'Nuovo gruppo amici',
+          body: `${ownerDisplayName} ti ha aggiunto al gruppo "${params.groupName}".`,
+          data: {
+            type: 'friend_group_added',
+            group_id: params.groupId,
+            added_by_user_id: params.ownerId,
+          },
+        }),
+      ),
     );
   }
 
@@ -288,6 +201,9 @@ export class FriendsService {
       .trim()
       .toLowerCase();
     if (!q) return [];
+    if (q.length < 2) {
+      throw new BadRequestException('query must be at least 2 characters');
+    }
 
     const [currentUserFriendLinks, candidates] = await this.prisma.$transaction(
       [
@@ -298,6 +214,12 @@ export class FriendsService {
         this.prisma.users.findMany({
           where: {
             id: { not: currentUserId },
+            // Social search must never surface staff/venue/admin accounts (impersonation
+            // risk) or suspended/deactivated users - both are enforced here, not just in
+            // the frontend, since the frontend filter is trivially bypassed by calling
+            // this endpoint directly.
+            role: 'client',
+            is_active: true,
             OR: [
               { username: { contains: q, mode: 'insensitive' } },
               { name: { contains: q, mode: 'insensitive' } },
@@ -316,6 +238,17 @@ export class FriendsService {
 
     if (candidates.length === 0) return [];
 
+    const candidateIds = candidates.map((candidate) => candidate.id);
+    const verifiedPrCandidates = await this.prisma.venue_pr_memberships.findMany(
+      {
+        where: { user_id: { in: candidateIds }, is_active: true },
+        select: { user_id: true },
+      },
+    );
+    const verifiedPrCandidateIds = new Set(
+      verifiedPrCandidates.map((m) => m.user_id),
+    );
+
     const currentUserFriendIds = Array.from(
       new Set(
         currentUserFriendLinks
@@ -327,6 +260,7 @@ export class FriendsService {
     if (currentUserFriendIds.length === 0) {
       return candidates.map((candidate) => ({
         ...candidate,
+        is_verified_pr: verifiedPrCandidateIds.has(candidate.id),
         mutual_friends_count: 0,
         mutual_friends_ids: [] as string[],
         mutual_friends: [] as Array<{
@@ -337,8 +271,6 @@ export class FriendsService {
         }>,
       }));
     }
-
-    const candidateIds = candidates.map((candidate) => candidate.id);
     const candidateMutualLinks = await this.prisma.friendships.findMany({
       where: {
         user_id: { in: candidateIds },
@@ -395,6 +327,7 @@ export class FriendsService {
 
       return {
         ...candidate,
+        is_verified_pr: verifiedPrCandidateIds.has(candidate.id),
         mutual_friends_count: mutualIds.length,
         mutual_friends_ids: mutualIds,
         mutual_friends: mutualFriendProfiles,
@@ -411,7 +344,8 @@ export class FriendsService {
     if (friendIds.length === 0) return [];
 
     const prismaAny = this.prisma as any;
-    const [friends, openStays, allVenuesRaw] = await Promise.all([
+    const [friends, openStays, allVenuesRaw, verifiedPrMemberships] =
+      await Promise.all([
       prismaAny.users.findMany({
         where: { id: { in: friendIds } },
         select: {
@@ -460,7 +394,17 @@ export class FriendsService {
           radius_geofence: true,
         },
       }),
+      // Server-derived PR verification badge (see PublicUser.is_verified_pr) - never trust
+      // this from the client, always recomputed from the actual membership table.
+      this.prisma.venue_pr_memberships.findMany({
+        where: { user_id: { in: friendIds }, is_active: true },
+        select: { user_id: true },
+      }),
     ]);
+
+    const verifiedPrUserIds = new Set(
+      verifiedPrMemberships.map((m: { user_id: string }) => m.user_id),
+    );
 
     const allVenues = allVenuesRaw
       .map((venue: any) => ({
@@ -557,6 +501,7 @@ export class FriendsService {
             : (lastActiveMinutes ?? locationLastSeenMinutes),
           sharing_enabled: Boolean(friend.location_sharing_enabled),
           is_stale: locationAgeMs === null ? true : locationAgeMs > staleMs,
+          is_verified_pr: verifiedPrUserIds.has(friend.id),
         };
       })
       .sort((left, right) => {
@@ -1125,31 +1070,22 @@ export class FriendsService {
       }
     }
 
-    const [fromUser, toUser] = await Promise.all([
-      this.prisma.users.findUnique({
-        where: { id: from_user_id },
-        select: { name: true, username: true },
-      }),
-      this.prisma.users.findUnique({
-        where: { id: target.id },
-        select: { push_token: true },
-      }),
-    ]);
+    const fromUser = await this.prisma.users.findUnique({
+      where: { id: from_user_id },
+      select: { name: true, username: true },
+    });
 
-    if (toUser?.push_token) {
-      const senderDisplayName =
-        fromUser?.name || fromUser?.username || 'Un utente';
-      await this.sendExpoPush({
-        token: toUser.push_token,
-        title: 'Nuova richiesta di amicizia',
-        body: `${senderDisplayName} ti ha inviato una richiesta di amicizia.`,
-        data: {
-          type: 'friend_request_received',
-          request_id: createdRequest.id,
-          from_user_id,
-        },
-      });
-    }
+    const senderDisplayName =
+      fromUser?.name || fromUser?.username || 'Un utente';
+    await this.pushDispatch.notifyUser(target.id, {
+      title: 'Nuova richiesta di amicizia',
+      body: `${senderDisplayName} ti ha inviato una richiesta di amicizia.`,
+      data: {
+        type: 'friend_request_received',
+        request_id: createdRequest.id,
+        from_user_id,
+      },
+    });
 
     return createdRequest;
   }
@@ -1180,31 +1116,22 @@ export class FriendsService {
     this.evaluateBadges(request.from_user_id);
     this.evaluateBadges(request.to_user_id);
 
-    const [acceptingUser, requesterUser] = await Promise.all([
-      this.prisma.users.findUnique({
-        where: { id: request.to_user_id },
-        select: { name: true, username: true },
-      }),
-      this.prisma.users.findUnique({
-        where: { id: request.from_user_id },
-        select: { push_token: true },
-      }),
-    ]);
+    const acceptingUser = await this.prisma.users.findUnique({
+      where: { id: request.to_user_id },
+      select: { name: true, username: true },
+    });
 
-    if (requesterUser?.push_token) {
-      const accepterDisplayName =
-        acceptingUser?.name || acceptingUser?.username || 'Un utente';
-      await this.sendExpoPush({
-        token: requesterUser.push_token,
-        title: 'Richiesta accettata',
-        body: `${accepterDisplayName} ha accettato la tua richiesta di amicizia.`,
-        data: {
-          type: 'friend_request_accepted',
-          request_id: requestId,
-          from_user_id: request.to_user_id,
-        },
-      });
-    }
+    const accepterDisplayName =
+      acceptingUser?.name || acceptingUser?.username || 'Un utente';
+    await this.pushDispatch.notifyUser(request.from_user_id, {
+      title: 'Richiesta accettata',
+      body: `${accepterDisplayName} ha accettato la tua richiesta di amicizia.`,
+      data: {
+        type: 'friend_request_accepted',
+        request_id: requestId,
+        from_user_id: request.to_user_id,
+      },
+    });
 
     return { success: true };
   }

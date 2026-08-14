@@ -4,7 +4,7 @@ import { EventStatus } from '@prisma/client';
 import { EventsService } from './events.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { SupabaseStorageService } from '../common/storage/supabase-storage.service';
-import { ExpoPushService } from '../common/push/expo-push.service';
+import { PushDispatchService } from '../common/push/push-dispatch.service';
 
 function makePrismaMock() {
   return {
@@ -36,18 +36,18 @@ function makePrismaMock() {
 describe('EventsService', () => {
   let service: EventsService;
   let prisma: ReturnType<typeof makePrismaMock>;
-  let expoPush: { send: jest.Mock };
+  let pushDispatch: { notifyUser: jest.Mock };
 
   beforeEach(async () => {
     prisma = makePrismaMock();
-    expoPush = { send: jest.fn().mockResolvedValue(undefined) };
+    pushDispatch = { notifyUser: jest.fn().mockResolvedValue(undefined) };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         EventsService,
         { provide: PrismaService, useValue: prisma },
         { provide: SupabaseStorageService, useValue: {} },
-        { provide: ExpoPushService, useValue: expoPush },
+        { provide: PushDispatchService, useValue: pushDispatch },
       ],
     }).compile();
 
@@ -55,15 +55,15 @@ describe('EventsService', () => {
   });
 
   describe('cancelEvent', () => {
-    it('marks the event CANCELLED, cancels its reservations, and notifies holders', async () => {
+    it('marks the event CANCELLED, cancels its reservations, and notifies each holder once', async () => {
       prisma.events.findUnique.mockResolvedValue({
         id: 'event-1',
         name: 'Sabato sera',
         status: EventStatus.LIVE,
       });
       prisma.reservations.findMany.mockResolvedValue([
-        { id: 'res-1', user: { push_token: 'ExponentPushToken[abc]' } },
-        { id: 'res-2', user: { push_token: null } },
+        { id: 'res-1', user_id: 'user-1' },
+        { id: 'res-2', user_id: 'user-2' },
       ]);
 
       const result = await service.cancelEvent('event-1');
@@ -80,8 +80,9 @@ describe('EventsService', () => {
           data: { status: 'cancelled' },
         }),
       );
-      // Only the reservation whose user actually has a push token gets notified.
-      expect(expoPush.send).toHaveBeenCalledTimes(1);
+      // PushDispatchService fans out to Expo and Web Push itself - one notifyUser call per
+      // distinct affected user, regardless of which channel(s) they're reachable on.
+      expect(pushDispatch.notifyUser).toHaveBeenCalledTimes(2);
       expect(result).toEqual({ success: true, cancelled_reservations: 2 });
     });
 
@@ -96,7 +97,7 @@ describe('EventsService', () => {
 
       expect(result).toEqual({ success: true, already_cancelled: true });
       expect(prisma.events.update).not.toHaveBeenCalled();
-      expect(expoPush.send).not.toHaveBeenCalled();
+      expect(pushDispatch.notifyUser).not.toHaveBeenCalled();
     });
   });
 

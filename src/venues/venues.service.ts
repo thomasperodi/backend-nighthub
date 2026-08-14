@@ -44,7 +44,7 @@ import {
   DEFAULT_CLOAKROOM_UNIT_PRICE,
   VenueBarPriceKey,
 } from './venue-pricing.constants';
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import { readFileSync } from 'fs';
 import { isAbsolute, resolve as resolvePath } from 'path';
 import { PKPass } from 'passkit-generator';
@@ -897,6 +897,20 @@ export class VenuesService {
       .slice(0, 24);
   }
 
+  // Base32-ish (Crockford, no ambiguous chars) random suffix - deliberately NOT derived from
+  // the PR's name/username, so `?pr=CODE` in a shared link can't be guessed or brute-forced
+  // just by knowing (or trying) a PR's display name. Kept short since it only needs to be
+  // unique per-venue, not globally.
+  private randomRefCodeSuffix(length = 6): string {
+    const alphabet = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+    const bytes = randomBytes(length);
+    let out = '';
+    for (let i = 0; i < length; i += 1) {
+      out += alphabet[bytes[i] % alphabet.length];
+    }
+    return out;
+  }
+
   private toIsoString(value: Date | string | null | undefined): string {
     if (value instanceof Date) return value.toISOString();
     if (!value) return new Date().toISOString();
@@ -1344,11 +1358,16 @@ export class VenuesService {
     seed: string,
     excludeMemberId?: string,
   ): Promise<string> {
-    const base = this.sanitizePrRefCode(seed) || 'PR';
-    let candidate = base;
-    let index = 1;
+    // The seed (PR name/username) only supplies a short, human-recognizable label prefix -
+    // it is never the whole code. A random suffix is always appended (not just on
+    // collision) so `?pr=CODE` can't be guessed from someone's name. Retries pick a fresh
+    // random suffix rather than an incrementing counter, which would just recreate the same
+    // guessability problem (-1, -2, ...).
+    const base = this.sanitizePrRefCode(seed).slice(0, 12) || 'PR';
+    let attempts = 0;
 
-    while (index < 200) {
+    while (attempts < 20) {
+      const candidate = `${base}-${this.randomRefCodeSuffix()}`;
       const rows = excludeMemberId
         ? await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
             SELECT id
@@ -1367,8 +1386,7 @@ export class VenuesService {
           `);
 
       if (!rows.length) return candidate;
-      candidate = `${base}-${index}`;
-      index += 1;
+      attempts += 1;
     }
 
     throw new BadRequestException('Impossibile generare un ref_code univoco');
@@ -3583,10 +3601,24 @@ export class VenuesService {
       throw new BadRequestException('PR is not active for this event');
     }
 
+    // Prevents scan stats being inflated with guests that don't correspond to real users -
+    // guest_user_id, when present, must resolve to an actual account.
+    if (payload.guest_user_id) {
+      const guestExists = await this.prisma.users.findUnique({
+        where: { id: payload.guest_user_id },
+        select: { id: true },
+      });
+      if (!guestExists) {
+        throw new BadRequestException('guest_user_id does not exist');
+      }
+    }
+
     const metadataJson = payload.metadata
       ? JSON.stringify(payload.metadata)
       : null;
-    const rows = await this.prisma.$queryRaw<PrScanRow[]>(Prisma.sql`
+    let rows: PrScanRow[];
+    try {
+      rows = await this.prisma.$queryRaw<PrScanRow[]>(Prisma.sql`
       INSERT INTO venue_pr_qr_scans (
         venue_id,
         event_id,
@@ -3622,6 +3654,29 @@ export class VenuesService {
         created_at,
         updated_at
     `);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message.toLowerCase() : '';
+      if (
+        message.includes('uniq_pr_qr_scan_per_guest') ||
+        message.includes('duplicate key value violates unique constraint')
+      ) {
+        // Idempotent: the same PR already registered a scan for this guest at this event -
+        // return that existing row instead of erroring or silently double-counting stats.
+        const existing = await this.prisma.$queryRaw<PrScanRow[]>(Prisma.sql`
+          SELECT
+            id, venue_id, event_id, pr_membership_id, scanned_by_user_id,
+            guest_user_id, referral_code, scanned_at, entry_id, entered_at,
+            metadata, created_at, updated_at
+          FROM venue_pr_qr_scans
+          WHERE event_id = ${payload.event_id}::uuid
+            AND pr_membership_id = ${targetMembership.id}::uuid
+            AND guest_user_id = ${payload.guest_user_id}::uuid
+          LIMIT 1
+        `);
+        if (existing[0]) return this.mapPrScan(existing[0]);
+      }
+      throw error;
+    }
 
     const scan = rows[0];
     if (!scan) throw new BadRequestException('Unable to register PR scan');
@@ -3846,17 +3901,18 @@ export class VenuesService {
     // `memberRows` and `scanRows` don't depend on `actorContext`/the event-ownership check at
     // all (they're only filtered by `visibleIds` afterward) - all four run together instead of
     // 3 sequential round trips.
-    const [actorContext, , memberRows, scanRows] = await Promise.all([
-      this.getVenueAndPrActorContext(venueId, user, false),
-      eventId ? this.ensureEventBelongsToVenue(eventId, venueId) : undefined,
-      this.loadPrMemberRows(venueId),
-      this.prisma.$queryRaw<
-        Array<{
-          pr_membership_id: string;
-          scans_count: number;
-          entries_count: number;
-        }>
-      >(Prisma.sql`
+    const [actorContext, , memberRows, scanRows, referralReservationRows] =
+      await Promise.all([
+        this.getVenueAndPrActorContext(venueId, user, false),
+        eventId ? this.ensureEventBelongsToVenue(eventId, venueId) : undefined,
+        this.loadPrMemberRows(venueId),
+        this.prisma.$queryRaw<
+          Array<{
+            pr_membership_id: string;
+            scans_count: number;
+            entries_count: number;
+          }>
+        >(Prisma.sql`
         SELECT
           pr_membership_id,
           COUNT(*)::int AS scans_count,
@@ -3866,7 +3922,28 @@ export class VenuesService {
           ${eventId ? Prisma.sql`AND event_id = ${eventId}::uuid` : Prisma.empty}
         GROUP BY pr_membership_id
       `),
-    ]);
+        // Conversions from the PR's shareable link/code (reservations.meta.pr_membership_id,
+        // set in ReservationsService.createReservation once a referral resolves) - previously
+        // this dashboard only ever read physical badge scans, so link-driven bookings never
+        // showed up here even after they started being attributed correctly.
+        this.prisma.$queryRaw<
+          Array<{
+            pr_membership_id: string;
+            referral_reservations_count: number;
+          }>
+        >(Prisma.sql`
+        SELECT
+          (r.meta->>'pr_membership_id')::uuid AS pr_membership_id,
+          COUNT(*)::int AS referral_reservations_count
+        FROM reservations r
+        INNER JOIN events e ON e.id = r.event_id
+        WHERE e.venue_id = ${venueId}::uuid
+          AND r.meta->>'pr_membership_id' IS NOT NULL
+          AND r.status <> 'cancelled'
+          ${eventId ? Prisma.sql`AND r.event_id = ${eventId}::uuid` : Prisma.empty}
+        GROUP BY 1
+      `),
+      ]);
 
     let visibleRows = memberRows;
     if (!actorContext.owner && actorContext.membership) {
@@ -3887,13 +3964,32 @@ export class VenuesService {
 
     const visibleIds = new Set(visibleRows.map((row) => row.id));
 
-    const statsByMember = new Map<string, { scans: number; entries: number }>();
+    const statsByMember = new Map<
+      string,
+      { scans: number; entries: number; referral_reservations: number }
+    >();
     for (const row of scanRows) {
       if (!visibleIds.has(row.pr_membership_id)) continue;
+      const existing = statsByMember.get(row.pr_membership_id);
       statsByMember.set(row.pr_membership_id, {
         scans: Number(row.scans_count ?? 0),
         entries: Number(row.entries_count ?? 0),
+        referral_reservations: existing?.referral_reservations ?? 0,
       });
+    }
+    for (const row of referralReservationRows) {
+      if (!row.pr_membership_id || !visibleIds.has(row.pr_membership_id)) {
+        continue;
+      }
+      const existing = statsByMember.get(row.pr_membership_id) ?? {
+        scans: 0,
+        entries: 0,
+        referral_reservations: 0,
+      };
+      existing.referral_reservations = Number(
+        row.referral_reservations_count ?? 0,
+      );
+      statsByMember.set(row.pr_membership_id, existing);
     }
 
     const childrenMap = new Map<string, string[]>();
@@ -3909,21 +4005,33 @@ export class VenuesService {
       childrenMap.set(row.parent_membership_id, siblings);
     }
 
-    const rollupCache = new Map<string, { scans: number; entries: number }>();
+    const rollupCache = new Map<
+      string,
+      { scans: number; entries: number; referral_reservations: number }
+    >();
     const rollup = (
       membershipId: string,
-    ): { scans: number; entries: number } => {
+    ): { scans: number; entries: number; referral_reservations: number } => {
       const cached = rollupCache.get(membershipId);
       if (cached) return cached;
 
-      const own = statsByMember.get(membershipId) ?? { scans: 0, entries: 0 };
+      const own = statsByMember.get(membershipId) ?? {
+        scans: 0,
+        entries: 0,
+        referral_reservations: 0,
+      };
       const children = childrenMap.get(membershipId) ?? [];
 
-      const totals = { scans: own.scans, entries: own.entries };
+      const totals = {
+        scans: own.scans,
+        entries: own.entries,
+        referral_reservations: own.referral_reservations,
+      };
       for (const childId of children) {
         const childTotals = rollup(childId);
         totals.scans += childTotals.scans;
         totals.entries += childTotals.entries;
+        totals.referral_reservations += childTotals.referral_reservations;
       }
 
       rollupCache.set(membershipId, totals);
@@ -3931,7 +4039,11 @@ export class VenuesService {
     };
 
     const members = visibleRows.map((row) => {
-      const own = statsByMember.get(row.id) ?? { scans: 0, entries: 0 };
+      const own = statsByMember.get(row.id) ?? {
+        scans: 0,
+        entries: 0,
+        referral_reservations: 0,
+      };
       const team = rollup(row.id);
       return {
         id: row.id,
@@ -3953,10 +4065,12 @@ export class VenuesService {
         stats: {
           scans: own.scans,
           entries: own.entries,
+          referral_reservations: own.referral_reservations,
         },
         team_stats: {
           scans: team.scans,
           entries: team.entries,
+          referral_reservations: team.referral_reservations,
         },
       };
     });
@@ -3965,9 +4079,10 @@ export class VenuesService {
       (acc, member) => {
         acc.scans += member.stats.scans;
         acc.entries += member.stats.entries;
+        acc.referral_reservations += member.stats.referral_reservations;
         return acc;
       },
-      { scans: 0, entries: 0 },
+      { scans: 0, entries: 0, referral_reservations: 0 },
     );
 
     return {

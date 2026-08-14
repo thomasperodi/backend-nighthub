@@ -23,6 +23,7 @@ import { UpdateTableHostessDto } from './dto/update-table-hostess.dto';
 import { EventsService } from '../events/events.service';
 import { resolveEntryUnitPrice } from '../common/entry-pricing';
 import { CreateTableBottleOrderDto } from './dto/create-table-bottle-order.dto';
+import { PushDispatchService } from '../common/push/push-dispatch.service';
 
 @Injectable()
 export class StaffService {
@@ -30,6 +31,7 @@ export class StaffService {
     private readonly prisma: PrismaService,
     private readonly eventsService: EventsService,
     private readonly badgesService: BadgesService,
+    private readonly pushDispatch: PushDispatchService,
   ) {}
 
   private evaluateBadges(userId: string | null | undefined) {
@@ -409,37 +411,6 @@ export class StaffService {
     return AgeBucket.UNKNOWN;
   }
 
-  private async sendExpoPush(params: {
-    token: string;
-    title: string;
-    body: string;
-    data?: Record<string, unknown>;
-  }) {
-    const token = params.token || '';
-    const isExpoToken =
-      token.startsWith('ExponentPushToken') ||
-      token.startsWith('ExpoPushToken');
-    if (!isExpoToken) return;
-
-    try {
-      await fetch('https://exp.host/--/api/v2/push/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          to: token,
-          title: params.title,
-          body: params.body,
-          sound: 'default',
-          priority: 'high',
-          content_available: true,
-          data: params.data ?? {},
-        }),
-      });
-    } catch {
-      // Best-effort only.
-    }
-  }
-
   async recordEntry(dto: RecordEntryDto) {
     const quantity = dto.quantity ?? 1;
     if (quantity <= 0)
@@ -532,26 +503,20 @@ export class StaffService {
     }
 
     if (dto.user_id) {
-      const [user, event] = await Promise.all([
-        this.prisma.users.findUnique({
-          where: { id: dto.user_id },
-          select: { push_token: true },
-        }),
-        this.prisma.events.findUnique({
-          where: { id: eventId },
-          select: {
-            venue: {
-              select: {
-                id: true,
-                name: true,
-                latitude: true,
-                longitude: true,
-                radius_geofence: true,
-              },
+      const event = await this.prisma.events.findUnique({
+        where: { id: eventId },
+        select: {
+          venue: {
+            select: {
+              id: true,
+              name: true,
+              latitude: true,
+              longitude: true,
+              radius_geofence: true,
             },
           },
-        }),
-      ]);
+        },
+      });
 
       const venue = event?.venue ?? null;
       const latitude = venue?.latitude ? Number(venue.latitude) : null;
@@ -559,13 +524,11 @@ export class StaffService {
       const radius = venue?.radius_geofence ?? 100;
 
       if (
-        user?.push_token &&
         Number.isFinite(latitude) &&
         Number.isFinite(longitude) &&
         venue?.id
       ) {
-        await this.sendExpoPush({
-          token: user.push_token,
+        await this.pushDispatch.notifyUser(dto.user_id, {
           title: 'Ingresso al locale',
           body: `Monitoraggio posizione attivato per ${venue.name ?? 'il locale'}.`,
           data: {

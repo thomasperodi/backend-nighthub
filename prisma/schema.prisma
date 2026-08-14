@@ -209,6 +209,7 @@ model users {
   is_active                     Boolean   @default(true)
   push_token                    String?
   push_token_updated_at         DateTime?
+  onboarding_completed_at       DateTime?
   location_sharing_enabled      Boolean   @default(false)
   last_latitude                 Decimal?  @db.Decimal(9, 6)
   last_longitude                Decimal?  @db.Decimal(9, 6)
@@ -250,6 +251,7 @@ model users {
   group_table_proposal_votes    group_table_proposal_votes[]
   user_badges                   user_badges[]
   refresh_tokens                refresh_tokens[]
+  push_subscriptions            push_subscriptions[]
   filed_content_reports         content_reports[]            @relation("ContentReportReporter")
   content_reports_received      content_reports[]            @relation("ContentReportReported")
 
@@ -279,6 +281,24 @@ model refresh_tokens {
 
   @@index([user_id, revoked_at])
   @@index([family_id])
+}
+
+// Web Push subscriptions (browser/PWA), one row per device/browser - unlike `users.push_token`
+// (a single Expo/mobile token per user), a user can have many of these at once. Each is keyed
+// by its unique push service `endpoint`; deleted on logout (client-initiated) or automatically
+// when the push service reports it as gone (410/404 on send).
+model push_subscriptions {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id       String    @db.Uuid
+  user          users     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  endpoint      String    @unique
+  p256dh        String
+  auth_key      String
+  user_agent    String?
+  created_at    DateTime  @default(now())
+  last_seen_at  DateTime  @default(now())
+
+  @@index([user_id])
 }
 
 // Marks a legacy (non-Supabase) password-reset JWT as consumed. The reset token itself
@@ -436,6 +456,11 @@ model venue_pr_qr_scans {
   @@index([pr_membership_id, scanned_at])
   @@index([entry_id])
   @@index([guest_user_id, scanned_at])
+  // Anti-spam: the same PR can't register more than one scan for the same guest at the
+  // same event - without this, a compromised/careless actor could inflate a PR's scan
+  // stats by replaying the same guest repeatedly. Partial (guest_user_id can be null for
+  // scans not tied to a specific guest, which aren't subject to this dedup).
+  @@unique([event_id, pr_membership_id, guest_user_id], map: "uniq_pr_qr_scan_per_guest")
 }
 
 model venue_pr_membership_passes {
@@ -1105,6 +1130,7 @@ model reservations {
   qr_payload             String?
   checked_in_at          DateTime?
   checked_in_by_staff_id String?           @db.Uuid
+  reminder_sent_at       DateTime?
   checkin_entry_id       String?           @db.Uuid
   created_at             DateTime          @default(now())
 

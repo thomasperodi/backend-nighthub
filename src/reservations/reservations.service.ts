@@ -9,12 +9,15 @@ import { AgeBucket, EntryMethod, Gender, Prisma } from '@prisma/client';
 import { randomUUID } from 'crypto';
 import { resolveEntryUnitPrice } from '../common/entry-pricing';
 import { BadgesService } from '../badges/badges.service';
+import { PushDispatchService } from '../common/push/push-dispatch.service';
+import { eventStartMs } from '../common/event-time.util';
 
 type QrCheckInResult = {
   success: boolean;
   alreadyCheckedIn: boolean;
   reservation: unknown;
   entry?: unknown;
+  checkedInGuests?: number;
 };
 
 type ParsedQrData = {
@@ -136,6 +139,7 @@ export class ReservationsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly badgesService: BadgesService,
+    private readonly pushDispatch: PushDispatchService,
   ) {}
 
   private evaluateBadges(userId: string | null | undefined) {
@@ -148,50 +152,6 @@ export class ReservationsService {
     });
   }
   private readonly logger = new Logger(ReservationsService.name);
-
-  private maskToken(token: string) {
-    if (!token) return 'empty';
-    if (token.length <= 14) return token;
-    return `${token.slice(0, 10)}...${token.slice(-4)}`;
-  }
-
-  private async sendExpoPush(params: {
-    token: string;
-    title: string;
-    body: string;
-    data?: Record<string, unknown>;
-  }) {
-    const token = String(params.token || '').trim();
-    const isExpoToken = /^Expo(?:nent)?PushToken\[[^\]]+\]$/.test(token);
-    if (!isExpoToken) return;
-
-    try {
-      const response = await fetch('https://exp.host/--/api/v2/push/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          to: token,
-          title: params.title,
-          body: params.body,
-          sound: 'default',
-          priority: 'high',
-          content_available: true,
-          data: params.data ?? {},
-        }),
-      });
-
-      if (!response.ok) {
-        this.logger.warn(
-          `Expo push HTTP ${response.status} for ${this.maskToken(token)}`,
-        );
-      }
-    } catch (error) {
-      this.logger.error(
-        `Expo push exception for ${this.maskToken(token)}`,
-        error instanceof Error ? error.stack : undefined,
-      );
-    }
-  }
 
   private normalizeStringArray(value: unknown): string[] {
     if (!Array.isArray(value)) return [];
@@ -720,7 +680,11 @@ export class ReservationsService {
       }
     }
 
-    return { qrToken: value, userId: value };
+    // A raw (non-JSON) scanned value is only ever treated as a candidate qr_token, a real
+    // secret unique per reservation. It must never double as a user_id lookup key - that
+    // would let anyone check a person in by merely knowing/guessing their user id, with no
+    // possession of their actual QR pass required.
+    return { qrToken: value };
   }
 
   private normalizeCreateReservationDto(
@@ -760,7 +724,7 @@ export class ReservationsService {
       ) || null;
     const total_amount = payload.total_amount ?? payload.totalAmount;
     const table_name = payload.table_name ?? payload.tableName;
-    const meta = payload.meta;
+    const meta = this.mergeRootReferralIntoMeta(payload);
 
     return {
       user_id,
@@ -772,6 +736,37 @@ export class ReservationsService {
       meta,
       total_amount,
     };
+  }
+
+  /**
+   * Referral tracking (ref_code/pr_code/tracking_code/promo_code/inviter_user_id) is read
+   * exclusively from `meta` downstream (see parseTrackingCodeFromMeta). Some frontend call
+   * sites send these fields at the payload root instead of nested in `meta`, which silently
+   * drops PR attribution with no error. Absorb root-level referral fields into `meta` here so
+   * attribution works regardless of where the client places them, without already-nested
+   * meta fields being overridden.
+   */
+  private mergeRootReferralIntoMeta(payload: Record<string, unknown>): unknown {
+    const rootReferralKeys = [
+      'ref_code',
+      'pr_code',
+      'tracking_code',
+      'promo_code',
+      'inviter_user_id',
+    ] as const;
+
+    const existingMeta = this.asObjectRecord(payload.meta);
+    const additions: Record<string, unknown> = {};
+
+    for (const key of rootReferralKeys) {
+      if (existingMeta && existingMeta[key] !== undefined) continue;
+      const rootValue = this.normalizeStringValue(payload[key]);
+      if (rootValue) additions[key] = rootValue;
+    }
+
+    if (!Object.keys(additions).length) return payload.meta;
+
+    return { ...(existingMeta ?? {}), ...additions };
   }
 
   private normalizeTableName(value: unknown): string | null {
@@ -1150,7 +1145,7 @@ export class ReservationsService {
     const [event, userRecord] = await Promise.all([
       this.prisma.events.findUnique({
         where: { id: eventId },
-        select: { id: true, venue_id: true },
+        select: { id: true, venue_id: true, name: true },
       }),
       // ❗ Saltiamo il controllo duplicati se è un account venue
       this.prisma.users.findUnique({
@@ -1217,20 +1212,22 @@ export class ReservationsService {
         prMembership && this.roleHasDefaultPrComplimentary(prMembership.role),
       );
 
-    const referralMeta: ReservationReferralMeta | null =
-      prMembership || referralCode || invitedByUserId
-        ? {
-            inviter_user_id: prMembership?.user_id ?? invitedByUserId,
-            tracking_code: prMembership?.ref_code ?? referralCode,
-            pr_code: prMembership?.ref_code ?? referralCode,
-            ref_code: prMembership?.ref_code ?? referralCode,
-            promo_code: prMembership?.ref_code ?? referralCode,
-            pr_membership_id: prMembership?.id,
-            pr_role: prMembership?.role,
-            pr_omaggio_default: isPrComplimentaryEntry,
-            wallet_pass_eligible: isPrComplimentaryEntry,
-          }
-        : null;
+    // Only persist referral/tracking fields once they resolve to a real, active PR
+    // membership for this venue. An unmatched ref_code (typo, wrong venue, revoked
+    // membership) must not be written verbatim into reservations.meta.
+    const referralMeta: ReservationReferralMeta | null = prMembership
+      ? {
+          inviter_user_id: prMembership.user_id,
+          tracking_code: prMembership.ref_code,
+          pr_code: prMembership.ref_code,
+          ref_code: prMembership.ref_code,
+          promo_code: prMembership.ref_code,
+          pr_membership_id: prMembership.id,
+          pr_role: prMembership.role,
+          pr_omaggio_default: isPrComplimentaryEntry,
+          wallet_pass_eligible: isPrComplimentaryEntry,
+        }
+      : null;
 
     const venueTableZoneId: string | null | undefined =
       normalized.venue_table_zone_id ?? null;
@@ -1364,6 +1361,19 @@ export class ReservationsService {
 
     this.evaluateBadges(userId);
 
+    void this.notifyNewReservationInterestedParties({
+      reservationId: createdId,
+      type,
+      eventName: event.name,
+      venueId: event.venue_id,
+      prMembershipUserId: prMembership?.user_id,
+    }).catch((error) => {
+      this.logger.error(
+        `Failed to notify PR/venue for reservation ${createdId}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    });
+
     if (type === 'table') {
       const createdWithMeta = await this.getReservation(createdId);
 
@@ -1401,6 +1411,7 @@ export class ReservationsService {
     eventId: string;
     staffId: string;
     qrData: string;
+    actualGuests?: number;
   }): Promise<QrCheckInResult> {
     const eventId = String(params.eventId ?? '').trim();
     const staffId = String(params.staffId ?? '').trim();
@@ -1439,26 +1450,6 @@ export class ReservationsService {
     if (!reservation && parsed.reservationId) {
       reservation = await this.prisma.reservations.findUnique({
         where: { id: parsed.reservationId },
-        include: {
-          user: {
-            select: { id: true, sesso: true, name: true, birth_date: true },
-          },
-          event: {
-            select: { id: true, name: true, venue_id: true, date: true },
-          },
-        },
-      });
-    }
-
-    if (!reservation && parsed.userId) {
-      reservation = await this.prisma.reservations.findFirst({
-        where: {
-          user_id: parsed.userId,
-          event_id: eventId,
-          type: 'entry',
-          status: { in: ['pending', 'confirmed', 'completed'] },
-        },
-        orderBy: { created_at: 'desc' },
         include: {
           user: {
             select: { id: true, sesso: true, name: true, birth_date: true },
@@ -1517,19 +1508,33 @@ export class ReservationsService {
       isComplimentary: reservationIsComplimentary,
     });
 
+    // A list reservation books `guests` people under one QR; scanning it once must record
+    // everyone who actually walked in, not just the one code that got scanned - otherwise
+    // entries systematically undercounts group bookings and skews any show-up-rate derived
+    // from it. Staff can override the count at the door (actualGuests); otherwise it
+    // defaults to what was booked.
+    const requestedGuests = Number.isFinite(params.actualGuests)
+      ? Math.trunc(Number(params.actualGuests))
+      : undefined;
+    const guestsToCheckIn = Math.max(
+      1,
+      requestedGuests ?? reservation.guests ?? 1,
+    );
+
     const result = await this.prisma.$transaction(async (tx) => {
       // Atomically claims the check-in: `checked_in_at: null` in the WHERE is what makes
       // this a compare-and-swap instead of a plain write. Two near-simultaneous scans of
       // the same QR can both pass the pre-transaction guard above (it reads before either
       // has written), but only one of them can match this WHERE clause once the other has
       // already flipped `checked_in_at` - the loser gets `count: 0` and backs off instead
-      // of creating a second `entries` row for the same reservation.
+      // of creating a second batch of `entries` rows for the same reservation.
       const claim = await tx.reservations.updateMany({
         where: { id: reservation.id, checked_in_at: null },
         data: {
           status: 'completed',
           checked_in_at: new Date(),
           checked_in_by_staff_id: staffId,
+          actual_guests: guestsToCheckIn,
         },
       });
 
@@ -1537,18 +1542,23 @@ export class ReservationsService {
         return { alreadyCheckedIn: true as const };
       }
 
-      const createdEntry = await tx.entries.create({
-        data: {
-          event_id: eventId,
-          user_id: reservation.user_id,
-          staff_id: staffId,
-          sesso: gender,
-          price: entryPrice,
-          is_complimentary: reservationIsComplimentary,
-          age_bucket: ageBucket,
-          method: EntryMethod.QR,
-        },
-      });
+      const entryCreateData = {
+        event_id: eventId,
+        user_id: reservation.user_id,
+        staff_id: staffId,
+        sesso: gender,
+        price: entryPrice,
+        is_complimentary: reservationIsComplimentary,
+        age_bucket: ageBucket,
+        method: EntryMethod.QR,
+      };
+      const createdEntries: Array<
+        Awaited<ReturnType<typeof tx.entries.create>>
+      > = [];
+      for (let i = 0; i < guestsToCheckIn; i += 1) {
+        createdEntries.push(await tx.entries.create({ data: entryCreateData }));
+      }
+      const createdEntry = createdEntries[0];
 
       const updatedReservation = await tx.reservations.update({
         where: { id: reservation.id },
@@ -1569,7 +1579,12 @@ export class ReservationsService {
         },
       });
 
-      return { alreadyCheckedIn: false as const, createdEntry, updatedReservation };
+      return {
+        alreadyCheckedIn: false as const,
+        createdEntry,
+        checkedInGuests: createdEntries.length,
+        updatedReservation,
+      };
     });
 
     if (result.alreadyCheckedIn) {
@@ -1587,6 +1602,7 @@ export class ReservationsService {
       alreadyCheckedIn: false,
       reservation: result.updatedReservation,
       entry: result.createdEntry,
+      checkedInGuests: result.checkedInGuests,
     };
   }
 
@@ -1604,46 +1620,37 @@ export class ReservationsService {
       throw new NotFoundException('Event not found');
     }
 
+    // Only ever resolve the season pass by its qr_token, a real secret unique per pass. The
+    // wallet QR payload always carries pass_id alongside qr_token (see
+    // buildPrSeasonPassQrPayload), but pass_id alone must never be a valid check-in path -
+    // it's a plain UUID a rogue actor could obtain (e.g. a team manager who can see a
+    // teammate's pass row) without ever possessing that teammate's actual QR/token. Same
+    // class of bug already fixed for the customer entry QR in parseQrData/
+    // checkInEntryReservationByQr.
     const token = String(params.parsed.qrToken || '').trim();
-    const passId = String(params.parsed.passId || '').trim();
-    const normalizedPassId = /^[0-9a-fA-F-]{36}$/.test(passId) ? passId : '';
-    const passRows = token
-      ? await this.prisma.$queryRaw<PrSeasonPassLookupRow[]>(Prisma.sql`
-          SELECT
-            p.id,
-            p.venue_id,
-            p.pr_membership_id,
-            p.user_id,
-            p.status::text AS status,
-            p.valid_from,
-            p.valid_until,
-            p.revoked_at,
-            p.qr_token,
-            m.is_active AS membership_is_active
-          FROM venue_pr_membership_passes p
-          JOIN venue_pr_memberships m ON m.id = p.pr_membership_id
-          WHERE p.qr_token = ${token}
-          LIMIT 1
-        `)
-      : normalizedPassId
-        ? await this.prisma.$queryRaw<PrSeasonPassLookupRow[]>(Prisma.sql`
-            SELECT
-              p.id,
-              p.venue_id,
-              p.pr_membership_id,
-              p.user_id,
-              p.status::text AS status,
-              p.valid_from,
-              p.valid_until,
-              p.revoked_at,
-              p.qr_token,
-              m.is_active AS membership_is_active
-            FROM venue_pr_membership_passes p
-            JOIN venue_pr_memberships m ON m.id = p.pr_membership_id
-            WHERE p.id = ${normalizedPassId}::uuid
-            LIMIT 1
-          `)
-        : [];
+    if (!token) {
+      throw new BadRequestException('QR token required');
+    }
+
+    const passRows = await this.prisma.$queryRaw<
+      PrSeasonPassLookupRow[]
+    >(Prisma.sql`
+      SELECT
+        p.id,
+        p.venue_id,
+        p.pr_membership_id,
+        p.user_id,
+        p.status::text AS status,
+        p.valid_from,
+        p.valid_until,
+        p.revoked_at,
+        p.qr_token,
+        m.is_active AS membership_is_active
+      FROM venue_pr_membership_passes p
+      JOIN venue_pr_memberships m ON m.id = p.pr_membership_id
+      WHERE p.qr_token = ${token}
+      LIMIT 1
+    `);
 
     const pass = passRows[0] ?? null;
     if (!pass) {
@@ -1911,36 +1918,21 @@ export class ReservationsService {
     const meta = this.parseTableReservationMeta(reservation.meta);
     if (!meta?.table_invites.length) return;
 
-    const recipients = await this.prisma.users.findMany({
-      where: {
-        id: { in: meta.table_invites.map((invite) => invite.user_id) },
-        push_token: { not: null },
-      },
-      select: { id: true, push_token: true },
-    });
-
-    if (!recipients.length) return;
-
     const inviterName = meta.inviter_name || 'Un amico';
     const tableLabel =
       reservation.table_name?.trim() || reservation.event?.name || 'la serata';
 
     await Promise.allSettled(
-      recipients
-        .filter((recipient): recipient is { id: string; push_token: string } =>
-          Boolean(recipient.push_token),
-        )
-        .map((recipient) =>
-          this.sendExpoPush({
-            token: recipient.push_token,
-            title: 'Invito al tavolo',
-            body: `${inviterName} ti ha invitato al tavolo per ${tableLabel}.`,
-            data: {
-              type: 'table_invitation_received',
-              reservation_id: reservation.id,
-            },
-          }),
-        ),
+      meta.table_invites.map((invite) =>
+        this.pushDispatch.notifyUser(invite.user_id, {
+          title: 'Invito al tavolo',
+          body: `${inviterName} ti ha invitato al tavolo per ${tableLabel}.`,
+          data: {
+            type: 'table_invitation_received',
+            reservation_id: reservation.id,
+          },
+        }),
+      ),
     );
   }
 
@@ -1965,16 +1957,6 @@ export class ReservationsService {
     );
     if (!recipientIds.length) return;
 
-    const recipients = await this.prisma.users.findMany({
-      where: {
-        id: { in: recipientIds },
-        push_token: { not: null },
-      },
-      select: { push_token: true },
-    });
-
-    if (!recipients.length) return;
-
     const tableLabel =
       reservation.table_name?.trim() || reservation.event?.name || 'la serata';
     const body =
@@ -1985,28 +1967,106 @@ export class ReservationsService {
           : `Aggiornamento sul tavolo per ${tableLabel}.`;
 
     await Promise.allSettled(
-      recipients
-        .filter((recipient): recipient is { push_token: string } =>
-          Boolean(recipient.push_token),
-        )
-        .map((recipient) =>
-          this.sendExpoPush({
-            token: recipient.push_token,
-            title:
-              reservation.status === 'confirmed'
-                ? 'Tavolo confermato'
-                : reservation.status === 'cancelled'
-                  ? 'Tavolo annullato'
-                  : 'Aggiornamento tavolo',
-            body,
+      recipientIds.map((recipientId) =>
+        this.pushDispatch.notifyUser(recipientId, {
+          title:
+            reservation.status === 'confirmed'
+              ? 'Tavolo confermato'
+              : reservation.status === 'cancelled'
+                ? 'Tavolo annullato'
+                : 'Aggiornamento tavolo',
+          body,
+          data: {
+            type: 'table_invitation_updated',
+            reservation_id: reservation.id,
+            reservation_status: reservation.status,
+          },
+        }),
+      ),
+    );
+  }
+
+  /** New-reservation notifications for the people who care but aren't the booker: the PR
+   * whose link/code the booking is attributed to ("lista aggiornata"), and the venue account
+   * that operates the event ("nuova prenotazione"). Neither had any hook before this. */
+  private async notifyNewReservationInterestedParties(params: {
+    reservationId: string;
+    type: 'entry' | 'table';
+    eventName: string | null;
+    venueId: string | null | undefined;
+    prMembershipUserId: string | null | undefined;
+  }) {
+    const eventLabel = params.eventName || 'un evento';
+    const kindLabel = params.type === 'table' ? 'un tavolo' : 'la lista';
+
+    const notifications: Promise<void>[] = [];
+
+    if (params.prMembershipUserId) {
+      notifications.push(
+        this.pushDispatch.notifyUser(params.prMembershipUserId, {
+          title: 'Nuova persona in lista',
+          body: `Qualcuno ha prenotato ${kindLabel} per ${eventLabel} tramite il tuo link.`,
+          data: {
+            type: 'pr_referral_reservation',
+            reservation_id: params.reservationId,
+          },
+        }),
+      );
+    }
+
+    if (params.venueId) {
+      const venueOperators = await this.prisma.users.findMany({
+        where: { role: 'venue', venue_id: params.venueId },
+        select: { id: true },
+      });
+      for (const operator of venueOperators) {
+        notifications.push(
+          this.pushDispatch.notifyUser(operator.id, {
+            title: 'Nuova prenotazione',
+            body: `Nuova prenotazione (${kindLabel}) per ${eventLabel}.`,
             data: {
-              type: 'table_invitation_updated',
-              reservation_id: reservation.id,
-              reservation_status: reservation.status,
+              type: 'venue_new_reservation',
+              reservation_id: params.reservationId,
             },
           }),
-        ),
-    );
+        );
+      }
+    }
+
+    await Promise.allSettled(notifications);
+  }
+
+  /** Entry ("lista") reservations used to notify nobody on confirm/cancel - only table
+   * bookings did, via notifyTableInviteesAboutStatusChange. */
+  private async notifyEntryReservationStatusChange(reservation: {
+    id: string;
+    user_id: string;
+    status: string;
+    event?: { name: string | null } | null;
+  }) {
+    const eventLabel = reservation.event?.name || 'la serata';
+    const title =
+      reservation.status === 'confirmed'
+        ? 'Sei in lista'
+        : reservation.status === 'cancelled'
+          ? 'Prenotazione annullata'
+          : 'Aggiornamento prenotazione';
+    const body =
+      reservation.status === 'confirmed'
+        ? `Sei in lista per ${eventLabel}.`
+        : reservation.status === 'cancelled'
+          ? `La tua prenotazione per ${eventLabel} è stata annullata.`
+          : `Aggiornamento sulla tua prenotazione per ${eventLabel}.`;
+
+    await this.pushDispatch.notifyUser(reservation.user_id, {
+      title,
+      body,
+      data: {
+        type: 'entry_reservation_updated',
+        reservation_id: reservation.id,
+        reservation_status: reservation.status,
+      },
+    });
   }
 
   async listIncomingTableInvitations(userId: string) {
@@ -2136,15 +2196,14 @@ export class ReservationsService {
       select: { name: true, username: true },
     });
 
-    if (reservation.user?.push_token) {
+    if (reservation.user_id) {
       const responderName =
         responder?.name || responder?.username || 'Un amico';
       const voteText =
         params.response === 'accepted'
           ? 'ha confermato la presenza'
           : "ha rifiutato l'invito";
-      await this.sendExpoPush({
-        token: reservation.user.push_token,
+      await this.pushDispatch.notifyUser(reservation.user_id, {
         title: 'Risposta invito tavolo',
         body: `${responderName} ${voteText}.`,
         data: {
@@ -2300,12 +2359,12 @@ export class ReservationsService {
 
     const updatedFull = await this.getReservation(updated.id);
 
-    if (
-      existing.type === 'table' &&
-      nextStatus !== undefined &&
-      nextStatus !== existing.status
-    ) {
-      await this.notifyTableInviteesAboutStatusChange(updatedFull);
+    if (nextStatus !== undefined && nextStatus !== existing.status) {
+      if (existing.type === 'table') {
+        await this.notifyTableInviteesAboutStatusChange(updatedFull);
+      } else {
+        await this.notifyEntryReservationStatusChange(updatedFull);
+      }
     }
 
     return updatedFull;
@@ -2338,6 +2397,8 @@ export class ReservationsService {
 
     if (existing.type === 'table') {
       await this.notifyTableInviteesAboutStatusChange(updatedFull);
+    } else {
+      await this.notifyEntryReservationStatusChange(updatedFull);
     }
 
     return updatedFull;
@@ -2365,6 +2426,65 @@ export class ReservationsService {
     });
 
     return { success: true, expired: count };
+  }
+
+  // How far ahead of an event's actual start (see eventStartMs) a "evento imminente"
+  // reminder fires. Called by an external scheduler, same pattern as syncStatus above -
+  // there is no in-process scheduler on a serverless deployment, so this can't be a
+  // setInterval/@Cron: nothing stays running between requests.
+  private static readonly REMINDER_WINDOW_HOURS = 3;
+
+  async sendUpcomingEventReminders() {
+    const now = Date.now();
+    const horizon = new Date(
+      now + ReservationsService.REMINDER_WINDOW_HOURS * 60 * 60 * 1000,
+    );
+
+    // Narrow with the DATE column first (cheap, indexed-ish via btree on a date range) -
+    // the precise timezone-aware start instant is only computed for this small candidate
+    // set, not the whole table.
+    const candidates = await this.prisma.reservations.findMany({
+      where: {
+        status: { in: ['pending', 'confirmed'] },
+        reminder_sent_at: null,
+        event: {
+          date: { gte: new Date(now - 24 * 60 * 60 * 1000), lte: horizon },
+        },
+      },
+      select: {
+        id: true,
+        user_id: true,
+        event: { select: { name: true, date: true, start_time: true } },
+      },
+      take: 500,
+    });
+
+    const due = candidates.filter((reservation) => {
+      const startMs = eventStartMs(reservation.event);
+      return startMs !== null && startMs >= now && startMs <= horizon.getTime();
+    });
+
+    if (!due.length) return { success: true, reminded: 0 };
+
+    await Promise.allSettled(
+      due.map((reservation) =>
+        this.pushDispatch.notifyUser(reservation.user_id, {
+          title: 'Evento imminente',
+          body: `${reservation.event?.name || 'Il tuo evento'} inizia tra poche ore.`,
+          data: {
+            type: 'event_reminder',
+            reservation_id: reservation.id,
+          },
+        }),
+      ),
+    );
+
+    await this.prisma.reservations.updateMany({
+      where: { id: { in: due.map((reservation) => reservation.id) } },
+      data: { reminder_sent_at: new Date() },
+    });
+
+    return { success: true, reminded: due.length };
   }
 
   // Hostess: marks a confirmed table reservation as arrived at the venue - this is what

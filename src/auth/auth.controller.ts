@@ -235,6 +235,35 @@ export class AuthController {
     return { success: true };
   }
 
+  @Post('onboarding/complete')
+  async completeOnboarding(@CurrentUser() user: RequestUser) {
+    return this.authService.completeOnboarding(user.id);
+  }
+
+  @Post('push-subscription')
+  async subscribeToPush(
+    @Body()
+    body: {
+      endpoint?: string;
+      keys?: { p256dh?: string; auth?: string };
+      userAgent?: string;
+    },
+    @CurrentUser() user: RequestUser,
+  ) {
+    return this.authService.subscribeToPush(user.id, body);
+  }
+
+  @Delete('push-subscription')
+  async unsubscribeFromPush(
+    @Body() body: { endpoint?: string },
+    @CurrentUser() user: RequestUser,
+  ) {
+    return this.authService.unsubscribeFromPush(
+      user.id,
+      String(body?.endpoint || '').trim(),
+    );
+  }
+
   @Post('activity')
   async touchActivity(@CurrentUser() user: RequestUser) {
     await this.authService.touchUserActivity(user.id);

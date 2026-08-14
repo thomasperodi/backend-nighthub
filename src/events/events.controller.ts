@@ -18,6 +18,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
 import { AuthService } from '../auth/auth.service';
 import { EventsService } from './events.service';
+import { AttendanceForecastService } from './attendance-forecast.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { UpdateEventDto } from './dto/update-event.dto';
 import { Public } from '../auth/public.decorator';
@@ -36,6 +37,7 @@ export class EventsController {
   constructor(
     private readonly eventsService: EventsService,
     private readonly authService: AuthService,
+    private readonly attendanceForecastService: AttendanceForecastService,
   ) {}
 
   // Reuses AuthService.verifyAccessToken (the same verification JwtAuthGuard uses for every
@@ -160,6 +162,22 @@ export class EventsController {
       await this.eventsService.assertEventBelongsToVenue(id, user.venue_id);
     }
     return this.eventsService.getEventStats(id);
+  }
+
+  // Simple statistical attendance forecast (moving average of historical show-up rate) -
+  // see AttendanceForecastService for the method. Staff needs this at the door too (not
+  // just the venue account), same as scan-entry-qr's role set.
+  @Get('events/:id/forecast')
+  @Roles('staff', 'venue', 'admin')
+  async getAttendanceForecast(
+    @Param('id') id: string,
+    @CurrentUser() user: RequestUser,
+  ) {
+    if (user.role !== 'admin') {
+      if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
+      await this.eventsService.assertEventBelongsToVenue(id, user.venue_id);
+    }
+    return this.attendanceForecastService.getAttendanceForecast(id);
   }
 
   @Post('events')

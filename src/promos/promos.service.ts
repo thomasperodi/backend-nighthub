@@ -6,98 +6,15 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma, PromoStatus } from '@prisma/client';
+import { PushDispatchService } from '../common/push/push-dispatch.service';
 
 @Injectable()
 export class PromosService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly pushDispatch: PushDispatchService,
+  ) {}
   private readonly logger = new Logger(PromosService.name);
-  private readonly pushDebug = process.env.PUSH_DEBUG === '1';
-
-  private maskToken(token: string) {
-    if (!token) return 'empty';
-    if (token.length <= 14) return token;
-    return `${token.slice(0, 10)}...${token.slice(-4)}`;
-  }
-
-  private async sendExpoPush(params: {
-    token: string;
-    title: string;
-    body: string;
-    data?: Record<string, unknown>;
-  }) {
-    const token = String(params.token || '').trim();
-    const isExpoToken = /^Expo(?:nent)?PushToken\[[^\]]+\]$/.test(token);
-    if (!isExpoToken) {
-      this.logger.warn(
-        `Push skipped: invalid Expo token format (${this.maskToken(token)})`,
-      );
-      return;
-    }
-
-    try {
-      const response = await fetch('https://exp.host/--/api/v2/push/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          to: token,
-          title: params.title,
-          body: params.body,
-          sound: 'default',
-          priority: 'high',
-          content_available: true,
-          data: params.data ?? {},
-        }),
-      });
-
-      let payload: unknown = null;
-      try {
-        payload = await response.json();
-      } catch {
-        payload = null;
-      }
-
-      if (!response.ok) {
-        this.logger.error(
-          `Expo push HTTP ${response.status} for ${this.maskToken(token)}: ${JSON.stringify(payload)}`,
-        );
-        return;
-      }
-
-      const payloadData =
-        payload && typeof payload === 'object' && 'data' in payload
-          ? (payload as { data?: unknown }).data
-          : undefined;
-
-      const ticketStatus =
-        payloadData &&
-        typeof payloadData === 'object' &&
-        !Array.isArray(payloadData) &&
-        'status' in payloadData &&
-        typeof (payloadData as { status?: unknown }).status === 'string'
-          ? (payloadData as { status: string }).status
-          : undefined;
-
-      if (ticketStatus && ticketStatus !== 'ok') {
-        this.logger.error(
-          `Expo push rejected for ${this.maskToken(token)}: ${JSON.stringify(payloadData)}`,
-        );
-        return;
-      }
-
-      if (this.pushDebug) {
-        const pushType =
-          typeof params.data?.type === 'string' ? params.data.type : 'unknown';
-        this.logger.log(
-          `Expo push sent (${this.maskToken(token)}) type=${pushType}`,
-        );
-      }
-    } catch (error) {
-      this.logger.error(
-        `Expo push exception for ${this.maskToken(token)}`,
-        error instanceof Error ? error.stack : undefined,
-      );
-    }
-  }
 
   private async sendPromoCreatedPush(promo: {
     id: string;
@@ -109,12 +26,14 @@ export class PromosService {
     const users = await this.prisma.users.findMany({
       where: {
         role: 'client',
-        push_token: { not: null },
+        OR: [
+          { push_token: { not: null } },
+          { push_subscriptions: { some: {} } },
+        ],
       },
       select: {
         id: true,
         username: true,
-        push_token: true,
       },
     });
     if (!users.length) return;
@@ -188,19 +107,9 @@ export class PromosService {
     });
     const venueName = venue?.name || 'un locale';
 
-    const uniqueTokens = Array.from(
-      new Set(
-        recipients
-          .map((user) => user.push_token)
-          .filter((token): token is string => !!token)
-          .map((token) => token.trim()),
-      ),
-    );
-
     await Promise.allSettled(
-      uniqueTokens.map((token) =>
-        this.sendExpoPush({
-          token,
+      recipients.map((user) =>
+        this.pushDispatch.notifyUser(user.id, {
           title: 'Nuova promo disponibile',
           body: `${venueName}: ${promo.title}`,
           data: {

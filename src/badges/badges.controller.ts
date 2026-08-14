@@ -1,4 +1,11 @@
-import { Controller, Get, Param, Post } from '@nestjs/common';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Get,
+  Param,
+  Post,
+} from '@nestjs/common';
 import { BadgesService } from './badges.service';
 import { Roles } from '../auth/roles.decorator';
 import { CurrentUser } from '../auth/current-user.decorator';
@@ -48,5 +55,24 @@ export class BadgesController {
     @CurrentUser() user: RequestUser,
   ) {
     return this.badgesService.markSeen(user.id, userBadgeId);
+  }
+
+  /** Admin-only manual award, for badges whose criteria.type is 'manual' (e.g. the_connector,
+   * bottle_service) - these can never be earned automatically via evaluateForUser. */
+  @Post('admin/award')
+  @Roles('admin')
+  async adminAward(@Body() body: { user_id?: string; badge_code?: string }) {
+    const userId = String(body?.user_id || '').trim();
+    const badgeCode = String(body?.badge_code || '').trim();
+    if (!userId || !badgeCode) {
+      throw new BadRequestException('user_id and badge_code are required');
+    }
+
+    const result = await this.badgesService.awardManualBadge(
+      userId,
+      badgeCode,
+    );
+    if (!result) throw new BadRequestException('Unknown badge_code');
+    return result;
   }
 }

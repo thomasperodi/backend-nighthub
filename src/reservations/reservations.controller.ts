@@ -207,6 +207,19 @@ export class ReservationsController {
     return this.reservationsService.expireStalePendingReservations();
   }
 
+  // Same external-scheduler pattern as syncStatus above. Pushes "evento imminente"
+  // reminders for reservations whose event starts within the next few hours.
+  @Get('send-reminders')
+  @Public()
+  async sendReminders(
+    @Query('token') token?: string,
+    @Headers('x-cron-secret') headerSecret?: string,
+    @Headers('authorization') authorization?: string,
+  ) {
+    assertCronSecret({ token, headerSecret, authorization });
+    return this.reservationsService.sendUpcomingEventReminders();
+  }
+
   @Get(':id')
   @Roles('client', 'venue', 'staff', 'admin')
   async get(@Param('id') id: string, @CurrentUser() user: RequestUser) {
@@ -271,6 +284,11 @@ export class ReservationsController {
     const eventId = body?.event_id ?? body?.eventId;
     const qrData = body?.qr_data ?? body?.qrData ?? body?.data;
     const adminStaffId = body?.staff_id;
+    const rawActualGuests = body?.actual_guests ?? body?.actualGuests;
+    const actualGuests =
+      rawActualGuests !== undefined && rawActualGuests !== null
+        ? Number(rawActualGuests)
+        : undefined;
 
     try {
       if (!eventId) throw new BadRequestException('event_id required');
@@ -297,6 +315,7 @@ export class ReservationsController {
         eventId,
         staffId,
         qrData,
+        actualGuests,
       });
     } catch (error: any) {
       console.error('[reservations.controller] scanEntryQr error', {

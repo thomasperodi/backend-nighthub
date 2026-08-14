@@ -2,12 +2,13 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
 import { EventsService } from './events.service';
 import { EventsController } from './events.controller';
-import { ExpoPushService } from '../common/push/expo-push.service';
+import { PushModule } from '../common/push/push.module';
+import { AttendanceForecastService } from './attendance-forecast.service';
 
 @Module({
-  imports: [AuthModule],
+  imports: [AuthModule, PushModule],
   controllers: [EventsController],
-  providers: [EventsService, ExpoPushService],
+  providers: [EventsService, AttendanceForecastService],
   exports: [EventsService],
 })
 export class EventsModule {}

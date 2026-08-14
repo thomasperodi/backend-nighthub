@@ -23,6 +23,7 @@ type CurrentUserRecord = {
   phone: string | null;
   avatar: string | null;
   venue_id: string | null;
+  onboarding_completed_at: Date | null;
   created_at: Date;
   updated_at: Date;
 };
@@ -68,6 +69,8 @@ export class UsersService {
       avatar: user.avatar,
       venue_id: user.venue_id,
       pr_venue_id: prContext.pr_venue_id,
+      is_verified_pr: Boolean(activeMembership),
+      onboarding_completed: Boolean(user.onboarding_completed_at),
       created_at: user.created_at,
       updated_at: user.updated_at,
     };
@@ -87,6 +90,7 @@ export class UsersService {
         phone: true,
         avatar: true,
         venue_id: true,
+        onboarding_completed_at: true,
         created_at: true,
         updated_at: true,
       },
@@ -187,6 +191,7 @@ export class UsersService {
           phone: true,
           avatar: true,
           venue_id: true,
+          onboarding_completed_at: true,
           created_at: true,
           updated_at: true,
         },

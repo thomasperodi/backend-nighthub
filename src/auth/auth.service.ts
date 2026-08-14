@@ -27,6 +27,11 @@ export type PublicUser = {
   role: string;
   venue_id?: string | null;
   pr_venue_id?: string | null;
+  /** True while the user has at least one active venue_pr_memberships row - always
+   * server-derived, never client-settable, so it doubles as an anti-impersonation "verified
+   * PR" signal shown on their profile (see BadgesModule-adjacent PR verification badge). */
+  is_verified_pr: boolean;
+  onboarding_completed: boolean;
   created_at?: Date | null;
 };
 
@@ -562,8 +567,22 @@ export class AuthService {
       role: prContext.role,
       venue_id: user.venue_id,
       pr_venue_id: prContext.pr_venue_id,
+      is_verified_pr: Boolean(prContext.pr_venue_id),
+      onboarding_completed: Boolean(user.onboarding_completed_at),
       created_at: user.created_at,
     };
+  }
+
+  /** POST /auth/onboarding/complete. Idempotent: only ever sets the timestamp once. The
+   * onboarding flow otherwise has no backend state, which meant it silently replayed on
+   * every new device/browser (localStorage-only flag) and could be skipped entirely when a
+   * session was restored via refresh token instead of an explicit login submit. */
+  async completeOnboarding(userId: string): Promise<{ onboarding_completed: true }> {
+    await this.prisma.users.updateMany({
+      where: { id: userId, onboarding_completed_at: null },
+      data: { onboarding_completed_at: new Date() },
+    });
+    return { onboarding_completed: true };
   }
 
   async login(dto: LoginDto, meta: SessionMeta = {}): Promise<LoginResult> {
@@ -1104,5 +1123,61 @@ export class AuthService {
         push_token_updated_at: new Date(),
       },
     });
+  }
+
+  /** POST /auth/push-subscription - registers/refreshes a Web Push subscription for this
+   * device/browser. Unlike push_token (single column, Expo/mobile), a user can have any
+   * number of these; `endpoint` is globally unique per browser+device, so re-subscribing
+   * (e.g. after a permission re-grant) just updates the existing row via upsert. */
+  async subscribeToPush(
+    userId: string,
+    subscription: {
+      endpoint?: string;
+      keys?: { p256dh?: string; auth?: string };
+      userAgent?: string;
+    },
+  ) {
+    const endpoint = String(subscription?.endpoint || '').trim();
+    const p256dh = String(subscription?.keys?.p256dh || '').trim();
+    const authKey = String(subscription?.keys?.auth || '').trim();
+    if (!endpoint || !p256dh || !authKey) {
+      throw new BadRequestException(
+        'endpoint, keys.p256dh and keys.auth are required',
+      );
+    }
+
+    await this.prisma.push_subscriptions.upsert({
+      where: { endpoint },
+      update: {
+        user_id: userId,
+        p256dh,
+        auth_key: authKey,
+        user_agent: subscription.userAgent?.slice(0, 512),
+        last_seen_at: new Date(),
+      },
+      create: {
+        user_id: userId,
+        endpoint,
+        p256dh,
+        auth_key: authKey,
+        user_agent: subscription.userAgent?.slice(0, 512),
+      },
+    });
+
+    return { success: true };
+  }
+
+  /** DELETE /auth/push-subscription - called on logout so a shared/borrowed device stops
+   * receiving this account's notifications once signed out (see push_token's equivalent gap:
+   * that single-column field is never cleared on logout at all). Scoped to the caller's own
+   * userId so one user can't unsubscribe another's device by guessing an endpoint. */
+  async unsubscribeFromPush(userId: string, endpoint: string) {
+    if (!endpoint) return { success: true };
+
+    await this.prisma.push_subscriptions.deleteMany({
+      where: { endpoint, user_id: userId },
+    });
+
+    return { success: true };
   }
 }

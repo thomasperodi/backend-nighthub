@@ -3,9 +3,10 @@ import { StaffService } from './staff.service';
 import { StaffController } from './staff.controller';
 import { EventsModule } from '../events/events.module';
 import { BadgesModule } from '../badges/badges.module';
+import { PushModule } from '../common/push/push.module';
 
 @Module({
-  imports: [forwardRef(() => EventsModule), BadgesModule],
+  imports: [forwardRef(() => EventsModule), BadgesModule, PushModule],
   controllers: [StaffController],
   providers: [StaffService],
 })

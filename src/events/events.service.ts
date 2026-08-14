@@ -17,7 +17,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { SupabaseStorageService } from '../common/storage/supabase-storage.service';
-import { ExpoPushService } from '../common/push/expo-push.service';
+import { PushDispatchService } from '../common/push/push-dispatch.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { UpdateEventDto } from './dto/update-event.dto';
 
@@ -59,7 +59,7 @@ export class EventsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: SupabaseStorageService,
-    private readonly expoPush: ExpoPushService,
+    private readonly pushDispatch: PushDispatchService,
   ) {}
 
   private isTransientPrismaConnectivityError(error: unknown): boolean {
@@ -1787,10 +1787,7 @@ export class EventsService {
 
     const affectedReservations = await this.prisma.reservations.findMany({
       where: { event_id: id, status: { not: 'cancelled' } },
-      select: {
-        id: true,
-        user: { select: { push_token: true } },
-      },
+      select: { id: true, user_id: true },
     });
 
     await this.prisma.$transaction([
@@ -1804,12 +1801,16 @@ export class EventsService {
       }),
     ]);
 
+    const notifiedUserIds = new Set<string>();
     await Promise.all(
       affectedReservations
-        .filter((r) => r.user?.push_token)
+        .filter((r) => {
+          if (notifiedUserIds.has(r.user_id)) return false;
+          notifiedUserIds.add(r.user_id);
+          return true;
+        })
         .map((r) =>
-          this.expoPush.send({
-            token: r.user!.push_token!,
+          this.pushDispatch.notifyUser(r.user_id, {
             title: 'Evento annullato',
             body: `"${event.name}" è stato annullato dal locale. La tua prenotazione è stata cancellata.`,
             data: { type: 'event_cancelled', event_id: id },

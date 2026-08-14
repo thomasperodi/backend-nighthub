@@ -24,6 +24,10 @@
     {
       "path": "/auth/cleanup-tokens",
       "schedule": "0 4 * * *"
+    },
+    {
+      "path": "/reservations/send-reminders",
+      "schedule": "0 * * * *"
     }
   ]
 }

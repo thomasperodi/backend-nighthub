@@ -3,6 +3,7 @@ import { BadRequestException } from '@nestjs/common';
 import { ReservationsService } from './reservations.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { BadgesService } from '../badges/badges.service';
+import { PushDispatchService } from '../common/push/push-dispatch.service';
 
 function makePrismaMock() {
   return {
@@ -72,6 +73,10 @@ describe('ReservationsService', () => {
         {
           provide: BadgesService,
           useValue: { evaluateForUser: jest.fn().mockResolvedValue(undefined) },
+        },
+        {
+          provide: PushDispatchService,
+          useValue: { notifyUser: jest.fn().mockResolvedValue(undefined) },
         },
       ],
     }).compile();
@@ -145,13 +150,22 @@ describe('ReservationsService', () => {
       total_amount: 0, // complimentary => resolveEntryUnitPrice short-circuits, no pricing lookups needed
       meta: null,
       user: { id: 'user-1', sesso: null, name: 'Mario', birth_date: null },
-      event: { id: 'event-1', name: 'Sabato', venue_id: 'venue-1', date: new Date() },
+      event: {
+        id: 'event-1',
+        name: 'Sabato',
+        venue_id: 'venue-1',
+        date: new Date(),
+      },
     };
 
     it('creates the entry and claims check-in when it wins the race', async () => {
       prisma.reservations.findUnique.mockResolvedValue(qrReservation);
       const createdEntry = { id: 'entry-1' };
-      const updatedReservation = { ...qrReservation, status: 'completed', checked_in_at: new Date() };
+      const updatedReservation = {
+        ...qrReservation,
+        status: 'completed',
+        checked_in_at: new Date(),
+      };
 
       prisma.$transaction.mockImplementation(async (fn: any) =>
         fn({
@@ -180,7 +194,9 @@ describe('ReservationsService', () => {
       prisma.$transaction.mockImplementation(async (fn: any) =>
         fn({
           // count: 0 => another concurrent scan already claimed checked_in_at first.
-          reservations: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
+          reservations: {
+            updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+          },
           entries: { create: entriesCreate },
         }),
       );
