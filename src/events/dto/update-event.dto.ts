@@ -1,3 +1,5 @@
+import { EntryPriceDto, EventPromoDto, TablePricingOverrideDto } from './event-nested.dto';
+
 export class UpdateEventDto {
   venue_id?: string;
   name?: string;
@@ -14,26 +16,9 @@ export class UpdateEventDto {
   description?: string;
   image?: string;
 
-  entry_prices?: Array<{
-    label?: string;
-    gender?: string;
-    start_time?: string;
-    end_time?: string;
-    price: number | string;
-  }>;
+  entry_prices?: EntryPriceDto[];
 
-  table_pricing?: Array<{
-    venue_table_zone_id: string;
-    per_testa?: number | string;
-    costo_minimo?: number | string;
-    persone_max?: number;
-  }>;
+  table_pricing?: TablePricingOverrideDto[];
 
-  promos?: Array<{
-    title: string;
-    description?: string;
-    discount_type: string;
-    discount_value?: number | string;
-    status?: string;
-  }>;
+  promos?: EventPromoDto[];
 }

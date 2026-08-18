@@ -101,6 +101,12 @@ export class FriendsController {
     return this.friendsService.rejectRequest(id, user.id);
   }
 
+  @Delete('friends/requests/:id')
+  @Roles('client')
+  cancel(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    return this.friendsService.cancelRequest(id, user.id);
+  }
+
   @Delete('friends/:id')
   @Roles('client')
   remove(@Param('id') id: string, @CurrentUser() user: RequestUser) {

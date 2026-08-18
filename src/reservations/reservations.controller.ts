@@ -396,8 +396,18 @@ export class ReservationsController {
     if (user.role === 'client') {
       if (r.user_id !== user.id) throw new ForbiddenException('Forbidden');
       if (r.type === 'entry') {
+        // Intentional, not a gap: entry ("lista") reservations are never client-cancellable,
+        // by design - no-show/last-minute booking patterns are wanted intact for future
+        // behavioral analytics (e.g. "books the moment the event drops" vs "books day-of").
         throw new BadRequestException(
           'Gli ingressi non sono annullabili dal cliente',
+        );
+      }
+      if (r.type === 'table' && r.status !== 'pending') {
+        // Once the venue has confirmed a table, the client can no longer self-cancel - only
+        // a request-to-venue flow (not yet implemented) can resolve it from here on.
+        throw new BadRequestException(
+          'La prenotazione è già stata confermata dal locale: contatta il locale per annullarla',
         );
       }
     } else if (user.role !== 'admin') {

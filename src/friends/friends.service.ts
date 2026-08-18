@@ -1152,6 +1152,28 @@ export class FriendsService {
     return { success: true };
   }
 
+  // Withdraws a request the caller sent themselves, while it's still pending. Hard-deletes
+  // the row (rather than a `cancelled` status like reject's `rejected`) so the recipient's
+  // request list simply stops showing it - they must never be able to tell a withdrawn
+  // request apart from one that was never sent, which a status column would leak.
+  //
+  // Race safety: `deleteMany` with `status: 'pending'` in its where-clause means a
+  // concurrent accept/reject (which flips status away from 'pending' first) makes this
+  // match zero rows instead of deleting a request the recipient just acted on; conversely if
+  // this delete wins the race, acceptRequest/rejectRequest's own `findUnique` simply won't
+  // find the row anymore and will throw NotFoundException as it already does today.
+  async cancelRequest(requestId: string, userId: string) {
+    const { count } = await this.prisma.friend_requests.deleteMany({
+      where: { id: requestId, from_user_id: userId, status: 'pending' },
+    });
+
+    if (count === 0) {
+      throw new NotFoundException('Request not found');
+    }
+
+    return { success: true };
+  }
+
   async removeFriend(userId: string, friendId: string) {
     await this.prisma.$transaction([
       this.prisma.friendships.deleteMany({

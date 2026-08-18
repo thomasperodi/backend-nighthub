@@ -1,6 +1,7 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, INestApplication } from '@nestjs/common';
 import type { AbstractHttpAdapter } from '@nestjs/core';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { json, urlencoded } from 'express';
 import cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
@@ -53,6 +54,23 @@ export async function createApp(
   app.use(urlencoded({ extended: true, limit: '5mb' }));
 
   app.setGlobalPrefix('api');
+
+  // OpenAPI document, used as the single source of truth to generate the frontend's typed
+  // API client (see pwa/nighthub `npm run generate:api-types`). Kept available in every
+  // environment (not just dev) since the frontend's CI needs to fetch it too; it only
+  // describes route/DTO shapes, not runtime data, so this is not a sensitive endpoint.
+  const openApiDocument = SwaggerModule.createDocument(
+    app,
+    new DocumentBuilder()
+      .setTitle('NightHub API')
+      .setDescription('Auto-generated from DTOs/controllers via the @nestjs/swagger CLI plugin.')
+      .setVersion('1.0')
+      .addBearerAuth()
+      .build(),
+  );
+  SwaggerModule.setup('api/docs', app, openApiDocument, {
+    jsonDocumentUrl: 'api/docs-json',
+  });
 
   // `credentials: true` + an explicit origin list (not '*') is required for the browser to
   // send/receive the httpOnly session cookie. Requests with no Origin header (native/mobile

@@ -962,10 +962,18 @@ export class AuthService {
     const bcryptHash = hash as (s: string, rounds: number) => Promise<string>;
     const hashedPassword = await bcryptHash(newPassword, 10);
 
-    await this.prisma.users.update({
-      where: { id: payload.sub },
-      data: { password_hash: hashedPassword },
-    });
+    // Same reasoning as changePassword: a password reset shouldn't leave a session from
+    // before the reset (e.g. an attacker's, or a stolen device) still valid.
+    await this.prisma.$transaction([
+      this.prisma.users.update({
+        where: { id: payload.sub },
+        data: { password_hash: hashedPassword },
+      }),
+      this.prisma.refresh_tokens.updateMany({
+        where: { user_id: payload.sub, revoked_at: null },
+        data: { revoked_at: new Date() },
+      }),
+    ]);
 
     await this.touchUserActivity(payload.sub, new Date());
 
@@ -1007,10 +1015,18 @@ export class AuthService {
     const bcryptHash = hash as (s: string, rounds: number) => Promise<string>;
     const hashedPassword = await bcryptHash(newPassword, 10);
 
-    await this.prisma.users.update({
-      where: { id: user.id },
-      data: { password_hash: hashedPassword },
-    });
+    // Same reasoning as changePassword: a password reset shouldn't leave a session from
+    // before the reset (e.g. an attacker's, or a stolen device) still valid.
+    await this.prisma.$transaction([
+      this.prisma.users.update({
+        where: { id: user.id },
+        data: { password_hash: hashedPassword },
+      }),
+      this.prisma.refresh_tokens.updateMany({
+        where: { user_id: user.id, revoked_at: null },
+        data: { revoked_at: new Date() },
+      }),
+    ]);
 
     await this.touchUserActivity(user.id, new Date());
 
