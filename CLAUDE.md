@@ -50,6 +50,14 @@ Unlinking an org from a venue (`OrganizationsService.unlinkVenue`) soft-deactiva
 
 **Still not built**: UI/endpoint for a request-to-venue flow when a client wants to cancel an already-confirmed table reservation (client just gets a blocking message today). Multi-owner organizations and multi-org-per-PR remain out of scope per the confirmed decisions (not gaps, deliberate).
 
+## Custom wallet cards / Fase 7 (added 2026-08-18)
+
+Per-venue PR season pass branding, requested explicitly and implemented same-day. New `venue_wallet_templates` table (1:1 with `venues`: `logo_path`, `background_color`, `foreground_color`, `label_color`) — additive, a venue without a row gets the exact same hardcoded dark/gold pass as before. `buildPrSeasonPassApplePkpass` in `VenuesService` is now `async` (needed to fetch the logo bytes) and reads the template when present. New `SupabaseStorageService.downloadPublicImageBuffer` fetches an uploaded image's bytes via the Supabase client (not the public URL) for embedding directly into the generated `.pkpass`; new `'venue-wallet-logos'` storage prefix. New venue-owned endpoints (`GET/PATCH /venues/:id/wallet-template`, `POST/DELETE /venues/:id/wallet-template/logo`) — first endpoints in this controller to use `@RequireVenueOwnership()` instead of the inline check the rest of the file still uses. `icon.png`/`icon@2x/3x.png` stay the minimal placeholder regardless of branding (Apple requires a specific small square size; uploaded logos aren't resized) — only `logo.png` uses the venue's asset. Google Wallet remains out of scope (no real API integration, URL-template only, as before).
+
+## Cross-tenant security verification (2026-08-18)
+
+Ran a one-off QA script (Prisma-seeded test data + real logins via `POST /auth/login` + HTTP requests against a locally running instance, then fully cleaned up — not committed, not part of the test suite) covering 14 cross-tenant access checks across 2 venues and 2 organizations: a `venue` account cannot read another venue's linked organizations, wallet template, or org-scoped stats; an `organization` account cannot read another organization's detail, stats, venues, or PR network; unauthenticated requests are rejected. **14/14 passed.** This exercised `VenueOwnershipGuard`/`OrganizationOwnershipGuard` end-to-end, not just at the unit/boot level. If you need to re-verify after changing ownership logic, the script pattern (seed via Prisma directly, login via the real endpoint, assert status codes, delete everything in a `finally`) is straightforward to recreate — it wasn't kept in the repo since it's a one-off verification, not a maintained test.
+
 ## Known gaps relevant to planned frontend work
 
 - No cancel-own-friend-request endpoint.
