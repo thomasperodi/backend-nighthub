@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import {
@@ -27,6 +28,8 @@ import { PushDispatchService } from '../common/push/push-dispatch.service';
 
 @Injectable()
 export class StaffService {
+  private readonly logger = new Logger(StaffService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly eventsService: EventsService,
@@ -657,7 +660,16 @@ export class StaffService {
         typeof payload['event_table_id'] === 'string'
           ? payload['event_table_id']
           : undefined,
-    }).catch(() => undefined);
+    }).catch((error: unknown) => {
+      // The sale itself already succeeded above - this only resolves the event id to
+      // recalculate its stats, so a failure here must not fail the whole request. Logged
+      // (rather than silently discarded) so a caller polling `stats` afterward has a trail
+      // to follow when it unexpectedly comes back null.
+      this.logger.warn(
+        `recordSale: failed to resolve event id for stats recalculation: ${String(error)}`,
+      );
+      return undefined;
+    });
 
     const stats = resolvedEventId
       ? await this.eventsService.recalculateEventStats(resolvedEventId)
