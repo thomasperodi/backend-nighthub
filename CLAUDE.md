@@ -43,7 +43,12 @@ New module `src/organizations/` (`OrganizationsController`/`OrganizationsService
 
 Unlinking an org from a venue (`OrganizationsService.unlinkVenue`) soft-deactivates (`is_active: false`, never deletes) any PR memberships that org held at that venue — confirmed rule: a PR is scoped through the venue link, so losing the link loses that venue too, for now.
 
-**Not yet built**: any endpoint/UI to move monetization (`subscription_plans`) from venues to organizations (decision #12 flagged this needs more definition before touching `subscription_plans`). Also not built: a request-to-venue flow for cancelling an already-confirmed table reservation (client can no longer self-cancel it, but there's no venue-side request UI for that yet).
+**Fase 5 gap-closing (added 2026-08-18, same day)**: three items flagged as missing from the original Fase 5 pass were built:
+- **Reusable ownership guards**: `src/common/guards/venue-ownership.guard.ts` (`@RequireVenueOwnership()`) and `organization-ownership.guard.ts` (`@RequireOrganizationOwnership()`) — applied to every Organizations-related endpoint (`OrganizationsController`'s `:id`-scoped routes, `venues.controller.ts`'s new `/organizations` routes). The service layer no longer re-checks ownership for those routes (removed the redundant `assertOrgAccess`/inline role checks) — this is what closes the "guard centralizzata" recommendation from the audit. **Not retrofitted**: the ~20+ pre-existing copy-pasted ownership checks elsewhere in `venues.controller.ts`/`events.controller.ts`/`reservations.controller.ts`/`staff.controller.ts` — the guard is available for that but retrofitting all of them is a separate, larger pass.
+- **Push test endpoint**: `POST /auth/push-test` — authenticated, sends a test push to the calling user's own devices only (Expo + every Web Push subscription via `PushDispatchService`), throttled 5/min. Cannot target anyone else.
+- **Organization billing**: `organizations.plan_id` (FK to `subscription_plans`, same catalog venues use) + `PATCH /organizations/:id/plan` (admin-only). Confirmed decision: billing moves to organizations, one flat plan per org regardless of venue count. `venues.plan_id` is **not** migrated or dropped — left in place and documented as legacy in the schema, since existing venue plan assignments in production shouldn't be silently destroyed by this change.
+
+**Still not built**: UI/endpoint for a request-to-venue flow when a client wants to cancel an already-confirmed table reservation (client just gets a blocking message today). Multi-owner organizations and multi-org-per-PR remain out of scope per the confirmed decisions (not gaps, deliberate).
 
 ## Known gaps relevant to planned frontend work
 
