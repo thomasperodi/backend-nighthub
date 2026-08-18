@@ -3,6 +3,7 @@ import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtModule } from '@nestjs/jwt';
 import { ACCESS_TOKEN_TTL_SECONDS, getJwtSecret } from './jwt.config';
+import { PushModule } from '../common/push/push.module';
 
 @Module({
   imports: [
@@ -10,6 +11,7 @@ import { ACCESS_TOKEN_TTL_SECONDS, getJwtSecret } from './jwt.config';
       secret: getJwtSecret(),
       signOptions: { expiresIn: ACCESS_TOKEN_TTL_SECONDS },
     }),
+    PushModule,
   ],
   providers: [AuthService],
   controllers: [AuthController],

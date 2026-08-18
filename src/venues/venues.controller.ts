@@ -18,6 +18,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { VenuesService } from './venues.service';
 import { EventsService } from '../events/events.service';
 import { OrganizationsService } from '../organizations/organizations.service';
+import { RequireVenueOwnership } from '../common/guards/venue-ownership.guard';
 import { CreateVenueDto } from './dto/create-venue.dto';
 import { CreateVenueStationsBulkDto } from './dto/create-venue-stations-bulk.dto';
 import { UpdateVenueImageDto } from './dto/update-venue-image.dto';
@@ -261,11 +262,9 @@ export class VenuesController {
   // CreateVenuePrMemberDto.organization_id).
   @Get(':id/organizations')
   @Roles('venue', 'admin')
-  listVenueOrganizations(
-    @Param('id') id: string,
-    @CurrentUser() user?: RequestUser,
-  ) {
-    return this.organizationsService.listForVenue(id, user);
+  @RequireVenueOwnership()
+  listVenueOrganizations(@Param('id') id: string) {
+    return this.organizationsService.listForVenue(id);
   }
 
   // Performance of one linked organization's PRs, scoped to this venue's own events only -
@@ -273,12 +272,12 @@ export class VenuesController {
   // structural (entries/scans carry venue_id) rather than an extra filter.
   @Get(':id/organizations/:orgId/stats')
   @Roles('venue', 'admin')
+  @RequireVenueOwnership()
   getVenueOrganizationStats(
     @Param('id') id: string,
     @Param('orgId') orgId: string,
-    @CurrentUser() user?: RequestUser,
   ) {
-    return this.organizationsService.getStatsForVenue(id, orgId, user);
+    return this.organizationsService.getStatsForVenue(id, orgId);
   }
 
   @Post(':id/pr-network')

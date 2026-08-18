@@ -12,9 +12,11 @@ import { OrganizationsService } from './organizations.service';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
 import { LinkVenueDto } from './dto/link-venue.dto';
+import { AssignOrganizationPlanDto } from './dto/assign-organization-plan.dto';
 import { Roles } from '../auth/roles.decorator';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { RequestUser } from '../auth/types';
+import { RequireOrganizationOwnership } from '../common/guards/organization-ownership.guard';
 
 @Controller('organizations')
 export class OrganizationsController {
@@ -43,8 +45,9 @@ export class OrganizationsController {
 
   @Get(':id')
   @Roles('admin', 'organization')
-  getById(@Param('id') id: string, @CurrentUser() user?: RequestUser) {
-    return this.organizationsService.getById(id, user);
+  @RequireOrganizationOwnership()
+  getById(@Param('id') id: string) {
+    return this.organizationsService.getById(id);
   }
 
   @Patch(':id')
@@ -55,6 +58,16 @@ export class OrganizationsController {
     @CurrentUser() user?: RequestUser,
   ) {
     return this.organizationsService.update(id, dto, user);
+  }
+
+  @Patch(':id/plan')
+  @Roles('admin')
+  assignPlan(
+    @Param('id') id: string,
+    @Body() dto: AssignOrganizationPlanDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.organizationsService.assignPlan(id, dto.plan_id, user);
   }
 
   @Post(':id/venue-links')
@@ -79,23 +92,22 @@ export class OrganizationsController {
 
   @Get(':id/venues')
   @Roles('admin', 'organization')
-  listVenues(@Param('id') id: string, @CurrentUser() user?: RequestUser) {
-    return this.organizationsService.listVenues(id, user);
+  @RequireOrganizationOwnership()
+  listVenues(@Param('id') id: string) {
+    return this.organizationsService.listVenues(id);
   }
 
   @Get(':id/pr-network')
   @Roles('admin', 'organization')
-  listPrNetwork(@Param('id') id: string, @CurrentUser() user?: RequestUser) {
-    return this.organizationsService.listPrNetwork(id, user);
+  @RequireOrganizationOwnership()
+  listPrNetwork(@Param('id') id: string) {
+    return this.organizationsService.listPrNetwork(id);
   }
 
   @Get(':id/stats')
   @Roles('admin', 'organization')
-  getStats(
-    @Param('id') id: string,
-    @Query('venue_id') venueId?: string,
-    @CurrentUser() user?: RequestUser,
-  ) {
-    return this.organizationsService.getStats(id, user, venueId);
+  @RequireOrganizationOwnership()
+  getStats(@Param('id') id: string, @Query('venue_id') venueId?: string) {
+    return this.organizationsService.getStats(id, venueId);
   }
 }

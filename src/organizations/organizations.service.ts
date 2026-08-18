@@ -17,23 +17,11 @@ export class OrganizationsService {
     private readonly auditLog: AuditLogService,
   ) {}
 
-  // Centralizes the ownership check other modules were flagged (in the NightHub audit) for
-  // re-implementing ad hoc per-endpoint - every organization-scoped method in this service
-  // goes through this single place instead of repeating an if/throw. Admin always passes;
-  // an `organization`-role account only passes for its own organization_id (confirmed
-  // business rule: one owner account per organization, no shared membership table).
-  private assertOrgAccess(
-    actor: RequestUser | undefined,
-    organizationId: string,
-  ) {
-    if (!actor?.id) throw new ForbiddenException('Forbidden');
-    const role = String(actor.role || '').toLowerCase();
-    if (role === 'admin') return;
-    if (role === 'organization' && actor.organization_id === organizationId)
-      return;
-    throw new ForbiddenException('Forbidden');
-  }
-
+  // Organization-id ownership for getById/listVenues/listPrNetwork/getStats is enforced by
+  // OrganizationOwnershipGuard at the controller level (see organizations.controller.ts),
+  // not re-checked here - this is what closes the "guard centralizzata" gap flagged in the
+  // NightHub audit's Fase 5 recap: a single reusable guard instead of a
+  // per-service-method if/throw.
   private assertAdmin(actor: RequestUser | undefined) {
     if (String(actor?.role || '').toLowerCase() !== 'admin') {
       throw new ForbiddenException('Forbidden');
@@ -66,18 +54,19 @@ export class OrganizationsService {
       orderBy: { name: 'asc' },
       include: {
         _count: { select: { venue_links: true, pr_memberships: true } },
+        plan: { select: { id: true, key: true, name: true, icon: true } },
       },
     });
   }
 
-  async getById(organizationId: string, actor: RequestUser | undefined) {
-    this.assertOrgAccess(actor, organizationId);
+  async getById(organizationId: string) {
     const organization = await this.prisma.organizations.findUnique({
       where: { id: organizationId },
       include: {
         venue_links: {
           include: { venue: { select: { id: true, name: true, city: true } } },
         },
+        plan: { select: { id: true, key: true, name: true, icon: true } },
       },
     });
     if (!organization) throw new NotFoundException('Organization not found');
@@ -91,7 +80,7 @@ export class OrganizationsService {
         'No organization associated with this account',
       );
     }
-    return this.getById(actor.organization_id, actor);
+    return this.getById(actor.organization_id);
   }
 
   async update(
@@ -125,6 +114,50 @@ export class OrganizationsService {
         targetType: 'organization',
         targetId: organizationId,
         metadata: dto as Record<string, unknown>,
+      });
+    }
+
+    return organization;
+  }
+
+  // Billing moves to organizations (confirmed business decision) - one flat plan per
+  // organization, reusing the same subscription_plans catalog venues.plan_id already uses.
+  // Mirrors AdminService.assignVenuePlan's shape/behavior for consistency.
+  async assignPlan(
+    organizationId: string,
+    planId: string | null | undefined,
+    actor: RequestUser | undefined,
+  ) {
+    this.assertAdmin(actor);
+    const existing = await this.prisma.organizations.findUnique({
+      where: { id: organizationId },
+      select: { id: true },
+    });
+    if (!existing) throw new NotFoundException('Organization not found');
+
+    if (planId) {
+      const plan = await this.prisma.subscription_plans.findUnique({
+        where: { id: planId },
+        select: { id: true },
+      });
+      if (!plan) throw new NotFoundException('Plan not found');
+    }
+
+    const organization = await this.prisma.organizations.update({
+      where: { id: organizationId },
+      data: { plan_id: planId ?? null },
+      include: {
+        plan: { select: { id: true, key: true, name: true, icon: true } },
+      },
+    });
+
+    if (actor?.id) {
+      this.auditLog.record({
+        adminId: actor.id,
+        action: 'organization.assign_plan',
+        targetType: 'organization',
+        targetId: organizationId,
+        metadata: { plan_id: planId ?? null },
       });
     }
 
@@ -234,8 +267,7 @@ export class OrganizationsService {
   }
 
   /** Venues linked to an organization — org-self or admin. */
-  async listVenues(organizationId: string, actor: RequestUser | undefined) {
-    this.assertOrgAccess(actor, organizationId);
+  async listVenues(organizationId: string) {
     return this.prisma.organization_venue_links.findMany({
       where: { organization_id: organizationId },
       include: {
@@ -245,15 +277,10 @@ export class OrganizationsService {
     });
   }
 
-  /** Organizations linked to a venue — venue-self (of that venue) or admin. Used by the
-   * venue-side "which organizations work here" view and the PR-network invite form. */
-  async listForVenue(venueId: string, actor: RequestUser | undefined) {
-    const role = String(actor?.role || '').toLowerCase();
-    if (role !== 'admin') {
-      if (role !== 'venue' || actor?.venue_id !== venueId) {
-        throw new ForbiddenException('Forbidden');
-      }
-    }
+  /** Organizations linked to a venue — venue ownership enforced by VenueOwnershipGuard at
+   * the controller level (see venues.controller.ts). Used by the venue-side "which
+   * organizations work here" view and the PR-network invite form. */
+  async listForVenue(venueId: string) {
     return this.prisma.organization_venue_links.findMany({
       where: { venue_id: venueId },
       include: {
@@ -267,8 +294,7 @@ export class OrganizationsService {
    * or admin. This is the org-side counterpart to VenuesService.listVenuePrNetworkMembers,
    * which is scoped to one venue; this one intentionally spans all of them (confirmed
    * business rule: the organization sees its own PRs across every venue it works). */
-  async listPrNetwork(organizationId: string, actor: RequestUser | undefined) {
-    this.assertOrgAccess(actor, organizationId);
+  async listPrNetwork(organizationId: string) {
     const memberships = await this.prisma.venue_pr_memberships.findMany({
       where: { organization_id: organizationId },
       include: {
@@ -294,13 +320,7 @@ export class OrganizationsService {
    * or scoped to one venue via `venueId`. Deliberately a first cut built from the tables
    * that already exist (qr scans, attributed door entries) rather than a new
    * analytics/snapshot pipeline - refine once real KPI requirements are defined. */
-  async getStats(
-    organizationId: string,
-    actor: RequestUser | undefined,
-    venueId?: string,
-  ) {
-    this.assertOrgAccess(actor, organizationId);
-
+  async getStats(organizationId: string, venueId?: string) {
     const membershipWhere = {
       organization_id: organizationId,
       ...(venueId ? { venue_id: venueId } : {}),
@@ -386,22 +406,12 @@ export class OrganizationsService {
     };
   }
 
-  /** Performance of the organizations working a given venue's events — venue-self (of that
-   * venue) or admin. Deliberately scoped to entries/scans that carry this venue_id, which is
-   * how the "locale sees org performance only within its own events" rule is enforced: there
-   * is no cross-venue leak by construction, not by an extra filter that could be forgotten. */
-  async getStatsForVenue(
-    venueId: string,
-    organizationId: string,
-    actor: RequestUser | undefined,
-  ) {
-    const role = String(actor?.role || '').toLowerCase();
-    if (role !== 'admin') {
-      if (role !== 'venue' || actor?.venue_id !== venueId) {
-        throw new ForbiddenException('Forbidden');
-      }
-    }
-
+  /** Performance of the organizations working a given venue's events — venue ownership
+   * enforced by VenueOwnershipGuard at the controller level. Deliberately scoped to
+   * entries/scans that carry this venue_id, which is how the "locale sees org performance
+   * only within its own events" rule is enforced: there is no cross-venue leak by
+   * construction, not by an extra filter that could be forgotten. */
+  async getStatsForVenue(venueId: string, organizationId: string) {
     const link = await this.prisma.organization_venue_links.findUnique({
       where: {
         organization_id_venue_id: {

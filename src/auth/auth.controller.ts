@@ -32,10 +32,14 @@ import { CurrentUser } from './current-user.decorator';
 import { CsrfOriginGuard } from './csrf-origin.guard';
 import type { RequestUser } from './types';
 import { assertCronSecret } from '../common/cron-auth.util';
+import { PushDispatchService } from '../common/push/push-dispatch.service';
 
 @Controller('auth')
 export class AuthController {
-  constructor(private authService: AuthService) {}
+  constructor(
+    private authService: AuthService,
+    private readonly pushDispatch: PushDispatchService,
+  ) {}
 
   private sessionMeta(req: Request) {
     return {
@@ -262,6 +266,22 @@ export class AuthController {
       user.id,
       String(body?.endpoint || '').trim(),
     );
+  }
+
+  // Self-service QA endpoint: sends a test push to the CALLING user only, on every channel
+  // they're currently reachable on (Expo token + every Web Push subscription) - see
+  // PushDispatchService.notifyUser. Deliberately cannot target anyone else, so it carries no
+  // spam/abuse risk beyond the caller's own devices; throttled anyway to keep it from being
+  // hammered.
+  @Post('push-test')
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  async sendTestPush(@CurrentUser() user: RequestUser) {
+    await this.pushDispatch.notifyUser(user.id, {
+      title: 'NightHub — notifica di prova',
+      body: 'Se la vedi, le notifiche push funzionano su questo dispositivo.',
+      data: { type: 'test' },
+    });
+    return { success: true };
   }
 
   @Post('activity')
