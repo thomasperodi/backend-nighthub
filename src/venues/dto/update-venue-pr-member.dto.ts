@@ -32,4 +32,9 @@ export class UpdateVenuePrMemberDto {
   @IsOptional()
   @IsString()
   ref_code?: string;
+
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsUUID()
+  organization_id?: string | null;
 }

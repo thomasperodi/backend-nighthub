@@ -17,6 +17,7 @@ import type { Response } from 'express';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { VenuesService } from './venues.service';
 import { EventsService } from '../events/events.service';
+import { OrganizationsService } from '../organizations/organizations.service';
 import { CreateVenueDto } from './dto/create-venue.dto';
 import { CreateVenueStationsBulkDto } from './dto/create-venue-stations-bulk.dto';
 import { UpdateVenueImageDto } from './dto/update-venue-image.dto';
@@ -46,6 +47,7 @@ export class VenuesController {
   constructor(
     private readonly venuesService: VenuesService,
     private readonly eventsService: EventsService,
+    private readonly organizationsService: OrganizationsService,
   ) {}
 
   @Get()
@@ -252,6 +254,31 @@ export class VenuesController {
     @CurrentUser() user?: RequestUser,
   ) {
     return this.venuesService.listVenuePrNetworkMembers(id, user);
+  }
+
+  // Organizations linked to this venue - feeds both the venue-side "which organizations
+  // work here" view and the org picker in the PR-network invite form (see
+  // CreateVenuePrMemberDto.organization_id).
+  @Get(':id/organizations')
+  @Roles('venue', 'admin')
+  listVenueOrganizations(
+    @Param('id') id: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.organizationsService.listForVenue(id, user);
+  }
+
+  // Performance of one linked organization's PRs, scoped to this venue's own events only -
+  // see OrganizationsService.getStatsForVenue's doc comment for why the scoping is
+  // structural (entries/scans carry venue_id) rather than an extra filter.
+  @Get(':id/organizations/:orgId/stats')
+  @Roles('venue', 'admin')
+  getVenueOrganizationStats(
+    @Param('id') id: string,
+    @Param('orgId') orgId: string,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.organizationsService.getStatsForVenue(id, orgId, user);
   }
 
   @Post(':id/pr-network')

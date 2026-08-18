@@ -2024,11 +2024,31 @@ export class AdminService {
       if (!venueExists) throw new NotFoundException('Venue not found');
     }
 
+    // Mirrors the venue_id handling above: an `organization` role account represents that
+    // organization's own login, the same way a `venue` role account represents a locale's.
+    const needsOrganization = role === UserRole.organization;
+    const organizationId = input.organization_id ?? null;
+    if (needsOrganization && !organizationId) {
+      throw new BadRequestException(
+        'organization_id required for organization role',
+      );
+    }
+
+    if (organizationId) {
+      const organizationExists = await this.prisma.organizations.findUnique({
+        where: { id: organizationId },
+        select: { id: true },
+      });
+      if (!organizationExists)
+        throw new NotFoundException('Organization not found');
+    }
+
     const updatedUser = await this.prisma.users.update({
       where: { id: userId },
       data: {
         role,
         venue_id: needsVenue ? venueId : null,
+        organization_id: needsOrganization ? organizationId : null,
       },
       select: {
         id: true,
@@ -2037,6 +2057,8 @@ export class AdminService {
         role: true,
         venue_id: true,
         venue: { select: { name: true } },
+        organization_id: true,
+        organization: { select: { name: true } },
       },
     });
 
@@ -2047,6 +2069,8 @@ export class AdminService {
       role: updatedUser.role,
       venueId: updatedUser.venue_id,
       venueName: updatedUser.venue?.name ?? null,
+      organizationId: updatedUser.organization_id,
+      organizationName: updatedUser.organization?.name ?? null,
     };
   }
 

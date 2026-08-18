@@ -33,6 +33,18 @@ Ownership/tenant checks are done **manually, per-endpoint**, not via a reusable 
 
 `@nestjs/swagger` is wired in `src/bootstrap.ts` and its CLI plugin is enabled in `nest-cli.json` (auto-infers schemas from DTO classes, no `@ApiProperty()` decorators needed anywhere). The spec is served at `GET /api/docs-json` (Swagger UI at `/api/docs`) in every environment, since the frontend's `npm run generate:api-types` script needs to fetch it. If you add a DTO with an inline anonymous object/array-of-object property, extract it into a named class (see `src/events/dto/event-nested.dto.ts` for the pattern) — the schema builder throws a "circular dependency" error on unnamed nested object types, which is exactly the bug this fix addressed in `CreateEventDto`/`UpdateEventDto`.
 
+## Organizations (added 2026-08-18)
+
+Implemented per confirmed business decisions (see the audit artifact / memory). New tables: `organizations` (name, vat_number, is_active, no owner-membership table — one owner account per org for now), `organization_venue_links` (N:N, admin-created only). New FK: `venue_pr_memberships.organization_id` (nullable, one org per PR membership). New `UserRole` value `organization`, mirroring `venue`'s pattern exactly: `users.organization_id` + `role: 'organization'` for an org's own login account. JWT payload/`RequestUser` now carries `organization_id` alongside `venue_id`.
+
+New module `src/organizations/` (`OrganizationsController`/`OrganizationsService`) — admin-only CRUD + venue-linking, org-self endpoints (`/organizations/me`, `/venues`, `/pr-network`, `/stats`). Authorization is centralized in one `assertOrgAccess`/`assertAdmin` pair inside the service (not copy-pasted per-endpoint) — this was a deliberate fix for the IDOR-risk pattern flagged elsewhere in this codebase, see §D.2 of the audit.
+
+`VenuesService`'s PR-network methods (`createVenuePrNetworkMember`/`updateVenuePrNetworkMember`/`listVenuePrNetworkMembers`) now accept/return `organization_id` — only the venue owner (not team managers) can tag a PR with an organization, and only if `organization_venue_links` actually has that pairing (`assertOrganizationLinkedToVenue`). New venue-side endpoints: `GET /venues/:id/organizations` (linked orgs) and `GET /venues/:id/organizations/:orgId/stats` (that org's performance, scoped to this venue's own events only — entries/scans carry `venue_id` directly, so the scoping is structural, not an extra filter someone could forget).
+
+Unlinking an org from a venue (`OrganizationsService.unlinkVenue`) soft-deactivates (`is_active: false`, never deletes) any PR memberships that org held at that venue — confirmed rule: a PR is scoped through the venue link, so losing the link loses that venue too, for now.
+
+**Not yet built**: any endpoint/UI to move monetization (`subscription_plans`) from venues to organizations (decision #12 flagged this needs more definition before touching `subscription_plans`). Also not built: a request-to-venue flow for cancelling an already-confirmed table reservation (client can no longer self-cancel it, but there's no venue-side request UI for that yet).
+
 ## Known gaps relevant to planned frontend work
 
 - No cancel-own-friend-request endpoint.

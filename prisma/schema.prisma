@@ -19,6 +19,7 @@ enum UserRole {
   staff
   venue
   admin
+  organization
 }
 
 enum VenuePrRole {
@@ -226,6 +227,12 @@ model users {
   venue_id String? @db.Uuid
   venue    venues? @relation(fields: [venue_id], references: [id])
 
+  // Mirrors venue_id/venue above, for `role: organization` accounts (an organization's own
+  // business account, as opposed to a `client` who happens to hold a venue_pr_memberships
+  // row - see venue_pr_memberships.organization_id for that side of the relationship).
+  organization_id String?        @db.Uuid
+  organization    organizations? @relation(fields: [organization_id], references: [id])
+
   // 🔥 QUESTI DUE DEVONO ESISTERE ENTRAMBI
   entries                  entries[]                        @relation("UserEntries")
   staff_entries            entries[]                        @relation("StaffEntries")
@@ -255,7 +262,10 @@ model users {
   filed_content_reports         content_reports[]            @relation("ContentReportReporter")
   content_reports_received      content_reports[]            @relation("ContentReportReported")
 
+  organization_venue_links_created organization_venue_links[] @relation("OrganizationVenueLinkCreator")
+
   @@index([venue_id])
+  @@index([organization_id])
   @@index([username])
   @@index([location_sharing_enabled, last_location_updated_at])
   @@index([last_active_at])
@@ -288,15 +298,15 @@ model refresh_tokens {
 // by its unique push service `endpoint`; deleted on logout (client-initiated) or automatically
 // when the push service reports it as gone (410/404 on send).
 model push_subscriptions {
-  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  user_id       String    @db.Uuid
-  user          users     @relation(fields: [user_id], references: [id], onDelete: Cascade)
-  endpoint      String    @unique
-  p256dh        String
-  auth_key      String
-  user_agent    String?
-  created_at    DateTime  @default(now())
-  last_seen_at  DateTime  @default(now())
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id      String   @db.Uuid
+  user         users    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  endpoint     String   @unique
+  p256dh       String
+  auth_key     String
+  user_agent   String?
+  created_at   DateTime @default(now())
+  last_seen_at DateTime @default(now())
 
   @@index([user_id])
 }
@@ -309,6 +319,46 @@ model used_password_reset_tokens {
   jti        String   @id
   used_at    DateTime @default(now())
   expires_at DateTime
+}
+
+// ===============================
+// ORGANIZATIONS
+// ===============================
+// An organization is an independent business entity that works events at one or more
+// venues, bringing its own PR team - it is NOT a subdivision of a venue. Venue↔organization
+// links are created by platform admins only (organization_venue_links), and a PR's
+// venue_pr_memberships row is tagged with the organization it works for (nullable, since
+// pre-existing PRs predate this and a PR can currently work for at most one organization -
+// see venue_pr_memberships.organization_id).
+model organizations {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name       String
+  vat_number String?
+  is_active  Boolean  @default(true)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  owners         users[]
+  venue_links    organization_venue_links[]
+  pr_memberships venue_pr_memberships[]
+}
+
+// Which venues an organization is allowed to work events at. Deliberately admin-only to
+// create/remove (not a bilateral request/accept flow like a friend request, and not
+// self-service by either side) - see created_by_admin_id.
+model organization_venue_links {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organization_id     String   @db.Uuid
+  venue_id            String   @db.Uuid
+  created_by_admin_id String?  @db.Uuid
+  created_at          DateTime @default(now())
+
+  organization     organizations @relation(fields: [organization_id], references: [id], onDelete: Cascade)
+  venue            venues        @relation(fields: [venue_id], references: [id], onDelete: Cascade)
+  created_by_admin users?        @relation("OrganizationVenueLinkCreator", fields: [created_by_admin_id], references: [id], onDelete: SetNull)
+
+  @@unique([organization_id, venue_id])
+  @@index([venue_id])
 }
 
 // ===============================
@@ -357,6 +407,7 @@ model venues {
   floor_plan               venue_floor_plans?
   group_table_proposals    group_table_proposals[]
   plan                     subscription_plans?              @relation(fields: [plan_id], references: [id], onDelete: SetNull)
+  organization_links       organization_venue_links[]
 
   @@index([plan_id])
 }
@@ -397,6 +448,16 @@ model venue_pr_memberships {
   created_at           DateTime    @default(now())
   updated_at           DateTime    @updatedAt
 
+  // Which organization this PR currently works for at this venue - nullable because
+  // existing memberships predate organizations and need a backfill decision (see the
+  // Organizations audit doc), and because a PR is not required to belong to one. A PR works
+  // for at most one organization at a time (confirmed business rule): this is a plain FK,
+  // not a join table. Scoped through the venue like the rest of this model - if the
+  // organization stops working this venue, this membership's organization_id should be
+  // cleared/deactivated along with it, not kept dangling.
+  organization_id String?        @db.Uuid
+  organization    organizations? @relation(fields: [organization_id], references: [id], onDelete: SetNull)
+
   venue             venues                           @relation(fields: [venue_id], references: [id], onDelete: Cascade)
   user              users                            @relation("VenuePrMembershipUser", fields: [user_id], references: [id], onDelete: Cascade)
   parent_membership venue_pr_memberships?            @relation("VenuePrMembershipHierarchy", fields: [parent_membership_id], references: [id], onDelete: SetNull)
@@ -412,6 +473,7 @@ model venue_pr_memberships {
   @@unique([venue_id, ref_code])
   @@index([venue_id, role, is_active])
   @@index([parent_membership_id])
+  @@index([organization_id, is_active])
 }
 
 model venue_pr_event_assignments {
@@ -452,15 +514,15 @@ model venue_pr_qr_scans {
   event         events               @relation(fields: [event_id], references: [id], onDelete: Cascade)
   pr_membership venue_pr_memberships @relation(fields: [pr_membership_id], references: [id], onDelete: Cascade)
 
-  @@index([venue_id, event_id, scanned_at])
-  @@index([pr_membership_id, scanned_at])
-  @@index([entry_id])
-  @@index([guest_user_id, scanned_at])
   // Anti-spam: the same PR can't register more than one scan for the same guest at the
   // same event - without this, a compromised/careless actor could inflate a PR's scan
   // stats by replaying the same guest repeatedly. Partial (guest_user_id can be null for
   // scans not tied to a specific guest, which aren't subject to this dedup).
   @@unique([event_id, pr_membership_id, guest_user_id], map: "uniq_pr_qr_scan_per_guest")
+  @@index([venue_id, event_id, scanned_at])
+  @@index([pr_membership_id, scanned_at])
+  @@index([entry_id])
+  @@index([guest_user_id, scanned_at])
 }
 
 model venue_pr_membership_passes {
@@ -733,8 +795,8 @@ model venue_stays {
 // EVENTS
 // ===============================
 model events {
-  id               String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  venue_id         String          @db.Uuid
+  id               String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id         String               @db.Uuid
   name             String
   description      String?
   image            String?
@@ -747,17 +809,17 @@ model events {
   // admin explicitly turned off (see EventsService.evaluateAutoFeaturedEvents).
   is_featured      Boolean              @default(false)
   featured_source  EventFeaturedSource?
-  date             DateTime        @db.Date
-  start_time       DateTime?       @db.Time(6)
-  end_time         DateTime?       @db.Time(6)
-  status           EventStatus     @default(DRAFT)
-  access_mode      EventAccessMode @default(LIST)
+  date             DateTime             @db.Date
+  start_time       DateTime?            @db.Time(6)
+  end_time         DateTime?            @db.Time(6)
+  status           EventStatus          @default(DRAFT)
+  access_mode      EventAccessMode      @default(LIST)
   presale_price    Decimal?
-  presale_currency String          @default("eur")
+  presale_currency String               @default("eur")
   presale_capacity Int?
-  presale_sold     Int             @default(0)
-  created_at       DateTime        @default(now())
-  updated_at       DateTime        @updatedAt
+  presale_sold     Int                  @default(0)
+  created_at       DateTime             @default(now())
+  updated_at       DateTime             @updatedAt
 
   venue venues @relation(fields: [venue_id], references: [id])
 

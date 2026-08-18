@@ -26,6 +26,7 @@ export type PublicUser = {
   avatar?: string | null;
   role: string;
   venue_id?: string | null;
+  organization_id?: string | null;
   pr_venue_id?: string | null;
   /** True while the user has at least one active venue_pr_memberships row - always
    * server-derived, never client-settable, so it doubles as an anti-impersonation "verified
@@ -489,15 +490,16 @@ export class AuthService {
   }
 
   private signAccessToken(
-    user: Pick<users, 'id' | 'role' | 'venue_id'>,
+    user: Pick<users, 'id' | 'role' | 'venue_id' | 'organization_id'>,
   ): string {
-    // Payload stays minimal on purpose (sub, role, venue_id only) - no email, no password,
-    // nothing that would be sensitive if the token were ever intercepted. Expiry comes from
-    // JwtModule's default signOptions (ACCESS_TOKEN_TTL_SECONDS, see jwt.config.ts).
+    // Payload stays minimal on purpose (sub, role, venue_id, organization_id) - no email, no
+    // password, nothing that would be sensitive if the token were ever intercepted. Expiry
+    // comes from JwtModule's default signOptions (ACCESS_TOKEN_TTL_SECONDS, see jwt.config.ts).
     const payload: AccessTokenPayload = {
       sub: user.id,
       role: user.role,
       venue_id: user.venue_id,
+      organization_id: user.organization_id,
     };
     return this.jwtService.sign(payload);
   }
@@ -525,7 +527,12 @@ export class AuthService {
     const role = String(p.role || '').toLowerCase();
     if (!id || !role) throw new UnauthorizedException('Invalid token payload');
 
-    return { id, role, venue_id: p.venue_id ?? null };
+    return {
+      id,
+      role,
+      venue_id: p.venue_id ?? null,
+      organization_id: p.organization_id ?? null,
+    };
   }
 
   private hashRefreshToken(rawToken: string): string {
@@ -566,6 +573,7 @@ export class AuthService {
       avatar: user.avatar,
       role: prContext.role,
       venue_id: user.venue_id,
+      organization_id: user.organization_id,
       pr_venue_id: prContext.pr_venue_id,
       is_verified_pr: Boolean(prContext.pr_venue_id),
       onboarding_completed: Boolean(user.onboarding_completed_at),
@@ -724,6 +732,17 @@ export class AuthService {
       if (venue?.contract_status === 'suspended') {
         throw new ForbiddenException(
           'Il locale associato a questo account è sospeso. Contatta il supporto.',
+        );
+      }
+    }
+    if (user.role === 'organization' && user.organization_id) {
+      const organization = await this.prisma.organizations.findUnique({
+        where: { id: user.organization_id },
+        select: { is_active: true },
+      });
+      if (organization && !organization.is_active) {
+        throw new ForbiddenException(
+          "L'organizzazione associata a questo account è sospesa. Contatta il supporto.",
         );
       }
     }

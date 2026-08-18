@@ -98,6 +98,7 @@ type PrMembershipRow = {
   created_by_user_id: string | null;
   created_at: Date;
   updated_at: Date;
+  organization_id: string | null;
 };
 
 type PrMemberListRow = PrMembershipRow & {
@@ -105,6 +106,7 @@ type PrMemberListRow = PrMembershipRow & {
   user_username: string | null;
   user_email: string;
   user_role: string;
+  organization_name: string | null;
 };
 
 type PrEventAssignmentRow = {
@@ -939,6 +941,10 @@ export class VenuesService {
         role: String(row.user_role || '').toLowerCase(),
       },
       display_name: row.user_name || row.user_username || row.user_email,
+      organization_id: row.organization_id,
+      organization: row.organization_id
+        ? { id: row.organization_id, name: row.organization_name }
+        : null,
     };
   }
 
@@ -1176,12 +1182,15 @@ export class VenuesService {
         m.created_by_user_id,
         m.created_at,
         m.updated_at,
+        m.organization_id,
         u.name AS user_name,
         u.username AS user_username,
         u.email AS user_email,
-        u.role::text AS user_role
+        u.role::text AS user_role,
+        o.name AS organization_name
       FROM venue_pr_memberships m
       JOIN users u ON u.id = m.user_id
+      LEFT JOIN organizations o ON o.id = m.organization_id
       WHERE m.venue_id = ${venueId}::uuid
       ORDER BY
         CASE m.role
@@ -1209,12 +1218,15 @@ export class VenuesService {
         m.created_by_user_id,
         m.created_at,
         m.updated_at,
+        m.organization_id,
         u.name AS user_name,
         u.username AS user_username,
         u.email AS user_email,
-        u.role::text AS user_role
+        u.role::text AS user_role,
+        o.name AS organization_name
       FROM venue_pr_memberships m
       JOIN users u ON u.id = m.user_id
+      LEFT JOIN organizations o ON o.id = m.organization_id
       WHERE m.venue_id = ${venueId}::uuid
         AND m.id = ${memberId}::uuid
       LIMIT 1
@@ -1237,7 +1249,8 @@ export class VenuesService {
         is_active,
         created_by_user_id,
         created_at,
-        updated_at
+        updated_at,
+        organization_id
       FROM venue_pr_memberships
       WHERE venue_id = ${venueId}::uuid
         AND user_id = ${userId}::uuid
@@ -1261,13 +1274,46 @@ export class VenuesService {
         is_active,
         created_by_user_id,
         created_at,
-        updated_at
+        updated_at,
+        organization_id
       FROM venue_pr_memberships
       WHERE venue_id = ${venueId}::uuid
         AND id = ${memberId}::uuid
       LIMIT 1
     `);
     return rows[0] ?? null;
+  }
+
+  // Validates that an organization is actually allowed to work the given venue (linked via
+  // organization_venue_links, admin-managed) before it can be stamped onto a PR membership -
+  // otherwise any venue owner could tag a PR as working for an arbitrary organization it has
+  // no relationship with.
+  private async assertOrganizationLinkedToVenue(
+    organizationId: string,
+    venueId: string,
+  ): Promise<void> {
+    const org = await this.prisma.organizations.findUnique({
+      where: { id: organizationId },
+      select: { id: true, is_active: true },
+    });
+    if (!org || !org.is_active) {
+      throw new BadRequestException('Organization not found or inactive');
+    }
+
+    const link = await this.prisma.organization_venue_links.findUnique({
+      where: {
+        organization_id_venue_id: {
+          organization_id: organizationId,
+          venue_id: venueId,
+        },
+      },
+      select: { id: true },
+    });
+    if (!link) {
+      throw new BadRequestException(
+        'This organization is not linked to this venue',
+      );
+    }
   }
 
   private async loadPrMembershipByRefCode(
@@ -3025,6 +3071,7 @@ export class VenuesService {
       role: string;
       parent_membership_id?: string | null;
       ref_code?: string | null;
+      organization_id?: string | null;
     },
     user?: RequestUser,
   ) {
@@ -3087,6 +3134,24 @@ export class VenuesService {
 
     this.validatePrHierarchy(targetRole, parent);
 
+    // Only the venue owner (admin, or the venue's own account) can tag a PR as working for
+    // an organization - team managers are already restricted to a narrower set of fields
+    // above, and letting them freely assign an org here would let them claim a PR works for
+    // an organization they have no relationship with.
+    let resolvedOrganizationId: string | null = null;
+    if (payload.organization_id) {
+      if (!actorContext.owner) {
+        throw new ForbiddenException(
+          'Solo il locale può assegnare un PR a un’organizzazione',
+        );
+      }
+      await this.assertOrganizationLinkedToVenue(
+        payload.organization_id,
+        venueId,
+      );
+      resolvedOrganizationId = payload.organization_id;
+    }
+
     const refSeed =
       payload.ref_code?.trim() ||
       targetUser.username ||
@@ -3105,6 +3170,7 @@ export class VenuesService {
         ref_code,
         is_active,
         created_by_user_id,
+        organization_id,
         updated_at
       )
       VALUES (
@@ -3115,6 +3181,7 @@ export class VenuesService {
         ${refCode},
         true,
         ${user?.id ?? null}::uuid,
+        ${resolvedOrganizationId}::uuid,
         NOW()
       )
       RETURNING id
@@ -3139,6 +3206,7 @@ export class VenuesService {
       parent_membership_id?: string | null;
       is_active?: boolean;
       ref_code?: string;
+      organization_id?: string | null;
     },
     user?: RequestUser,
   ) {
@@ -3179,6 +3247,7 @@ export class VenuesService {
     let nextParentId = existing.parent_membership_id;
     let nextIsActive = Boolean(existing.is_active);
     let nextRefCode = existing.ref_code;
+    let nextOrganizationId = existing.organization_id;
 
     if (actorContext.owner) {
       if (payload.role !== undefined) {
@@ -3195,6 +3264,16 @@ export class VenuesService {
           payload.ref_code || existing.ref_code,
           existing.id,
         );
+      }
+
+      if (payload.organization_id !== undefined) {
+        if (payload.organization_id) {
+          await this.assertOrganizationLinkedToVenue(
+            payload.organization_id,
+            venueId,
+          );
+        }
+        nextOrganizationId = payload.organization_id ?? null;
       }
     }
 
@@ -3248,6 +3327,10 @@ export class VenuesService {
 
     if (nextIsActive !== Boolean(existing.is_active)) {
       updates.push(Prisma.sql`is_active = ${nextIsActive}`);
+    }
+
+    if ((nextOrganizationId ?? null) !== (existing.organization_id ?? null)) {
+      updates.push(Prisma.sql`organization_id = ${nextOrganizationId}::uuid`);
     }
 
     if (!updates.length) {
