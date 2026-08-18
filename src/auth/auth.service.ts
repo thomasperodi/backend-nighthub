@@ -41,7 +41,7 @@ export type LoginResult = {
   user: PublicUser;
   refreshToken: string;
   refreshTokenExpiresAt: Date;
-} | null;
+};
 
 export type RefreshResult = {
   accessToken: string;
@@ -637,15 +637,17 @@ export class AuthService {
           : '';
     const identifier = this.normalizeIdentifier(rawIdentifier);
     if (!identifier || typeof input.password !== 'string' || !input.password) {
-      return null;
+      throw new UnauthorizedException('Credenziali non valide');
     }
 
+    // Deliberately the same error/status for "no such user" and "wrong password" (below) -
+    // distinguishing them would let a caller enumerate which identifiers are registered.
     const user: users | null = await this.findUserByIdentifier(identifier);
-    if (!user) return null;
+    if (!user) throw new UnauthorizedException('Credenziali non valide');
 
     const bcryptCompare = compare as (a: string, b: string) => Promise<boolean>;
     const valid = await bcryptCompare(input.password, user.password_hash);
-    if (!valid) return null;
+    if (!valid) throw new UnauthorizedException('Credenziali non valide');
 
     // Deliberately thrown (not `return null`) so a suspended account gets a distinct,
     // explicit error instead of blending into the generic "invalid credentials" response.

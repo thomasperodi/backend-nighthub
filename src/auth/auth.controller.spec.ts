@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { UnauthorizedException } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { AuthController } from './auth.controller';
 import { AuthService, REFRESH_COOKIE_NAME } from './auth.service';
@@ -111,17 +112,13 @@ describe('AuthController', () => {
     expect(JSON.stringify(body)).not.toContain('refresh-token-value');
   });
 
-  it('login: returns null and sets no cookie on invalid credentials', async () => {
-    authService.login.mockResolvedValue(null);
+  it('login: propagates the 401 and sets no cookie on invalid credentials', async () => {
+    authService.login.mockRejectedValue(new UnauthorizedException('Credenziali non valide'));
     const { res, cookie } = makeRes();
 
-    const body = await controller.login(
-      { identifier: 'a', password: 'wrong' } as any,
-      makeReq(),
-      res,
-    );
-
-    expect(body).toBeNull();
+    await expect(
+      controller.login({ identifier: 'a', password: 'wrong' } as any, makeReq(), res),
+    ).rejects.toThrow(UnauthorizedException);
     expect(cookie).not.toHaveBeenCalled();
   });
 

@@ -108,7 +108,6 @@ export class AuthController {
     @Res({ passthrough: true }) res: Response,
   ) {
     const result = await this.authService.register(dto, this.sessionMeta(req));
-    if (!result) return null;
 
     this.setRefreshCookie(res, result.refreshToken);
     return { access_token: result.accessToken, user: result.user };
@@ -123,7 +122,6 @@ export class AuthController {
     @Res({ passthrough: true }) res: Response,
   ) {
     const result = await this.authService.login(dto, this.sessionMeta(req));
-    if (!result) return null;
 
     this.setRefreshCookie(res, result.refreshToken);
     return { access_token: result.accessToken, user: result.user };

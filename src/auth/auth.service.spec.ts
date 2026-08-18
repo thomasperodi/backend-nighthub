@@ -104,31 +104,31 @@ describe('AuthService', () => {
       );
     });
 
-    it('returns null on wrong password', async () => {
+    it('throws Unauthorized on wrong password', async () => {
       const passwordHash = await bcryptHash('correct-password', 10);
       prisma.users.findFirst.mockResolvedValue({
         ...baseUser,
         password_hash: passwordHash,
       });
 
-      const result = await service.login({
-        identifier: 'user1',
-        password: 'wrong-password',
-      } as any);
-
-      expect(result).toBeNull();
+      await expect(
+        service.login({
+          identifier: 'user1',
+          password: 'wrong-password',
+        } as any),
+      ).rejects.toThrow(UnauthorizedException);
       expect(prisma.refresh_tokens.create).not.toHaveBeenCalled();
     });
 
-    it('returns null when the user does not exist', async () => {
+    it('throws Unauthorized when the user does not exist', async () => {
       prisma.users.findFirst.mockResolvedValue(null);
 
-      const result = await service.login({
-        identifier: 'ghost',
-        password: 'whatever',
-      } as any);
-
-      expect(result).toBeNull();
+      await expect(
+        service.login({
+          identifier: 'ghost',
+          password: 'whatever',
+        } as any),
+      ).rejects.toThrow(UnauthorizedException);
     });
   });
 
