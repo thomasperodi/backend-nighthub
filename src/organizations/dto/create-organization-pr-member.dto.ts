@@ -1,5 +1,4 @@
 import {
-  IsBoolean,
   IsIn,
   IsOptional,
   IsString,
@@ -7,11 +6,18 @@ import {
   ValidateIf,
 } from 'class-validator';
 
-export class UpdateVenuePrMemberDto {
-  @IsOptional()
+export class CreateOrganizationPrMemberDto {
+  // Which of the organization's linked venues this PR will work at - required, since
+  // (unlike a venue account) an organization can be linked to several.
+  @IsUUID()
+  venue_id: string;
+
+  @IsUUID()
+  user_id: string;
+
   @IsString()
   @IsIn(['RESPONSABILE', 'PR', 'responsabile', 'pr'])
-  role?: string;
+  role: string;
 
   @IsOptional()
   @ValidateIf((_, value) => value !== null)
@@ -19,15 +25,6 @@ export class UpdateVenuePrMemberDto {
   parent_membership_id?: string | null;
 
   @IsOptional()
-  @IsBoolean()
-  is_active?: boolean;
-
-  @IsOptional()
   @IsString()
   ref_code?: string;
-
-  @IsOptional()
-  @ValidateIf((_, value) => value !== null)
-  @IsUUID()
-  organization_id?: string | null;
 }

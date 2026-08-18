@@ -1,20 +1,27 @@
 import {
   BadRequestException,
   ForbiddenException,
+  forwardRef,
+  Inject,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogService } from '../common/audit/audit-log.service';
+import { VenuesService } from '../venues/venues.service';
 import type { RequestUser } from '../auth/types';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
+import { CreateOrganizationPrMemberDto } from './dto/create-organization-pr-member.dto';
+import { UpdateOrganizationPrMemberDto } from './dto/update-organization-pr-member.dto';
 
 @Injectable()
 export class OrganizationsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditLog: AuditLogService,
+    @Inject(forwardRef(() => VenuesService))
+    private readonly venuesService: VenuesService,
   ) {}
 
   // Organization-id ownership for getById/listVenues/listPrNetwork/getStats is enforced by
@@ -307,6 +314,7 @@ export class OrganizationsService {
     return memberships.map((m) => ({
       id: m.id,
       role: m.role,
+      parent_membership_id: m.parent_membership_id,
       is_active: m.is_active,
       ref_code: m.ref_code,
       venue: m.venue,
@@ -457,5 +465,61 @@ export class OrganizationsService {
       total_scans: totalScans,
       total_attributed_entries: totalEntries,
     };
+  }
+
+  // PR-network mutations - organization ownership already enforced by
+  // OrganizationOwnershipGuard at the controller level. Delegates to VenuesService's
+  // organization-scoped siblings (create/update/deleteOrganizationPrMember), which reuse the
+  // same hierarchy/ref-code logic as the venue-side PR network without letting an
+  // organization touch a venue's own PRs or another organization's - see the doc comment on
+  // those methods in venues.service.ts.
+  async createPrMember(
+    organizationId: string,
+    dto: CreateOrganizationPrMemberDto,
+  ) {
+    return this.venuesService.createOrganizationPrMember(
+      dto.venue_id,
+      organizationId,
+      {
+        user_id: dto.user_id,
+        role: dto.role,
+        parent_membership_id: dto.parent_membership_id,
+        ref_code: dto.ref_code,
+      },
+    );
+  }
+
+  async updatePrMember(
+    organizationId: string,
+    memberId: string,
+    dto: UpdateOrganizationPrMemberDto,
+  ) {
+    return this.venuesService.updateOrganizationPrMember(
+      organizationId,
+      memberId,
+      dto,
+    );
+  }
+
+  async deletePrMember(organizationId: string, memberId: string) {
+    return this.venuesService.deleteOrganizationPrMember(
+      organizationId,
+      memberId,
+    );
+  }
+
+  /** Every event this organization has created, across all its linked venues - both
+   * exclusive management is confirmed to have no exclusivity: the venue can also manage it
+   * (see EventsService.assertEventBelongsToOrganization's doc comment), this is just the
+   * organization's own view of what it created. */
+  async listEvents(organizationId: string) {
+    return this.prisma.events.findMany({
+      where: { organization_id: organizationId },
+      include: {
+        venue: { select: { id: true, name: true, city: true } },
+        entry_prices: true,
+      },
+      orderBy: { date: 'desc' },
+    });
   }
 }

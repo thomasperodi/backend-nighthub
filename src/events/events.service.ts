@@ -1486,7 +1486,9 @@ export class EventsService {
       select: { user_id: true },
       distinct: ['user_id'],
     });
-    const goingIds = reservations.map((r) => r.user_id);
+    const goingIds = reservations
+      .map((r) => r.user_id)
+      .filter((id): id is string => id !== null);
     if (goingIds.length === 0) return [];
 
     return this.prisma.users.findMany({
@@ -1502,6 +1504,46 @@ export class EventsService {
     });
     if (!e) throw new NotFoundException('Event not found');
     if (e.venue_id !== venueId) throw new ForbiddenException('Forbidden');
+  }
+
+  // Only the organization that CREATED the event may manage it as an organization actor -
+  // confirmed decision: not every organization linked to the venue, just the creator (the
+  // venue itself can always manage it too, via assertEventBelongsToVenue - no exclusivity
+  // between the two, no lock).
+  async assertEventBelongsToOrganization(
+    eventId: string,
+    organizationId: string,
+  ) {
+    const e = await this.prisma.events.findUnique({
+      where: { id: eventId },
+      select: { id: true, organization_id: true },
+    });
+    if (!e) throw new NotFoundException('Event not found');
+    if (e.organization_id !== organizationId) {
+      throw new ForbiddenException('Forbidden');
+    }
+  }
+
+  // An organization may only create/manage events at a venue it's actually linked to
+  // (organization_venue_links, admin-created only - see OrganizationsService).
+  async assertOrganizationLinkedToVenue(
+    organizationId: string,
+    venueId: string,
+  ) {
+    const link = await this.prisma.organization_venue_links.findUnique({
+      where: {
+        organization_id_venue_id: {
+          organization_id: organizationId,
+          venue_id: venueId,
+        },
+      },
+      select: { id: true },
+    });
+    if (!link) {
+      throw new BadRequestException(
+        'This organization is not linked to this venue',
+      );
+    }
   }
 
   async getEventStats(eventId: string): Promise<EventStats> {
@@ -1583,6 +1625,7 @@ export class EventsService {
     const event = await this.prisma.events.create({
       data: {
         venue_id: dto.venue_id,
+        organization_id: dto.organization_id,
         name: dto.name,
         description: dto.description,
         image: imagePath,
@@ -1804,7 +1847,9 @@ export class EventsService {
     const notifiedUserIds = new Set<string>();
     await Promise.all(
       affectedReservations
-        .filter((r) => {
+        .filter((r): r is typeof r & { user_id: string } => {
+          // Guest (unauthenticated) reservations have no account to push to.
+          if (!r.user_id) return false;
           if (notifiedUserIds.has(r.user_id)) return false;
           notifiedUserIds.add(r.user_id);
           return true;
@@ -1818,7 +1863,10 @@ export class EventsService {
         ),
     );
 
-    return { success: true, cancelled_reservations: affectedReservations.length };
+    return {
+      success: true,
+      cancelled_reservations: affectedReservations.length,
+    };
   }
 
   async deleteEvent(id: string) {
@@ -1981,9 +2029,7 @@ export class EventsService {
     });
     if (!eligibleEvents.length) return { success: true, updated: 0 };
 
-    const venueIds = Array.from(
-      new Set(eligibleEvents.map((e) => e.venue_id)),
-    );
+    const venueIds = Array.from(new Set(eligibleEvents.map((e) => e.venue_id)));
     const eligibleEventIds = eligibleEvents.map((e) => e.id);
 
     const [dailyAverageRows, recentCountRows] = await Promise.all([

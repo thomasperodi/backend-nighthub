@@ -84,8 +84,10 @@ type VenueFloorPlanPayload = venue_floor_plans & {
   tables: venue_tables[];
 };
 
-type PrNetworkRoleDb = 'responsabile' | 'capo_squadra' | 'pr';
-type PrNetworkRoleApi = 'RESPONSABILE' | 'CAPO_SQUADRA' | 'PR';
+// 2-tier hierarchy (confirmed 2026-08-18, was 3-tier with capo_squadra - see the migration
+// that dropped it from the DB enum).
+type PrNetworkRoleDb = 'responsabile' | 'pr';
+type PrNetworkRoleApi = 'RESPONSABILE' | 'PR';
 
 type PrMembershipRow = {
   id: string;
@@ -845,7 +847,6 @@ export class VenuesService {
 
   private toPrRoleApi(role: PrNetworkRoleDb): PrNetworkRoleApi {
     if (role === 'responsabile') return 'RESPONSABILE';
-    if (role === 'capo_squadra') return 'CAPO_SQUADRA';
     return 'PR';
   }
 
@@ -854,13 +855,12 @@ export class VenuesService {
       .trim()
       .toLowerCase();
     if (normalized === 'responsabile') return 'responsabile';
-    if (normalized === 'capo_squadra') return 'capo_squadra';
     if (normalized === 'pr') return 'pr';
     throw new BadRequestException('Unsupported PR role');
   }
 
   private canManagePrTeam(role: PrNetworkRoleDb): boolean {
-    return role === 'responsabile' || role === 'capo_squadra';
+    return role === 'responsabile';
   }
 
   private canManagerCreatePrRole(
@@ -868,9 +868,6 @@ export class VenuesService {
     targetRole: PrNetworkRoleDb,
   ): boolean {
     if (managerRole === 'responsabile') {
-      return targetRole === 'capo_squadra' || targetRole === 'pr';
-    }
-    if (managerRole === 'capo_squadra') {
       return targetRole === 'pr';
     }
     return false;
@@ -1214,8 +1211,7 @@ export class VenuesService {
       ORDER BY
         CASE m.role
           WHEN 'responsabile' THEN 0
-          WHEN 'capo_squadra' THEN 1
-          ELSE 2
+          ELSE 1
         END,
         COALESCE(u.name, u.username, u.email) ASC
     `);
@@ -1306,8 +1302,9 @@ export class VenuesService {
   // Validates that an organization is actually allowed to work the given venue (linked via
   // organization_venue_links, admin-managed) before it can be stamped onto a PR membership -
   // otherwise any venue owner could tag a PR as working for an arbitrary organization it has
-  // no relationship with.
-  private async assertOrganizationLinkedToVenue(
+  // no relationship with. Not private: VenuesController also calls this directly to scope an
+  // `organization`-role caller to its own linked venues (e.g. the PR-invite lookup endpoint).
+  async assertOrganizationLinkedToVenue(
     organizationId: string,
     venueId: string,
   ): Promise<void> {
@@ -1405,15 +1402,11 @@ export class VenuesService {
       throw new BadRequestException('Questo ruolo richiede un superiore');
     }
 
-    if (role === 'capo_squadra' && parent.role !== 'responsabile') {
+    // Only 'pr' reaches here (role === 'responsabile' already returned above) - with the
+    // 2-tier hierarchy, its parent must always be a responsabile.
+    if (parent.role !== 'responsabile') {
       throw new BadRequestException(
-        'CAPO_SQUADRA deve avere un RESPONSABILE sopra di lui',
-      );
-    }
-
-    if (role === 'pr' && parent.role === 'pr') {
-      throw new BadRequestException(
-        'PR deve essere assegnato sotto un RESPONSABILE o CAPO_SQUADRA',
+        'PR deve essere assegnato sotto un RESPONSABILE',
       );
     }
   }
@@ -3145,7 +3138,16 @@ export class VenuesService {
           })()
         : rows;
 
-    return visibleRows.map((row) => this.mapPrMember(row));
+    // Confirmed decision: PR members invited by an organization are exclusive to that
+    // organization - the venue itself doesn't see or manage them in its own team list
+    // (only in aggregate, via GET /venues/:id/organizations/:orgId/stats). Admin is exempt
+    // (platform-wide oversight, matches the confirmed permission matrix).
+    const scopedRows =
+      this.normalizeAppRole(user?.role) === 'venue'
+        ? visibleRows.filter((row) => !row.organization_id)
+        : visibleRows;
+
+    return scopedRows.map((row) => this.mapPrMember(row));
   }
 
   // Supports the venue-side "invite" form: CreateVenuePrMemberDto only accepts a raw
@@ -3250,22 +3252,14 @@ export class VenuesService {
 
     this.validatePrHierarchy(targetRole, parent);
 
-    // Only the venue owner (admin, or the venue's own account) can tag a PR as working for
-    // an organization - team managers are already restricted to a narrower set of fields
-    // above, and letting them freely assign an org here would let them claim a PR works for
-    // an organization they have no relationship with.
-    let resolvedOrganizationId: string | null = null;
+    // The venue can no longer tag a PR it invites with an organization - that capability
+    // moved entirely to organization self-service (createOrganizationPrMember above).
+    // Confirmed decision: a PR working for an organization is invited BY that organization,
+    // not assigned to one after the fact by the venue.
     if (payload.organization_id) {
-      if (!actorContext.owner) {
-        throw new ForbiddenException(
-          'Solo il locale può assegnare un PR a un’organizzazione',
-        );
-      }
-      await this.assertOrganizationLinkedToVenue(
-        payload.organization_id,
-        venueId,
+      throw new BadRequestException(
+        "Un'organizzazione invita i propri PR direttamente, il locale non può più assegnarli",
       );
-      resolvedOrganizationId = payload.organization_id;
     }
 
     const refSeed =
@@ -3297,7 +3291,7 @@ export class VenuesService {
         ${refCode},
         true,
         ${user?.id ?? null}::uuid,
-        ${resolvedOrganizationId}::uuid,
+        NULL::uuid,
         NOW()
       )
       RETURNING id
@@ -3330,6 +3324,17 @@ export class VenuesService {
 
     const existing = await this.loadPrMembershipById(venueId, memberId);
     if (!existing) throw new NotFoundException('PR membership not found');
+
+    // Org-owned memberships are exclusive to the organization that invited them - the venue
+    // (any role within it, owner or team manager) can't see or manage them, matching
+    // listVenuePrNetworkMembers's filtering. Use PATCH/DELETE /organizations/:id/pr-network
+    // instead. Admin is exempt.
+    if (
+      existing.organization_id &&
+      this.normalizeAppRole(user?.role) !== 'admin'
+    ) {
+      throw new NotFoundException('PR membership not found');
+    }
 
     const actorContext = await this.resolvePrActorContext(venueId, user, true);
 
@@ -3382,7 +3387,12 @@ export class VenuesService {
         );
       }
 
-      if (payload.organization_id !== undefined) {
+      // Only admin can still touch organization_id here (platform override) - a venue
+      // account can no longer assign a PR to an organization, see createVenuePrNetworkMember.
+      if (
+        payload.organization_id !== undefined &&
+        this.normalizeAppRole(user?.role) === 'admin'
+      ) {
         if (payload.organization_id) {
           await this.assertOrganizationLinkedToVenue(
             payload.organization_id,
@@ -3480,6 +3490,13 @@ export class VenuesService {
     const existing = await this.loadPrMembershipById(venueId, memberId);
     if (!existing) throw new NotFoundException('PR membership not found');
 
+    if (
+      existing.organization_id &&
+      this.normalizeAppRole(user?.role) !== 'admin'
+    ) {
+      throw new NotFoundException('PR membership not found');
+    }
+
     const actorContext = await this.resolvePrActorContext(venueId, user, true);
     if (!actorContext.owner) {
       const actorMembership = actorContext.membership;
@@ -3515,6 +3532,263 @@ export class VenuesService {
       DELETE FROM venue_pr_memberships
       WHERE venue_id = ${venueId}::uuid
         AND id = ${memberId}::uuid
+    `);
+
+    return { deleted: true, id: memberId };
+  }
+
+  // The organization-scoped siblings of create/update/deleteVenuePrNetworkMember above -
+  // deliberately separate rather than folded into resolvePrActorContext's owner/manager
+  // branching, since an organization actor is NOT a venue owner: it may only ever touch PR
+  // memberships it created itself at a venue it's linked to, never the venue's own PRs or
+  // another organization's. Confirmed decision: the venue no longer sees or manages these
+  // memberships at all (see listVenuePrNetworkMembers's organization_id filter below).
+
+  async createOrganizationPrMember(
+    venueId: string,
+    organizationId: string,
+    payload: {
+      user_id: string;
+      role: string;
+      parent_membership_id?: string | null;
+      ref_code?: string | null;
+    },
+  ) {
+    await this.getVenue(venueId);
+    await this.assertOrganizationLinkedToVenue(organizationId, venueId);
+
+    if (!payload?.user_id) {
+      throw new BadRequestException('user_id is required');
+    }
+
+    const targetRole = this.toPrRoleDb(payload.role);
+
+    const targetUser = await this.prisma.users.findUnique({
+      where: { id: payload.user_id },
+      select: { id: true, email: true, username: true, name: true },
+    });
+    if (!targetUser) throw new NotFoundException('User not found');
+
+    const existingMembership = await this.loadPrMembershipByUser(
+      venueId,
+      payload.user_id,
+    );
+    if (existingMembership) {
+      throw new BadRequestException(
+        'User already assigned to this venue PR network',
+      );
+    }
+
+    const resolvedParentId = payload.parent_membership_id ?? null;
+    const parent = resolvedParentId
+      ? await this.loadPrMembershipById(venueId, resolvedParentId)
+      : null;
+    if (resolvedParentId && !parent) {
+      throw new BadRequestException('Parent membership not found');
+    }
+    // A PR hierarchy stays within one organization - can't chain to a venue-owned or
+    // another organization's responsabile.
+    if (parent && parent.organization_id !== organizationId) {
+      throw new BadRequestException('Parent membership not found');
+    }
+
+    this.validatePrHierarchy(targetRole, parent);
+
+    const refSeed =
+      payload.ref_code?.trim() ||
+      targetUser.username ||
+      targetUser.name ||
+      targetUser.email;
+    const refCode = await this.buildUniquePrRefCode(venueId, refSeed);
+
+    const inserted = await this.prisma.$queryRaw<
+      Array<{ id: string }>
+    >(Prisma.sql`
+      INSERT INTO venue_pr_memberships (
+        venue_id,
+        user_id,
+        role,
+        parent_membership_id,
+        ref_code,
+        is_active,
+        organization_id,
+        updated_at
+      )
+      VALUES (
+        ${venueId}::uuid,
+        ${payload.user_id}::uuid,
+        ${targetRole}::"VenuePrRole",
+        ${resolvedParentId}::uuid,
+        ${refCode},
+        true,
+        ${organizationId}::uuid,
+        NOW()
+      )
+      RETURNING id
+    `);
+
+    const createdId = inserted[0]?.id;
+    if (!createdId) {
+      throw new BadRequestException('Unable to create PR membership');
+    }
+
+    const row = await this.loadPrMemberRowById(venueId, createdId);
+    if (!row) throw new NotFoundException('Created PR membership not found');
+
+    return this.mapPrMember(row);
+  }
+
+  // No venue_id in the URL for organization-scoped endpoints (see
+  // OrganizationsController) - resolved here from the membership itself, then
+  // double-checked against organization_id, since venue_pr_memberships.id alone is
+  // already a globally unique primary key.
+  private async findOrganizationMembership(
+    organizationId: string,
+    memberId: string,
+  ): Promise<PrMembershipRow | null> {
+    const row = await this.prisma.venue_pr_memberships.findUnique({
+      where: { id: memberId },
+      select: { venue_id: true, organization_id: true },
+    });
+    if (!row || row.organization_id !== organizationId) return null;
+    return this.loadPrMembershipById(row.venue_id, memberId);
+  }
+
+  async updateOrganizationPrMember(
+    organizationId: string,
+    memberId: string,
+    payload: {
+      role?: string;
+      parent_membership_id?: string | null;
+      is_active?: boolean;
+      ref_code?: string;
+    },
+  ) {
+    const existing = await this.findOrganizationMembership(
+      organizationId,
+      memberId,
+    );
+    if (!existing) throw new NotFoundException('PR membership not found');
+    const venueId = existing.venue_id;
+
+    let nextRole = existing.role;
+    let nextParentId = existing.parent_membership_id;
+    let nextIsActive = Boolean(existing.is_active);
+    let nextRefCode = existing.ref_code;
+
+    if (payload.role !== undefined) {
+      nextRole = this.toPrRoleDb(payload.role);
+    }
+    if (payload.parent_membership_id !== undefined) {
+      nextParentId = payload.parent_membership_id ?? null;
+    }
+    if (payload.ref_code !== undefined) {
+      nextRefCode = await this.buildUniquePrRefCode(
+        venueId,
+        payload.ref_code || existing.ref_code,
+        existing.id,
+      );
+    }
+    if (payload.is_active !== undefined) {
+      nextIsActive = Boolean(payload.is_active);
+    }
+
+    if (nextParentId && nextParentId === existing.id) {
+      throw new BadRequestException(
+        'Un membro non puo essere il proprio superiore',
+      );
+    }
+
+    const parent = nextParentId
+      ? await this.loadPrMembershipById(venueId, nextParentId)
+      : null;
+    if (nextParentId && !parent) {
+      throw new BadRequestException('Parent membership not found');
+    }
+    if (parent && parent.organization_id !== organizationId) {
+      throw new BadRequestException('Parent membership not found');
+    }
+
+    if (nextParentId) {
+      const treeRows = await this.prisma.$queryRaw<
+        Array<{ id: string; parent_membership_id: string | null }>
+      >(Prisma.sql`
+        SELECT id, parent_membership_id
+        FROM venue_pr_memberships
+        WHERE venue_id = ${venueId}::uuid AND organization_id = ${organizationId}::uuid
+      `);
+      const selfAndDescendants = this.collectPrSubtree(existing.id, treeRows);
+      if (selfAndDescendants.has(nextParentId)) {
+        throw new BadRequestException('Ciclo gerarchico non consentito');
+      }
+    }
+
+    this.validatePrHierarchy(nextRole, parent);
+
+    const updates: Prisma.Sql[] = [];
+    if (nextRole !== existing.role) {
+      updates.push(Prisma.sql`role = ${nextRole}::"VenuePrRole"`);
+    }
+    if ((nextParentId ?? null) !== (existing.parent_membership_id ?? null)) {
+      updates.push(Prisma.sql`parent_membership_id = ${nextParentId}::uuid`);
+    }
+    if (nextRefCode !== existing.ref_code) {
+      updates.push(Prisma.sql`ref_code = ${nextRefCode}`);
+    }
+    if (nextIsActive !== Boolean(existing.is_active)) {
+      updates.push(Prisma.sql`is_active = ${nextIsActive}`);
+    }
+
+    if (!updates.length) {
+      const row = await this.loadPrMemberRowById(venueId, memberId);
+      if (!row) throw new NotFoundException('PR membership not found');
+      return this.mapPrMember(row);
+    }
+
+    updates.push(Prisma.sql`updated_at = NOW()`);
+
+    await this.prisma.$executeRaw(Prisma.sql`
+      UPDATE venue_pr_memberships
+      SET ${Prisma.join(updates, ', ')}
+      WHERE venue_id = ${venueId}::uuid
+        AND id = ${memberId}::uuid
+        AND organization_id = ${organizationId}::uuid
+    `);
+
+    const row = await this.loadPrMemberRowById(venueId, memberId);
+    if (!row) throw new NotFoundException('PR membership not found');
+
+    return this.mapPrMember(row);
+  }
+
+  async deleteOrganizationPrMember(organizationId: string, memberId: string) {
+    const existing = await this.findOrganizationMembership(
+      organizationId,
+      memberId,
+    );
+    if (!existing) throw new NotFoundException('PR membership not found');
+    const venueId = existing.venue_id;
+
+    const children = await this.prisma.$queryRaw<
+      Array<{ id: string }>
+    >(Prisma.sql`
+      SELECT id
+      FROM venue_pr_memberships
+      WHERE venue_id = ${venueId}::uuid
+        AND parent_membership_id = ${memberId}::uuid
+      LIMIT 1
+    `);
+    if (children.length > 0) {
+      throw new BadRequestException(
+        'Impossibile eliminare: riassegna prima i membri del team collegati',
+      );
+    }
+
+    await this.prisma.$executeRaw(Prisma.sql`
+      DELETE FROM venue_pr_memberships
+      WHERE venue_id = ${venueId}::uuid
+        AND id = ${memberId}::uuid
+        AND organization_id = ${organizationId}::uuid
     `);
 
     return { deleted: true, id: memberId };
@@ -3704,8 +3978,7 @@ export class VenuesService {
       ORDER BY
         CASE m.role
           WHEN 'responsabile' THEN 0
-          WHEN 'capo_squadra' THEN 1
-          ELSE 2
+          ELSE 1
         END,
         COALESCE(u.name, u.username, u.email) ASC
     `),

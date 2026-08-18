@@ -22,9 +22,11 @@ enum UserRole {
   organization
 }
 
+// Confirmed 2026-08-18: simplified from a 3-tier hierarchy (responsabile > capo_squadra >
+// pr) to 2-tier. Existing `capo_squadra` rows were promoted to `responsabile` in the
+// migration that dropped this enum value - see 20260818170000_remove_capo_squadra_role.
 enum VenuePrRole {
   responsabile
-  capo_squadra
   pr
 }
 
@@ -349,6 +351,7 @@ model organizations {
   owners         users[]
   venue_links    organization_venue_links[]
   pr_memberships venue_pr_memberships[]
+  events         events[]
 
   @@index([plan_id])
 }
@@ -859,6 +862,13 @@ model events {
 
   venue venues @relation(fields: [venue_id], references: [id])
 
+  // Nullable: most events are still created directly by the venue. Set when an organization
+  // (not the venue) created this event under one of its linked venues (confirmed decision:
+  // both the venue and the creating organization can manage the event afterwards - no
+  // exclusivity, no lock). Never changeable by a non-admin once set.
+  organization_id String?        @db.Uuid
+  organization    organizations? @relation(fields: [organization_id], references: [id], onDelete: SetNull)
+
   entries                  entries[]
   entry_prices             event_entry_prices[]
   event_tables             event_tables[]
@@ -876,6 +886,7 @@ model events {
   @@index([date, start_time])
   @@index([status])
   @@index([is_featured, date])
+  @@index([organization_id])
 }
 
 // ===============================
@@ -1214,7 +1225,7 @@ model user_promos {
 // ===============================
 model reservations {
   id                     String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  user_id                String            @db.Uuid
+  user_id                String?           @db.Uuid
   event_id               String            @db.Uuid
   venue_table_zone_id    String?           @db.Uuid
   table_name             String?
@@ -1232,7 +1243,20 @@ model reservations {
   checkin_entry_id       String?           @db.Uuid
   created_at             DateTime          @default(now())
 
-  user                       users                  @relation(fields: [user_id], references: [id])
+  // Populated only for an "entry" reservation created via the unauthenticated referral
+  // guest-join flow (POST /reservations/guest-join) when no matching account was found by
+  // email/username - see ReservationsService.guestJoinEntry. Mutually exclusive with
+  // user_id: either the reservation belongs to a real account (user_id set, guest_* null),
+  // or it's a standalone guest attendance (user_id null, guest_* populated).
+  guest_name    String?
+  guest_surname String?
+  guest_email   String?
+  // Random, unguessable id handed back to the unauthenticated browser that created this
+  // reservation, so it can fetch it back later (GET /reservations/guest/:token) without a
+  // NightHub session. Never a substitute for an access token.
+  guest_token   String? @unique
+
+  user                       users?                 @relation(fields: [user_id], references: [id])
   event                      events                 @relation(fields: [event_id], references: [id])
   venue_table_zone           venue_table_zones?     @relation(fields: [venue_table_zone_id], references: [id])
   ticket_order               ticket_orders?
@@ -1245,6 +1269,7 @@ model reservations {
   @@index([user_id, created_at])
   @@index([event_id, type, status])
   @@index([checked_in_by_staff_id])
+  @@index([event_id, guest_email])
 }
 
 model ticket_orders {

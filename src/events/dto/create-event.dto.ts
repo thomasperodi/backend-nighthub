@@ -2,6 +2,10 @@ import { EntryPriceDto, EventPromoDto, TablePricingOverrideDto } from './event-n
 
 export class CreateEventDto {
   venue_id?: string;
+  // Server-set only (see EventsController.create) - stamped when the caller is an
+  // organization creating an event at one of its linked venues. Never trust this from the
+  // client directly.
+  organization_id?: string;
   name!: string;
   is_featured?: boolean;
   date!: string; // ISO date string (yyyy-mm-dd)

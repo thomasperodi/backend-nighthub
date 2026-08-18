@@ -13,6 +13,8 @@ import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
 import { LinkVenueDto } from './dto/link-venue.dto';
 import { AssignOrganizationPlanDto } from './dto/assign-organization-plan.dto';
+import { CreateOrganizationPrMemberDto } from './dto/create-organization-pr-member.dto';
+import { UpdateOrganizationPrMemberDto } from './dto/update-organization-pr-member.dto';
 import { Roles } from '../auth/roles.decorator';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { RequestUser } from '../auth/types';
@@ -102,6 +104,41 @@ export class OrganizationsController {
   @RequireOrganizationOwnership()
   listPrNetwork(@Param('id') id: string) {
     return this.organizationsService.listPrNetwork(id);
+  }
+
+  @Post(':id/pr-network')
+  @Roles('admin', 'organization')
+  @RequireOrganizationOwnership()
+  createPrMember(
+    @Param('id') id: string,
+    @Body() dto: CreateOrganizationPrMemberDto,
+  ) {
+    return this.organizationsService.createPrMember(id, dto);
+  }
+
+  @Patch(':id/pr-network/:memberId')
+  @Roles('admin', 'organization')
+  @RequireOrganizationOwnership()
+  updatePrMember(
+    @Param('id') id: string,
+    @Param('memberId') memberId: string,
+    @Body() dto: UpdateOrganizationPrMemberDto,
+  ) {
+    return this.organizationsService.updatePrMember(id, memberId, dto);
+  }
+
+  @Delete(':id/pr-network/:memberId')
+  @Roles('admin', 'organization')
+  @RequireOrganizationOwnership()
+  deletePrMember(@Param('id') id: string, @Param('memberId') memberId: string) {
+    return this.organizationsService.deletePrMember(id, memberId);
+  }
+
+  @Get(':id/events')
+  @Roles('admin', 'organization')
+  @RequireOrganizationOwnership()
+  listEvents(@Param('id') id: string) {
+    return this.organizationsService.listEvents(id);
   }
 
   @Get(':id/stats')

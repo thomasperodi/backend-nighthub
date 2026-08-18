@@ -7,7 +7,7 @@ import {
   ValidateIf,
 } from 'class-validator';
 
-export class UpdateVenuePrMemberDto {
+export class UpdateOrganizationPrMemberDto {
   @IsOptional()
   @IsString()
   @IsIn(['RESPONSABILE', 'PR', 'responsabile', 'pr'])
@@ -25,9 +25,4 @@ export class UpdateVenuePrMemberDto {
   @IsOptional()
   @IsString()
   ref_code?: string;
-
-  @IsOptional()
-  @ValidateIf((_, value) => value !== null)
-  @IsUUID()
-  organization_id?: string | null;
 }

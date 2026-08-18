@@ -226,11 +226,7 @@ export class ReservationsService {
     const normalized = String(role ?? '')
       .trim()
       .toLowerCase();
-    return (
-      normalized === 'responsabile' ||
-      normalized === 'capo_squadra' ||
-      normalized === 'pr'
-    );
+    return normalized === 'responsabile' || normalized === 'pr';
   }
 
   private isReservationComplimentary(
@@ -310,6 +306,79 @@ export class ReservationsService {
 
     if (!Object.keys(merged).length) return undefined;
     return merged as Prisma.InputJsonValue;
+  }
+
+  /**
+   * Resolves an incoming ref_code/pr_code/inviter_user_id (from `meta`) against an active
+   * `venue_pr_memberships` row for this event's venue, and builds the referral fields to
+   * persist on the reservation. Shared by the authenticated createReservation() path and
+   * the unauthenticated guestJoinEntry() path - an unmatched/expired/wrong-venue code is
+   * silently dropped in both, never persisted verbatim.
+   */
+  private async resolveReferralAttribution(params: {
+    venueId: string | null | undefined;
+    meta: Record<string, unknown> | null;
+    type: 'table' | 'entry';
+  }): Promise<{
+    referralMeta: ReservationReferralMeta | null;
+    prMembership: {
+      id: string;
+      user_id: string;
+      role: string;
+      ref_code: string;
+    } | null;
+    isPrComplimentaryEntry: boolean;
+  }> {
+    const referralCode = this.parseTrackingCodeFromMeta(params.meta);
+    const invitedByUserId = this.readMetaString(params.meta, 'inviter_user_id');
+    const prMembershipOrFilters: Prisma.venue_pr_membershipsWhereInput[] = [
+      ...(referralCode
+        ? [{ ref_code: { equals: referralCode, mode: 'insensitive' as const } }]
+        : []),
+      ...(invitedByUserId ? [{ user_id: invitedByUserId }] : []),
+    ];
+
+    const prMembership =
+      (referralCode || invitedByUserId) && params.venueId
+        ? await this.prisma.venue_pr_memberships.findFirst({
+            where: {
+              venue_id: params.venueId,
+              is_active: true,
+              OR: prMembershipOrFilters,
+            },
+            select: {
+              id: true,
+              user_id: true,
+              role: true,
+              ref_code: true,
+            },
+          })
+        : null;
+
+    const isPrComplimentaryEntry =
+      params.type === 'entry' &&
+      Boolean(
+        prMembership && this.roleHasDefaultPrComplimentary(prMembership.role),
+      );
+
+    // Only persist referral/tracking fields once they resolve to a real, active PR
+    // membership for this venue. An unmatched ref_code (typo, wrong venue, revoked
+    // membership) must not be written verbatim into reservations.meta.
+    const referralMeta: ReservationReferralMeta | null = prMembership
+      ? {
+          inviter_user_id: prMembership.user_id,
+          tracking_code: prMembership.ref_code,
+          pr_code: prMembership.ref_code,
+          ref_code: prMembership.ref_code,
+          promo_code: prMembership.ref_code,
+          pr_membership_id: prMembership.id,
+          pr_role: prMembership.role,
+          pr_omaggio_default: isPrComplimentaryEntry,
+          wallet_pass_eligible: isPrComplimentaryEntry,
+        }
+      : null;
+
+    return { referralMeta, prMembership, isPrComplimentaryEntry };
   }
 
   private getErrorDetails(error: unknown): { code?: string; message: string } {
@@ -565,6 +634,7 @@ export class ReservationsService {
       total_amount: true,
       qr_token: true,
       qr_payload: true,
+      guest_token: true,
       checked_in_at: true,
       checked_in_by_staff_id: true,
       checkin_entry_id: true,
@@ -614,7 +684,7 @@ export class ReservationsService {
 
   private buildEntryQrPayload(params: {
     reservationId: string;
-    userId: string;
+    userId: string | null;
     eventId: string;
     qrToken: string;
   }) {
@@ -990,12 +1060,14 @@ export class ReservationsService {
    */
   private async hydrateReservations<
     T extends {
-      user_id: string;
+      user_id: string | null;
       event_id: string;
       venue_table_zone_id: string | null;
     },
   >(rows: T[]) {
-    const userIds = Array.from(new Set(rows.map((r) => r.user_id)));
+    const userIds = Array.from(
+      new Set(rows.map((r) => r.user_id).filter((id): id is string => !!id)),
+    );
     const eventIds = Array.from(new Set(rows.map((r) => r.event_id)));
     const zoneIds = Array.from(
       new Set(
@@ -1055,7 +1127,7 @@ export class ReservationsService {
 
     return rows.map((row) => ({
       ...row,
-      user: userById.get(row.user_id) ?? null,
+      user: row.user_id ? (userById.get(row.user_id) ?? null) : null,
       event: eventById.get(row.event_id) ?? null,
       venue_table_zone: row.venue_table_zone_id
         ? (zoneById.get(row.venue_table_zone_id) ?? null)
@@ -1177,57 +1249,12 @@ export class ReservationsService {
     }
 
     const incomingMeta = this.asObjectRecord(normalized.meta);
-    const referralCode = this.parseTrackingCodeFromMeta(incomingMeta);
-    const invitedByUserId = this.readMetaString(
-      incomingMeta,
-      'inviter_user_id',
-    );
-    const prMembershipOrFilters: Prisma.venue_pr_membershipsWhereInput[] = [
-      ...(referralCode
-        ? [{ ref_code: { equals: referralCode, mode: 'insensitive' as const } }]
-        : []),
-      ...(invitedByUserId ? [{ user_id: invitedByUserId }] : []),
-    ];
-
-    const prMembership =
-      (referralCode || invitedByUserId) && event?.venue_id
-        ? await this.prisma.venue_pr_memberships.findFirst({
-            where: {
-              venue_id: event.venue_id,
-              is_active: true,
-              OR: prMembershipOrFilters,
-            },
-            select: {
-              id: true,
-              user_id: true,
-              role: true,
-              ref_code: true,
-            },
-          })
-        : null;
-
-    const isPrComplimentaryEntry =
-      type === 'entry' &&
-      Boolean(
-        prMembership && this.roleHasDefaultPrComplimentary(prMembership.role),
-      );
-
-    // Only persist referral/tracking fields once they resolve to a real, active PR
-    // membership for this venue. An unmatched ref_code (typo, wrong venue, revoked
-    // membership) must not be written verbatim into reservations.meta.
-    const referralMeta: ReservationReferralMeta | null = prMembership
-      ? {
-          inviter_user_id: prMembership.user_id,
-          tracking_code: prMembership.ref_code,
-          pr_code: prMembership.ref_code,
-          ref_code: prMembership.ref_code,
-          promo_code: prMembership.ref_code,
-          pr_membership_id: prMembership.id,
-          pr_role: prMembership.role,
-          pr_omaggio_default: isPrComplimentaryEntry,
-          wallet_pass_eligible: isPrComplimentaryEntry,
-        }
-      : null;
+    const { referralMeta, prMembership, isPrComplimentaryEntry } =
+      await this.resolveReferralAttribution({
+        venueId: event.venue_id,
+        meta: incomingMeta,
+        type,
+      });
 
     const venueTableZoneId: string | null | undefined =
       normalized.venue_table_zone_id ?? null;
@@ -1405,6 +1432,296 @@ export class ReservationsService {
       data: { qr_payload: qrPayload },
       select: this.reservationSelect(),
     });
+  }
+
+  private normalizeGuestNamePart(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > 80) return null;
+    return trimmed;
+  }
+
+  private normalizeGuestEmail(value: unknown): string | null {
+    const raw = this.normalizeStringValue(value);
+    if (!raw) return null;
+    const normalized = raw.toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
+      throw new BadRequestException('email is not valid');
+    }
+    return normalized;
+  }
+
+  /**
+   * Email/username lookup for the unauthenticated guest-join flow. This deliberately never
+   * verifies a password or issues a session - a match only decides whose account the
+   * resulting attendance is attributed to, per the confirmed "guest join is not a login"
+   * rule (see docs/spec referral guest-join). Returns only the id, never anything about the
+   * matched account, so the caller can't learn anything about someone else's profile.
+   */
+  private async findUserForGuestJoin(
+    normalizedEmail: string | null,
+    username: string | null,
+  ): Promise<{ id: string } | null> {
+    if (normalizedEmail) {
+      const byEmail = await this.prisma.users.findFirst({
+        where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
+        select: { id: true },
+      });
+      if (byEmail) return byEmail;
+    }
+    if (username) {
+      const byUsername = await this.prisma.users.findFirst({
+        where: { username: { equals: username, mode: 'insensitive' } },
+        select: { id: true },
+      });
+      if (byUsername) return byUsername;
+    }
+    return null;
+  }
+
+  /** Strips everything that isn't safe to hand back to an unauthenticated caller holding
+   * only a guestToken - no matched account's email/phone, no other guest's info. */
+  private toGuestSafeReservation(reservation: {
+    id: string;
+    event_id: string;
+    type: string;
+    status: string;
+    guests: number;
+    qr_payload: string | null;
+    checked_in_at: Date | null;
+    created_at: Date;
+    event?: {
+      id: string;
+      name: string;
+      date: Date;
+      start_time: Date | null;
+      end_time: Date | null;
+      venue?: {
+        id: string;
+        name: string;
+        city: string | null;
+        address: string | null;
+      } | null;
+    } | null;
+  }) {
+    return {
+      id: reservation.id,
+      event_id: reservation.event_id,
+      type: reservation.type,
+      status: reservation.status,
+      guests: reservation.guests,
+      qr_payload: reservation.qr_payload,
+      checked_in_at: reservation.checked_in_at,
+      created_at: reservation.created_at,
+      event: reservation.event
+        ? {
+            id: reservation.event.id,
+            name: reservation.event.name,
+            date: reservation.event.date,
+            start_time: reservation.event.start_time,
+            end_time: reservation.event.end_time,
+            venue: reservation.event.venue
+              ? {
+                  id: reservation.event.venue.id,
+                  name: reservation.event.venue.name,
+                  city: reservation.event.venue.city,
+                  address: reservation.event.venue.address,
+                }
+              : null,
+          }
+        : null,
+    };
+  }
+
+  /**
+   * Public, unauthenticated "Mettiti in lista" for a visitor arriving from a PR referral
+   * link who isn't logged in (and shouldn't have to be). Tries to resolve an existing
+   * NightHub account by email/username - if one matches, the attendance is attributed to
+   * it (`user_id` set) without ever authenticating as that account; otherwise a guest-only
+   * entry is created (`user_id: null`, guest_name/guest_surname/guest_email). Either way a
+   * `guest_token` is issued so the unauthenticated browser can fetch this reservation back
+   * later via getGuestReservation(). Dedup: one active entry per event per resolved
+   * identity (matched user_id, or normalized guest email when no account matched).
+   */
+  async guestJoinEntry(dto: Record<string, unknown> | null | undefined) {
+    const payload = dto ?? {};
+    const eventId = this.normalizeStringValue(
+      payload.event_id ?? payload.eventId,
+    );
+    if (!eventId) throw new BadRequestException('event_id required');
+
+    // Nome/cognome sono richiesti solo se serve creare una entry guest vera e propria
+    // (nessun account trovato per l'email/username forniti) - se l'email corrisponde a un
+    // account esistente bastano quelli, senza chiedere altro (vedi il branch "matchedUser"
+    // più sotto).
+    const firstName = this.normalizeGuestNamePart(
+      payload.guest_name ?? payload.first_name ?? payload.firstName,
+    );
+    const lastName = this.normalizeGuestNamePart(
+      payload.guest_surname ?? payload.last_name ?? payload.lastName,
+    );
+
+    const usernameRaw =
+      this.normalizeStringValue(payload.username ?? payload.guest_username) ||
+      null;
+    const normalizedEmail = this.normalizeGuestEmail(
+      payload.email ?? payload.guest_email,
+    );
+    if (!normalizedEmail && !usernameRaw) {
+      throw new BadRequestException('email or username required');
+    }
+
+    const event = await this.prisma.events.findUnique({
+      where: { id: eventId },
+      select: { id: true, venue_id: true, name: true, status: true },
+    });
+    if (!event) throw new NotFoundException('Event not found');
+    if (event.status === 'CANCELLED') {
+      throw new BadRequestException('Questo evento è stato annullato');
+    }
+
+    const matchedUser = await this.findUserForGuestJoin(
+      normalizedEmail,
+      usernameRaw,
+    );
+
+    const existing = matchedUser
+      ? await this.prisma.reservations.findFirst({
+          where: {
+            event_id: eventId,
+            user_id: matchedUser.id,
+            type: 'entry',
+            status: { not: 'cancelled' },
+          },
+          select: this.reservationSelect(),
+        })
+      : normalizedEmail
+        ? await this.prisma.reservations.findFirst({
+            where: {
+              event_id: eventId,
+              user_id: null,
+              guest_email: normalizedEmail,
+              type: 'entry',
+              status: { not: 'cancelled' },
+            },
+            select: this.reservationSelect(),
+          })
+        : null;
+
+    if (existing) {
+      return {
+        reservation: this.toGuestSafeReservation(existing),
+        already_joined: true,
+        // Only handed back when the existing entry is itself guest-owned (no account
+        // matched) - never for a reservation belonging to someone else's account, which
+        // would let anyone "recover" another user's QR just by typing their email.
+        guest_token: existing.user_id
+          ? undefined
+          : (existing.guest_token ?? undefined),
+      };
+    }
+
+    // No account matched and no pre-existing reservation to recover: a real guest entry
+    // needs a name to be useful at the door. Machine-readable message on purpose (not
+    // human copy) so the frontend can catch it and switch to asking for the name, instead
+    // of showing a generic error - see GuestJoinSheet.
+    if (!matchedUser && (!firstName || !lastName)) {
+      throw new BadRequestException('guest_name_required');
+    }
+
+    const incomingMeta = this.asObjectRecord(
+      this.mergeRootReferralIntoMeta(payload),
+    );
+    const { referralMeta, prMembership } =
+      await this.resolveReferralAttribution({
+        venueId: event.venue_id,
+        meta: incomingMeta,
+        type: 'entry',
+      });
+    const reservationMeta = this.mergeReferralMeta({}, referralMeta ?? {});
+
+    const qrToken = randomUUID();
+    const guestToken = randomUUID();
+
+    const created = await (async () => {
+      try {
+        return await this.prisma.reservations.create({
+          data: {
+            user_id: matchedUser?.id ?? null,
+            event_id: eventId,
+            type: 'entry',
+            status: 'confirmed',
+            guests: 1,
+            meta: reservationMeta,
+            qr_token: qrToken,
+            guest_name: matchedUser ? null : firstName,
+            guest_surname: matchedUser ? null : lastName,
+            guest_email: matchedUser ? null : normalizedEmail,
+            guest_token: guestToken,
+          },
+          select: this.reservationSelect(),
+        });
+      } catch (error: unknown) {
+        const { code, message } = this.getErrorDetails(error);
+        if (
+          code === 'P2002' ||
+          message.toLowerCase().includes('duplicate key value')
+        ) {
+          throw new BadRequestException('Sei già in lista per questa serata');
+        }
+        throw error;
+      }
+    })();
+
+    const qrPayload = JSON.stringify(
+      this.buildEntryQrPayload({
+        reservationId: created.id,
+        userId: matchedUser?.id ?? null,
+        eventId,
+        qrToken,
+      }),
+    );
+    const updated = await this.prisma.reservations.update({
+      where: { id: created.id },
+      data: { qr_payload: qrPayload },
+      select: this.reservationSelect(),
+    });
+
+    this.evaluateBadges(matchedUser?.id ?? null);
+    void this.notifyNewReservationInterestedParties({
+      reservationId: created.id,
+      type: 'entry',
+      eventName: event.name,
+      venueId: event.venue_id,
+      prMembershipUserId: prMembership?.user_id,
+    }).catch((error) => {
+      this.logger.error(
+        `Failed to notify PR/venue for guest reservation ${created.id}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    });
+
+    return {
+      reservation: this.toGuestSafeReservation(updated),
+      already_joined: false,
+      guest_token: guestToken,
+    };
+  }
+
+  /** Lets an unauthenticated browser that holds a guestToken (from guestJoinEntry) fetch
+   * its own guest reservation back - e.g. to re-show the confirmation/QR after navigating
+   * away and back. Never exposes anything beyond what toGuestSafeReservation allows. */
+  async getGuestReservation(token: string) {
+    const guestToken = this.normalizeStringValue(token);
+    if (!guestToken) throw new BadRequestException('token required');
+
+    const reservation = await this.prisma.reservations.findUnique({
+      where: { guest_token: guestToken },
+      select: this.reservationSelect(),
+    });
+    if (!reservation) throw new NotFoundException('Reservation not found');
+
+    return this.toGuestSafeReservation(reservation);
   }
 
   async checkInEntryReservationByQr(params: {
@@ -1938,7 +2255,7 @@ export class ReservationsService {
 
   private async notifyTableInviteesAboutStatusChange(reservation: {
     id: string;
-    user_id: string;
+    user_id: string | null;
     status: string;
     table_name?: string | null;
     meta?: unknown;
@@ -1952,8 +2269,14 @@ export class ReservationsService {
     // Notify the person who actually made the booking too, not just the invitees they
     // added - this used to be silently skipped, so a venue confirming/cancelling a
     // reservation never reached the booker themselves, only whoever they'd invited.
+    // Table reservations always belong to a real account in practice (guest-join only
+    // ever creates "entry" reservations), but user_id is nullable on the shared type.
     const recipientIds = Array.from(
-      new Set([reservation.user_id, ...activeInviteeIds]),
+      new Set(
+        [reservation.user_id, ...activeInviteeIds].filter((id): id is string =>
+          Boolean(id),
+        ),
+      ),
     );
     if (!recipientIds.length) return;
 
@@ -2040,10 +2363,13 @@ export class ReservationsService {
    * bookings did, via notifyTableInviteesAboutStatusChange. */
   private async notifyEntryReservationStatusChange(reservation: {
     id: string;
-    user_id: string;
+    user_id: string | null;
     status: string;
     event?: { name: string | null } | null;
   }) {
+    // Guest (unauthenticated) entry reservations have no account to push to.
+    if (!reservation.user_id) return;
+
     const eventLabel = reservation.event?.name || 'la serata';
     const title =
       reservation.status === 'confirmed'
@@ -2092,10 +2418,16 @@ export class ReservationsService {
         (
           row,
         ): row is {
-          reservation: IncomingTableInvitationReservation;
+          reservation: IncomingTableInvitationReservation & {
+            user_id: string;
+          };
           invite: TableInviteMetaItem;
           meta: TableReservationMeta;
-        } => Boolean(row),
+        } =>
+          // Table reservations always belong to a real account (guest-join only ever
+          // creates "entry" reservations) - this narrows the type back to non-null for
+          // formatIncomingTableInvitation below.
+          row !== null && Boolean(row.reservation.user_id),
       );
 
     if (!invitations.length) return [];
@@ -2161,9 +2493,18 @@ export class ReservationsService {
       select: tableInvitationResponseReservationSelect,
     });
 
-    if (!reservation || reservation.status === 'cancelled') {
+    if (
+      !reservation ||
+      reservation.status === 'cancelled' ||
+      !reservation.user_id
+    ) {
+      // Table reservations always belong to a real account (guest-join only ever creates
+      // "entry" reservations) - a missing user_id here means there's no valid invitation.
       throw new NotFoundException('Table invitation not found');
     }
+    // Narrowed once, up front - property narrowing on `reservation.user_id` doesn't
+    // reliably survive the awaits below.
+    const bookerUserId: string = reservation.user_id;
 
     const meta = this.parseTableReservationMeta(reservation.meta);
     const inviteIndex =
@@ -2196,14 +2537,14 @@ export class ReservationsService {
       select: { name: true, username: true },
     });
 
-    if (reservation.user_id) {
+    {
       const responderName =
         responder?.name || responder?.username || 'Un amico';
       const voteText =
         params.response === 'accepted'
           ? 'ha confermato la presenza'
           : "ha rifiutato l'invito";
-      await this.pushDispatch.notifyUser(reservation.user_id, {
+      await this.pushDispatch.notifyUser(bookerUserId, {
         title: 'Risposta invito tavolo',
         body: `${responderName} ${voteText}.`,
         data: {
@@ -2227,7 +2568,7 @@ export class ReservationsService {
       : [];
 
     return this.formatIncomingTableInvitation({
-      reservation,
+      reservation: { ...reservation, user_id: bookerUserId },
       invite: updatedInvites[inviteIndex],
       venue,
       invitedGroupNames: groups.map((group) => group.name),
@@ -2459,10 +2800,17 @@ export class ReservationsService {
       take: 500,
     });
 
-    const due = candidates.filter((reservation) => {
-      const startMs = eventStartMs(reservation.event);
-      return startMs !== null && startMs >= now && startMs <= horizon.getTime();
-    });
+    const due = candidates.filter(
+      (
+        reservation,
+      ): reservation is typeof reservation & { user_id: string } => {
+        if (!reservation.user_id) return false; // guests have no account to push to
+        const startMs = eventStartMs(reservation.event);
+        return (
+          startMs !== null && startMs >= now && startMs <= horizon.getTime()
+        );
+      },
+    );
 
     if (!due.length) return { success: true, reminded: 0 };
 

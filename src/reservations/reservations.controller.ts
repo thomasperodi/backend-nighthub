@@ -187,6 +187,23 @@ export class ReservationsController {
     return this.reservationsService.listBookedZoneIdsForEvent(eventId);
   }
 
+  // Public "Mettiti in lista" for an unauthenticated visitor arriving from a PR referral
+  // link (see /r/event/:eventId?pr=CODE on the frontend). Never requires login - see
+  // ReservationsService.guestJoinEntry for the account-matching/dedup rules.
+  @Post('guest-join')
+  @Public()
+  guestJoin(@Body() body: any) {
+    return this.reservationsService.guestJoinEntry(body);
+  }
+
+  // Lets the unauthenticated browser that received a guest_token from guest-join fetch its
+  // own reservation back (e.g. to re-show the confirmation/QR after navigating away).
+  @Get('guest/:token')
+  @Public()
+  getGuestReservation(@Param('token') token: string) {
+    return this.reservationsService.getGuestReservation(token);
+  }
+
   @Get('table-invitations/incoming')
   @Roles('client')
   listIncomingTableInvitations(@CurrentUser() user: RequestUser) {

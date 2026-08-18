@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -181,9 +182,19 @@ export class EventsController {
   }
 
   @Post('events')
-  @Roles('venue', 'admin')
-  create(@Body() dto: CreateEventDto, @CurrentUser() user: RequestUser) {
-    if (user.role !== 'admin') {
+  @Roles('venue', 'admin', 'organization')
+  async create(@Body() dto: CreateEventDto, @CurrentUser() user: RequestUser) {
+    if (user.role === 'organization') {
+      if (!user.organization_id)
+        throw new ForbiddenException('Missing organization_id');
+      if (!dto.venue_id) throw new BadRequestException('venue_id is required');
+      await this.eventsService.assertOrganizationLinkedToVenue(
+        user.organization_id,
+        dto.venue_id,
+      );
+      dto.organization_id = user.organization_id;
+      dto.is_featured = false;
+    } else if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       dto.venue_id = user.venue_id;
       // Paid featured placement is admin-granted, not something a venue can set on its own
@@ -194,9 +205,11 @@ export class EventsController {
   }
 
   // Upload poster separately to keep event create/update fast.
-  // Client sends multipart/form-data with field name `file`.
+  // Client sends multipart/form-data with field name `file`. An organization creating its
+  // own event needs this too (see OrganizationEventFormSheet) - the poster isn't scoped to
+  // a venue or event yet at upload time, so no extra ownership check is needed here.
   @Post('events/poster')
-  @Roles('venue', 'admin')
+  @Roles('venue', 'admin', 'organization')
   @UseInterceptors(FileInterceptor('file'))
   uploadPoster(@UploadedFile() file?: UploadedPosterFile) {
     return this.eventsService.uploadEventPoster(file);
@@ -205,7 +218,7 @@ export class EventsController {
   // Preferred: client-direct upload (no bytes through Vercel).
   // Returns { bucket, path, token, signedUrl } for Supabase Storage.
   @Post('events/poster/signed')
-  @Roles('venue', 'admin')
+  @Roles('venue', 'admin', 'organization')
   createPosterSignedUpload(
     @Headers('authorization') authorization?: string,
     @Body() body?: { ext?: string; contentType?: string },
@@ -216,13 +229,24 @@ export class EventsController {
   }
 
   @Patch('events/:id')
-  @Roles('venue', 'admin')
+  @Roles('venue', 'admin', 'organization')
   async update(
     @Param('id') id: string,
     @Body() dto: UpdateEventDto,
     @CurrentUser() user: RequestUser,
   ) {
-    if (user.role !== 'admin') {
+    if (user.role === 'organization') {
+      if (!user.organization_id)
+        throw new ForbiddenException('Missing organization_id');
+      await this.eventsService.assertEventBelongsToOrganization(
+        id,
+        user.organization_id,
+      );
+      // venue_id is never movable by a non-admin, organization included - see decision #3
+      // in the audit ("un evento non deve poter essere spostato da un locale a un altro").
+      delete dto.venue_id;
+      delete dto.is_featured;
+    } else if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       await this.eventsService.assertEventBelongsToVenue(id, user.venue_id);
       dto.venue_id = user.venue_id;
@@ -235,9 +259,16 @@ export class EventsController {
   }
 
   @Post('events/:id/cancel')
-  @Roles('venue', 'admin')
+  @Roles('venue', 'admin', 'organization')
   async cancel(@Param('id') id: string, @CurrentUser() user: RequestUser) {
-    if (user.role !== 'admin') {
+    if (user.role === 'organization') {
+      if (!user.organization_id)
+        throw new ForbiddenException('Missing organization_id');
+      await this.eventsService.assertEventBelongsToOrganization(
+        id,
+        user.organization_id,
+      );
+    } else if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       await this.eventsService.assertEventBelongsToVenue(id, user.venue_id);
     }
@@ -245,9 +276,16 @@ export class EventsController {
   }
 
   @Delete('events/:id')
-  @Roles('venue', 'admin')
+  @Roles('venue', 'admin', 'organization')
   async remove(@Param('id') id: string, @CurrentUser() user: RequestUser) {
-    if (user.role !== 'admin') {
+    if (user.role === 'organization') {
+      if (!user.organization_id)
+        throw new ForbiddenException('Missing organization_id');
+      await this.eventsService.assertEventBelongsToOrganization(
+        id,
+        user.organization_id,
+      );
+    } else if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');
       await this.eventsService.assertEventBelongsToVenue(id, user.venue_id);
     }

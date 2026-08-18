@@ -239,12 +239,11 @@ export class FriendsService {
     if (candidates.length === 0) return [];
 
     const candidateIds = candidates.map((candidate) => candidate.id);
-    const verifiedPrCandidates = await this.prisma.venue_pr_memberships.findMany(
-      {
+    const verifiedPrCandidates =
+      await this.prisma.venue_pr_memberships.findMany({
         where: { user_id: { in: candidateIds }, is_active: true },
         select: { user_id: true },
-      },
-    );
+      });
     const verifiedPrCandidateIds = new Set(
       verifiedPrCandidates.map((m) => m.user_id),
     );
@@ -346,61 +345,61 @@ export class FriendsService {
     const prismaAny = this.prisma as any;
     const [friends, openStays, allVenuesRaw, verifiedPrMemberships] =
       await Promise.all([
-      prismaAny.users.findMany({
-        where: { id: { in: friendIds } },
-        select: {
-          id: true,
-          username: true,
-          name: true,
-          avatar: true,
-          location_sharing_enabled: true,
-          last_latitude: true,
-          last_longitude: true,
-          last_location_accuracy_meters: true,
-          last_location_updated_at: true,
-          last_active_at: true,
-        },
-      }),
-      prismaAny.venue_stays.findMany({
-        where: {
-          user_id: { in: friendIds },
-          exited_at: null,
-        },
-        orderBy: { entered_at: 'desc' },
-        select: {
-          user_id: true,
-          entered_at: true,
-          venue: {
-            select: {
-              id: true,
-              name: true,
-              latitude: true,
-              longitude: true,
-              radius_geofence: true,
+        prismaAny.users.findMany({
+          where: { id: { in: friendIds } },
+          select: {
+            id: true,
+            username: true,
+            name: true,
+            avatar: true,
+            location_sharing_enabled: true,
+            last_latitude: true,
+            last_longitude: true,
+            last_location_accuracy_meters: true,
+            last_location_updated_at: true,
+            last_active_at: true,
+          },
+        }),
+        prismaAny.venue_stays.findMany({
+          where: {
+            user_id: { in: friendIds },
+            exited_at: null,
+          },
+          orderBy: { entered_at: 'desc' },
+          select: {
+            user_id: true,
+            entered_at: true,
+            venue: {
+              select: {
+                id: true,
+                name: true,
+                latitude: true,
+                longitude: true,
+                radius_geofence: true,
+              },
             },
           },
-        },
-      }),
-      prismaAny.venues.findMany({
-        where: {
-          latitude: { not: null },
-          longitude: { not: null },
-        },
-        select: {
-          id: true,
-          name: true,
-          latitude: true,
-          longitude: true,
-          radius_geofence: true,
-        },
-      }),
-      // Server-derived PR verification badge (see PublicUser.is_verified_pr) - never trust
-      // this from the client, always recomputed from the actual membership table.
-      this.prisma.venue_pr_memberships.findMany({
-        where: { user_id: { in: friendIds }, is_active: true },
-        select: { user_id: true },
-      }),
-    ]);
+        }),
+        prismaAny.venues.findMany({
+          where: {
+            latitude: { not: null },
+            longitude: { not: null },
+          },
+          select: {
+            id: true,
+            name: true,
+            latitude: true,
+            longitude: true,
+            radius_geofence: true,
+          },
+        }),
+        // Server-derived PR verification badge (see PublicUser.is_verified_pr) - never trust
+        // this from the client, always recomputed from the actual membership table.
+        this.prisma.venue_pr_memberships.findMany({
+          where: { user_id: { in: friendIds }, is_active: true },
+          select: { user_id: true },
+        }),
+      ]);
 
     const verifiedPrUserIds = new Set(
       verifiedPrMemberships.map((m: { user_id: string }) => m.user_id),
@@ -933,6 +932,7 @@ export class FriendsService {
 
     const soonestByUser = new Map<string, (typeof reservations)[number]>();
     for (const reservation of reservations) {
+      if (!reservation.user_id) continue;
       if (!soonestByUser.has(reservation.user_id)) {
         soonestByUser.set(reservation.user_id, reservation);
       }

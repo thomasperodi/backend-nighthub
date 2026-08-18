@@ -420,7 +420,10 @@ export class AuthService {
     };
   }
 
-  async register(dto: RegisterDto, meta: SessionMeta = {}): Promise<LoginResult> {
+  async register(
+    dto: RegisterDto,
+    meta: SessionMeta = {},
+  ): Promise<LoginResult> {
     // Public self-registration always creates a `client` account. Promoting a user to
     // staff/venue/admin is an admin-only operation (AdminService.updateUserAssignment) -
     // never trust a role/venue_id supplied by an unauthenticated caller here.
@@ -471,6 +474,30 @@ export class AuthService {
         throw new ConflictException(`User already exists (${target})`);
       }
       throw err;
+    }
+
+    // Associate any pre-existing guest reservations (created via the unauthenticated
+    // referral guest-join flow, see ReservationsService.guestJoinEntry) that used this same
+    // email - registering with that email is the strongest ownership signal this app has
+    // for it. Best-effort: must never block registration if it fails.
+    try {
+      await this.prisma.reservations.updateMany({
+        where: {
+          user_id: null,
+          guest_email: dto.email.trim().toLowerCase(),
+          status: { not: 'cancelled' },
+        },
+        data: {
+          user_id: user.id,
+          guest_name: null,
+          guest_surname: null,
+          guest_email: null,
+        },
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Failed to associate guest reservations for new user ${user.id}: ${String(error)}`,
+      );
     }
 
     // Auto-login after registration: the frontend expects the same session shape as
@@ -585,7 +612,9 @@ export class AuthService {
    * onboarding flow otherwise has no backend state, which meant it silently replayed on
    * every new device/browser (localStorage-only flag) and could be skipped entirely when a
    * session was restored via refresh token instead of an explicit login submit. */
-  async completeOnboarding(userId: string): Promise<{ onboarding_completed: true }> {
+  async completeOnboarding(
+    userId: string,
+  ): Promise<{ onboarding_completed: true }> {
     await this.prisma.users.updateMany({
       where: { id: userId, onboarding_completed_at: null },
       data: { onboarding_completed_at: new Date() },

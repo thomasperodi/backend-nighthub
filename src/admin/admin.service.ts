@@ -265,7 +265,9 @@ export class AdminService {
 
     const uniqueUsers = new Set<string>();
 
-    for (const item of reservationUsers) uniqueUsers.add(item.user_id);
+    for (const item of reservationUsers) {
+      if (item.user_id) uniqueUsers.add(item.user_id);
+    }
     for (const item of ticketUsers) uniqueUsers.add(item.user_id);
     for (const item of entryUsers) {
       if (item.user_id) uniqueUsers.add(item.user_id);
@@ -1119,7 +1121,9 @@ export class AdminService {
       stayStats30d,
     ] = userActivityData;
 
-    for (const row of reservationUsers) activeUsersSet.add(row.user_id);
+    for (const row of reservationUsers) {
+      if (row.user_id) activeUsersSet.add(row.user_id);
+    }
     for (const row of ticketUsers) activeUsersSet.add(row.user_id);
     for (const row of entryUsers) {
       if (row.user_id) activeUsersSet.add(row.user_id);

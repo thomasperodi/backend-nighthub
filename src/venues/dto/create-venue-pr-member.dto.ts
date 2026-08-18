@@ -11,14 +11,7 @@ export class CreateVenuePrMemberDto {
   user_id: string;
 
   @IsString()
-  @IsIn([
-    'RESPONSABILE',
-    'CAPO_SQUADRA',
-    'PR',
-    'responsabile',
-    'capo_squadra',
-    'pr',
-  ])
+  @IsIn(['RESPONSABILE', 'PR', 'responsabile', 'pr'])
   role: string;
 
   @IsOptional()

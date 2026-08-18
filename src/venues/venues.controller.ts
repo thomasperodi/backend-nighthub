@@ -275,16 +275,28 @@ export class VenuesController {
   // `user_id`, and unlike admin's resolveUserByIdentifier, nothing venue-scoped existed to
   // look one up before creating the membership.
   @Get(':id/pr-network/lookup')
-  @Roles('venue', 'admin')
-  lookupPrNetworkUser(
+  @Roles('venue', 'admin', 'organization')
+  async lookupPrNetworkUser(
     @Param('id') id: string,
     @Query('identifier') identifier: string,
     @CurrentUser() user?: RequestUser,
   ) {
-    if (String(user?.role || '').toLowerCase() === 'venue') {
+    const role = String(user?.role || '').toLowerCase();
+    if (role === 'venue') {
       if (!user?.venue_id || user.venue_id !== id) {
         throw new ForbiddenException('Forbidden');
       }
+    } else if (role === 'organization') {
+      // An organization invites PRs at any of its own linked venues (see
+      // OrganizationPrScreen) - not just a venue it owns directly, so the check is against
+      // the org<->venue link rather than a single venue_id match.
+      if (!user?.organization_id) {
+        throw new ForbiddenException('Missing organization_id');
+      }
+      await this.venuesService.assertOrganizationLinkedToVenue(
+        user.organization_id,
+        id,
+      );
     }
     return this.venuesService.lookupUserForPrInvite(identifier);
   }
