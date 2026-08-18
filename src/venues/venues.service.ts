@@ -196,6 +196,10 @@ type PrSeasonPassAppleDownloadRow = {
   user_email: string;
   membership_role: PrNetworkRoleDb;
   membership_is_active: boolean;
+  wallet_logo_path: string | null;
+  wallet_background_color: string | null;
+  wallet_foreground_color: string | null;
+  wallet_label_color: string | null;
 };
 
 @Injectable()
@@ -384,10 +388,22 @@ export class VenuesService {
     };
   }
 
-  private buildPrSeasonPassApplePkpass(
+  private async buildPrSeasonPassApplePkpass(
     row: PrSeasonPassAppleDownloadRow,
-  ): Buffer {
+  ): Promise<Buffer> {
     const config = this.getAppleWalletPasskitConfig();
+
+    // Fase 7 "tessere custom": per-venue branding, additive over the hardcoded defaults
+    // below - a venue with no venue_wallet_templates row (the common case today) gets
+    // exactly the same pass it always did. Google Wallet has no equivalent (no real API
+    // integration exists, see the Organizations/Fase 7 audit).
+    const logoBuffer = row.wallet_logo_path
+      ? ((await this.storage.downloadPublicImageBuffer(row.wallet_logo_path)) ??
+        this.minimalPassPngBuffer)
+      : this.minimalPassPngBuffer;
+    const backgroundColor = row.wallet_background_color || 'rgb(18, 20, 25)';
+    const foregroundColor = row.wallet_foreground_color || 'rgb(245, 247, 251)';
+    const labelColor = row.wallet_label_color || 'rgb(216, 179, 106)';
 
     const holderName = row.user_name || row.user_username || row.user_email;
     const qrPayload = JSON.stringify(
@@ -410,9 +426,9 @@ export class VenuesService {
       passTypeIdentifier: config.passTypeIdentifier,
       teamIdentifier: config.teamIdentifier,
       logoText: config.logoText,
-      backgroundColor: 'rgb(18, 20, 25)',
-      foregroundColor: 'rgb(245, 247, 251)',
-      labelColor: 'rgb(216, 179, 106)',
+      backgroundColor,
+      foregroundColor,
+      labelColor,
       expirationDate: row.valid_until.toISOString(),
       sharingProhibited: false,
       generic: {
@@ -464,12 +480,15 @@ export class VenuesService {
 
     const pass = new PKPass(
       {
+        // icon.* stays the minimal placeholder regardless of branding: Apple requires it at
+        // a specific small square size (~29pt) and this doesn't resize uploaded assets - only
+        // logo.* (more forgiving on aspect/size) uses the venue's uploaded logo, if any.
         'icon.png': this.minimalPassPngBuffer,
         'icon@2x.png': this.minimalPassPngBuffer,
         'icon@3x.png': this.minimalPassPngBuffer,
-        'logo.png': this.minimalPassPngBuffer,
-        'logo@2x.png': this.minimalPassPngBuffer,
-        'logo@3x.png': this.minimalPassPngBuffer,
+        'logo.png': logoBuffer,
+        'logo@2x.png': logoBuffer,
+        'logo@3x.png': logoBuffer,
         'pass.json': Buffer.from(JSON.stringify(passJson)),
       },
       {
@@ -1762,6 +1781,98 @@ export class VenuesService {
     });
   }
 
+  // Per-venue PR season pass branding (Fase 7 "tessere custom" - Apple Wallet only; Google
+  // Wallet still has no real integration, see buildPrSeasonPassApplePkpass). A venue without
+  // a row here just gets the existing hardcoded dark/gold defaults - this is additive.
+  async getVenueWalletTemplate(venueId: string) {
+    await this.getVenue(venueId);
+    return this.prisma.venue_wallet_templates.findUnique({
+      where: { venue_id: venueId },
+    });
+  }
+
+  async updateVenueWalletTemplate(
+    venueId: string,
+    dto: {
+      background_color?: string | null;
+      foreground_color?: string | null;
+      label_color?: string | null;
+    },
+  ) {
+    await this.getVenue(venueId);
+    return this.prisma.venue_wallet_templates.upsert({
+      where: { venue_id: venueId },
+      create: {
+        venue_id: venueId,
+        background_color: dto.background_color ?? null,
+        foreground_color: dto.foreground_color ?? null,
+        label_color: dto.label_color ?? null,
+      },
+      update: {
+        background_color:
+          dto.background_color === undefined ? undefined : dto.background_color,
+        foreground_color:
+          dto.foreground_color === undefined ? undefined : dto.foreground_color,
+        label_color:
+          dto.label_color === undefined ? undefined : dto.label_color,
+      },
+    });
+  }
+
+  // Mirrors uploadVenueImage/updateVenueImage's two-step pattern (upload the file, then
+  // persist the returned path) - kept as two steps for the same reason: the caller can show
+  // a preview before committing, and a failed persist doesn't leave a half-updated record.
+  async uploadVenueWalletLogo(file?: {
+    buffer: Buffer;
+    mimetype: string;
+    originalname: string;
+  }) {
+    if (!file) throw new BadRequestException('file is required');
+    if (!file.mimetype?.startsWith('image/')) {
+      throw new BadRequestException('file must be an image');
+    }
+
+    const ext = (() => {
+      const match = /\.(png|jpe?g|webp)$/i.exec(file.originalname || '');
+      if (match) return match[1].toLowerCase();
+      if (file.mimetype === 'image/png') return 'png';
+      if (file.mimetype === 'image/webp') return 'webp';
+      return 'jpg';
+    })();
+
+    const { pathPromise } = this.storage.uploadPublicImageFromBuffer({
+      prefix: 'venue-wallet-logos',
+      buffer: file.buffer,
+      contentType: file.mimetype,
+      ext,
+    });
+
+    const path = await pathPromise;
+    return { path };
+  }
+
+  async setVenueWalletLogo(venueId: string, logoPath: string | null) {
+    await this.getVenue(venueId);
+    const existing = await this.prisma.venue_wallet_templates.findUnique({
+      where: { venue_id: venueId },
+      select: { logo_path: true },
+    });
+
+    const updated = await this.prisma.venue_wallet_templates.upsert({
+      where: { venue_id: venueId },
+      create: { venue_id: venueId, logo_path: logoPath },
+      update: { logo_path: logoPath },
+    });
+
+    if (existing?.logo_path && existing.logo_path !== logoPath) {
+      void this.storage
+        .deletePublicImage(existing.logo_path)
+        .catch(() => undefined);
+    }
+
+    return updated;
+  }
+
   async deleteVenue(id: string, adminId: string): Promise<venues> {
     const venue = await this.getVenue(id);
     const deleted = await this.prisma.venues.delete({ where: { id } });
@@ -2972,11 +3083,16 @@ export class VenuesService {
         u.username AS user_username,
         u.email AS user_email,
         m.role::text AS membership_role,
-        m.is_active AS membership_is_active
+        m.is_active AS membership_is_active,
+        wt.logo_path AS wallet_logo_path,
+        wt.background_color AS wallet_background_color,
+        wt.foreground_color AS wallet_foreground_color,
+        wt.label_color AS wallet_label_color
       FROM venue_pr_membership_passes p
       JOIN venue_pr_memberships m ON m.id = p.pr_membership_id
       JOIN venues v ON v.id = p.venue_id
       JOIN users u ON u.id = p.user_id
+      LEFT JOIN venue_wallet_templates wt ON wt.venue_id = p.venue_id
       WHERE p.id = ${normalizedPassId}::uuid
         AND p.qr_token = ${normalizedToken}
       LIMIT 1
@@ -2999,7 +3115,7 @@ export class VenuesService {
       throw new ForbiddenException('Pass is not active');
     }
 
-    const buffer = this.buildPrSeasonPassApplePkpass(row);
+    const buffer = await this.buildPrSeasonPassApplePkpass(row);
     const safeSerial = row.serial_number
       .toLowerCase()
       .replace(/[^a-z0-9._-]+/g, '-');

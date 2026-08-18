@@ -22,6 +22,7 @@ import { RequireVenueOwnership } from '../common/guards/venue-ownership.guard';
 import { CreateVenueDto } from './dto/create-venue.dto';
 import { CreateVenueStationsBulkDto } from './dto/create-venue-stations-bulk.dto';
 import { UpdateVenueImageDto } from './dto/update-venue-image.dto';
+import { UpdateVenueWalletTemplateDto } from './dto/update-venue-wallet-template.dto';
 import { UpdateVenueDto } from './dto/update-venue.dto';
 import { UpdateVenuePricingDto } from './dto/update-venue-pricing.dto';
 import { CreateVenueTablesBulkDto } from './dto/create-venue-tables-bulk.dto';
@@ -142,6 +143,46 @@ export class VenuesController {
     }
 
     return this.venuesService.uploadVenueImage(file);
+  }
+
+  // Fase 7 "tessere custom": per-venue PR season pass branding. Uses RequireVenueOwnership
+  // (the new reusable guard) rather than the inline if/throw the endpoints above still use -
+  // new code should prefer it over copying that pattern further.
+  @Get(':id/wallet-template')
+  @Roles('venue', 'admin')
+  @RequireVenueOwnership()
+  getWalletTemplate(@Param('id') id: string) {
+    return this.venuesService.getVenueWalletTemplate(id);
+  }
+
+  @Patch(':id/wallet-template')
+  @Roles('venue', 'admin')
+  @RequireVenueOwnership()
+  updateWalletTemplate(
+    @Param('id') id: string,
+    @Body() body: UpdateVenueWalletTemplateDto,
+  ) {
+    return this.venuesService.updateVenueWalletTemplate(id, body);
+  }
+
+  @Post(':id/wallet-template/logo')
+  @Roles('venue', 'admin')
+  @RequireVenueOwnership()
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadWalletLogo(
+    @Param('id') id: string,
+    @UploadedFile()
+    file?: { buffer: Buffer; mimetype: string; originalname: string },
+  ) {
+    const { path } = await this.venuesService.uploadVenueWalletLogo(file);
+    return this.venuesService.setVenueWalletLogo(id, path);
+  }
+
+  @Delete(':id/wallet-template/logo')
+  @Roles('venue', 'admin')
+  @RequireVenueOwnership()
+  deleteWalletLogo(@Param('id') id: string) {
+    return this.venuesService.setVenueWalletLogo(id, null);
   }
 
   @Post(':id/image/signed')

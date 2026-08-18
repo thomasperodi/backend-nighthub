@@ -2,7 +2,7 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { createClient } from '@supabase/supabase-js';
 import { randomUUID } from 'crypto';
 
-type PublicImagePrefix = 'events' | 'users' | 'venues';
+type PublicImagePrefix = 'events' | 'users' | 'venues' | 'venue-wallet-logos';
 
 @Injectable()
 export class SupabaseStorageService {
@@ -179,6 +179,35 @@ export class SupabaseStorageService {
 
     if (error && !/not found/i.test(error.message || '')) {
       throw new BadRequestException(`Failed to delete image: ${error.message}`);
+    }
+  }
+
+  // Used to embed an uploaded image directly into a generated file (e.g. a PR season pass
+  // .pkpass's logo) - downloads through the Supabase client rather than fetching the public
+  // URL over HTTP, so it works even if the bucket isn't public and avoids an extra network
+  // hop through the CDN. Returns null (rather than throwing) on any failure - callers should
+  // fall back to a default asset instead of failing the whole operation over a missing/
+  // corrupt logo.
+  async downloadPublicImageBuffer(
+    path?: string | null,
+  ): Promise<Buffer | null> {
+    const normalizedPath = String(path || '')
+      .trim()
+      .replace(/^\/+/, '');
+    if (!normalizedPath || /^(https?:)?\/\//i.test(normalizedPath)) {
+      return null;
+    }
+
+    try {
+      const client = this.ensureClient();
+      const { data, error } = await client.storage
+        .from(this.bucketPublic)
+        .download(normalizedPath);
+      if (error || !data) return null;
+      const arrayBuffer = await data.arrayBuffer();
+      return Buffer.from(arrayBuffer);
+    } catch {
+      return null;
     }
   }
 

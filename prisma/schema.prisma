@@ -422,6 +422,7 @@ model venues {
   group_table_proposals    group_table_proposals[]
   plan                     subscription_plans?              @relation(fields: [plan_id], references: [id], onDelete: SetNull)
   organization_links       organization_venue_links[]
+  wallet_template          venue_wallet_templates?
 
   @@index([plan_id])
 }
@@ -637,6 +638,26 @@ model venue_table_zones {
   @@unique([venue_id, name])
   @@index([venue_id, sort_order])
   @@index([venue_id, is_active])
+}
+
+// Per-venue branding for the PR season pass (Apple Wallet, see buildPrSeasonPassApplePkpass).
+// Optional 1:1 with venues - a venue without a row here just gets the existing hardcoded
+// dark/gold defaults, so this is additive and doesn't change behavior for venues that never
+// set one. Colors are stored as Apple's `rgb(r, g, b)` string format directly (what PassKit
+// expects), not hex, to avoid a conversion step at pass-build time.
+model venue_wallet_templates {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venue_id         String   @unique @db.Uuid
+  logo_path        String?
+  background_color String?
+  foreground_color String?
+  label_color      String?
+  created_at       DateTime @default(now())
+  updated_at       DateTime @updatedAt
+
+  venue venues @relation(fields: [venue_id], references: [id], onDelete: Cascade)
+
+  @@index([venue_id])
 }
 
 model venue_floor_plans {
