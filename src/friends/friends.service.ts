@@ -950,6 +950,7 @@ export class FriendsService {
         ...friend,
         event_id: reservation.event.id,
         event_name: reservation.event.name,
+        event_date: reservation.event.date,
         venue_id: reservation.event.venue.id,
         venue_name: reservation.event.venue.name,
       };
