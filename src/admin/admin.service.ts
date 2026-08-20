@@ -20,6 +20,11 @@ import { AssignVenuePlanDto } from './dto/assign-venue-plan.dto';
 import { TtlCache } from '../common/ttl-cache';
 import { geocodeAddress } from '../common/geocoding';
 import { AuditLogService } from '../common/audit/audit-log.service';
+import {
+  resolvePlanTerms as resolvePlanTermsShared,
+  computeOverage as computeOverageShared,
+  type PlanCustomTerms,
+} from '../common/billing/plan-usage.util';
 
 type RevenuePoint = { label: string; value: number };
 
@@ -1660,6 +1665,8 @@ export class AdminService {
   // Merges a plan's own price/quotas with a venue's negotiated overrides (if any) - an
   // override wins field-by-field when present. For a custom plan (is_custom, no defaults
   // of its own) every field effectively comes from the override.
+  // Delegates to the shared util (also used by OrganizationsService.getUsage) - kept as a
+  // method here since call sites in this file reference `this.resolvePlanTerms`.
   private resolvePlanTerms(
     plan: {
       monthly_price: unknown;
@@ -1670,36 +1677,11 @@ export class AdminService {
     } | null,
     customTerms: ReturnType<AdminService['parseCustomTerms']>,
   ) {
-    const monthlyPrice =
-      customTerms?.monthly_price ??
-      (plan?.monthly_price == null ? null : this.toNumber(plan.monthly_price));
-    const includedEvents =
-      customTerms?.included_events ?? plan?.included_events ?? null;
-    const includedPeople =
-      customTerms?.included_people ?? plan?.included_people ?? null;
-    const extraEventPrice =
-      customTerms?.extra_event_price ??
-      (plan?.extra_event_price == null
-        ? 0
-        : this.toNumber(plan.extra_event_price));
-    const extraPersonPrice =
-      customTerms?.extra_person_price ??
-      (plan?.extra_person_price == null
-        ? 0
-        : this.toNumber(plan.extra_person_price));
-
-    return {
-      monthlyPrice,
-      includedEvents,
-      includedPeople,
-      extraEventPrice,
-      extraPersonPrice,
-    };
+    return resolvePlanTermsShared(plan, customTerms as PlanCustomTerms);
   }
 
-  // Shared by getVenues() (per-venue billing detail) and getDashboardUncached()
-  // (platform-wide overage total). `null` includedEvents/includedPeople means nothing to
-  // meter (no plan assigned, or a custom/Elite plan with no quota set) - no overage.
+  // Delegates to the shared util (also used by OrganizationsService.getUsage) - kept as a
+  // method here since call sites in this file reference `this.computeOverage`.
   private computeOverage(
     terms: {
       includedEvents: number | null;
@@ -1710,29 +1692,7 @@ export class AdminService {
     eventsCount: number,
     peopleCount: number,
   ) {
-    const extraEventsCount =
-      terms.includedEvents == null
-        ? 0
-        : Math.max(0, eventsCount - terms.includedEvents);
-    const extraPeopleCount =
-      terms.includedPeople == null
-        ? 0
-        : Math.max(0, peopleCount - terms.includedPeople);
-
-    const extraEventsCost =
-      Math.round(extraEventsCount * terms.extraEventPrice * 100) / 100;
-    const extraPeopleCost =
-      Math.round(extraPeopleCount * terms.extraPersonPrice * 100) / 100;
-
-    return {
-      includedEvents: terms.includedEvents,
-      includedPeople: terms.includedPeople,
-      extraEventsCount,
-      extraPeopleCount,
-      extraEventsCost,
-      extraPeopleCost,
-      overageCost: Math.round((extraEventsCost + extraPeopleCost) * 100) / 100,
-    };
+    return computeOverageShared(terms, eventsCount, peopleCount);
   }
 
   private serializePlan(plan: {

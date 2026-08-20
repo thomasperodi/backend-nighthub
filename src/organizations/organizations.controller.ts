@@ -106,6 +106,19 @@ export class OrganizationsController {
     return this.organizationsService.listPrNetwork(id);
   }
 
+  // Resolves an id/email/username into a user before inviting them - org-scoped counterpart
+  // to GET /venues/:id/pr-network/lookup, needed since an org invite no longer has a venue in
+  // the URL (see CreateOrganizationPrMemberDto).
+  @Get(':id/pr-network/lookup')
+  @Roles('admin', 'organization')
+  @RequireOrganizationOwnership()
+  lookupPrInviteUser(
+    @Param('id') id: string,
+    @Query('identifier') identifier: string,
+  ) {
+    return this.organizationsService.lookupPrInviteUser(identifier);
+  }
+
   @Post(':id/pr-network')
   @Roles('admin', 'organization')
   @RequireOrganizationOwnership()
@@ -146,5 +159,12 @@ export class OrganizationsController {
   @RequireOrganizationOwnership()
   getStats(@Param('id') id: string, @Query('venue_id') venueId?: string) {
     return this.organizationsService.getStats(id, venueId);
+  }
+
+  @Get(':id/usage')
+  @Roles('admin', 'organization')
+  @RequireOrganizationOwnership()
+  getUsage(@Param('id') id: string) {
+    return this.organizationsService.getUsage(id);
   }
 }

@@ -113,11 +113,23 @@ export class AuthService {
   ): Promise<{ role: string; pr_venue_id: string | null }> {
     const activeMembership = await this.prisma.venue_pr_memberships.findFirst({
       where: { user_id: userId, is_active: true },
-      select: { venue_id: true },
+      select: { venue_id: true, organization_id: true },
     });
 
     if (!activeMembership) {
       return { role: baseRole, pr_venue_id: null };
+    }
+
+    // An org-owned membership has no venue_id of its own (it works every venue the
+    // organization is linked to) - fall back to one of those venues as a representative
+    // default landing venue, same as UsersService.findActivePrMembership.
+    if (!activeMembership.venue_id && activeMembership.organization_id) {
+      const link = await this.prisma.organization_venue_links.findFirst({
+        where: { organization_id: activeMembership.organization_id },
+        orderBy: { created_at: 'asc' },
+        select: { venue_id: true },
+      });
+      return { role: 'pr', pr_venue_id: link?.venue_id ?? null };
     }
 
     return { role: 'pr', pr_venue_id: activeMembership.venue_id };

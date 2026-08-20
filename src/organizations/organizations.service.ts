@@ -9,6 +9,12 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogService } from '../common/audit/audit-log.service';
 import { VenuesService } from '../venues/venues.service';
+import {
+  resolvePlanTerms,
+  computeOverage,
+  startOfMonth,
+  nextMonth,
+} from '../common/billing/plan-usage.util';
 import type { RequestUser } from '../auth/types';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
@@ -62,6 +68,7 @@ export class OrganizationsService {
       include: {
         _count: { select: { venue_links: true, pr_memberships: true } },
         plan: { select: { id: true, key: true, name: true, icon: true } },
+        owners: { select: { id: true, name: true, username: true, email: true } },
       },
     });
   }
@@ -74,6 +81,7 @@ export class OrganizationsService {
           include: { venue: { select: { id: true, name: true, city: true } } },
         },
         plan: { select: { id: true, key: true, name: true, icon: true } },
+        owners: { select: { id: true, name: true, username: true, email: true } },
       },
     });
     if (!organization) throw new NotFoundException('Organization not found');
@@ -227,10 +235,10 @@ export class OrganizationsService {
     return link;
   }
 
-  // Unlinking cascades to deactivating (never deleting - confirmed business rule) any PR
-  // memberships this organization held at that venue: a PR is scoped through the venue link,
-  // so losing the link means losing that venue too, for now (see venue_pr_memberships.
-  // organization_id's doc comment).
+  // A PR's membership is no longer scoped through a single venue link (see
+  // venue_pr_memberships.organization_id's doc comment) - it covers every venue the
+  // organization is linked to, so unlinking one venue no longer deactivates the organization's
+  // PR memberships; they simply stop covering this venue and keep working the others.
   async unlinkVenue(
     organizationId: string,
     venueId: string,
@@ -248,17 +256,9 @@ export class OrganizationsService {
     });
     if (!link) throw new NotFoundException('Link not found');
 
-    await this.prisma.$transaction([
-      this.prisma.organization_venue_links.delete({ where: { id: link.id } }),
-      this.prisma.venue_pr_memberships.updateMany({
-        where: {
-          organization_id: organizationId,
-          venue_id: venueId,
-          is_active: true,
-        },
-        data: { is_active: false },
-      }),
-    ]);
+    await this.prisma.organization_venue_links.delete({
+      where: { id: link.id },
+    });
 
     if (actor?.id) {
       this.auditLog.record({
@@ -300,16 +300,25 @@ export class OrganizationsService {
   /** PR members working for this organization, across every venue it's linked to — org-self
    * or admin. This is the org-side counterpart to VenuesService.listVenuePrNetworkMembers,
    * which is scoped to one venue; this one intentionally spans all of them (confirmed
-   * business rule: the organization sees its own PRs across every venue it works). */
+   * business rule: the organization sees its own PRs across every venue it works). Each PR
+   * is now a single row (not one per venue - see venue_pr_memberships.organization_id's doc
+   * comment), tagged with the full list of venues it currently covers. */
   async listPrNetwork(organizationId: string) {
-    const memberships = await this.prisma.venue_pr_memberships.findMany({
-      where: { organization_id: organizationId },
-      include: {
-        user: { select: { id: true, name: true, username: true, email: true } },
-        venue: { select: { id: true, name: true, city: true } },
-      },
-      orderBy: [{ venue: { name: 'asc' } }, { created_at: 'asc' }],
-    });
+    const [memberships, venueLinks] = await Promise.all([
+      this.prisma.venue_pr_memberships.findMany({
+        where: { organization_id: organizationId },
+        include: {
+          user: { select: { id: true, name: true, username: true, email: true } },
+        },
+        orderBy: { created_at: 'asc' },
+      }),
+      this.prisma.organization_venue_links.findMany({
+        where: { organization_id: organizationId },
+        include: { venue: { select: { id: true, name: true, city: true } } },
+      }),
+    ]);
+
+    const venues = venueLinks.map((link) => link.venue);
 
     return memberships.map((m) => ({
       id: m.id,
@@ -317,7 +326,7 @@ export class OrganizationsService {
       parent_membership_id: m.parent_membership_id,
       is_active: m.is_active,
       ref_code: m.ref_code,
-      venue: m.venue,
+      venues,
       user: m.user,
       display_name: m.user.name || m.user.username || m.user.email,
       created_at: m.created_at,
@@ -329,16 +338,25 @@ export class OrganizationsService {
    * that already exist (qr scans, attributed door entries) rather than a new
    * analytics/snapshot pipeline - refine once real KPI requirements are defined. */
   async getStats(organizationId: string, venueId?: string) {
-    const membershipWhere = {
-      organization_id: organizationId,
-      ...(venueId ? { venue_id: venueId } : {}),
-    };
-
-    const memberships = await this.prisma.venue_pr_memberships.findMany({
-      where: membershipWhere,
-      select: { id: true, is_active: true, venue_id: true },
-    });
+    // Every PR membership now covers every venue the organization is linked to (no venue_id
+    // of its own - see venue_pr_memberships.organization_id's doc comment), so the
+    // membership set itself no longer needs (or can be) filtered by venue; only the
+    // scan/entry counts below are venue-scoped.
+    const [memberships, venueLinks] = await Promise.all([
+      this.prisma.venue_pr_memberships.findMany({
+        where: { organization_id: organizationId },
+        select: { id: true, is_active: true },
+      }),
+      this.prisma.organization_venue_links.findMany({
+        where: {
+          organization_id: organizationId,
+          ...(venueId ? { venue_id: venueId } : {}),
+        },
+        include: { venue: { select: { id: true, name: true, city: true } } },
+      }),
+    ]);
     const membershipIds = memberships.map((m) => m.id);
+    const activePrCount = memberships.filter((m) => m.is_active).length;
 
     if (membershipIds.length === 0) {
       return {
@@ -346,67 +364,57 @@ export class OrganizationsService {
         total_pr_count: 0,
         total_scans: 0,
         total_attributed_entries: 0,
-        by_venue: [],
+        by_venue: venueLinks.map((link) => ({
+          venue: link.venue,
+          active_pr_count: 0,
+          total_scans: 0,
+          total_attributed_entries: 0,
+        })),
       };
     }
 
-    // `entries` has no venue_id column of its own (only event_id) - unlike qr_scans, which
-    // does carry venue_id directly. Since every PR membership is already scoped to exactly
-    // one venue, entry counts are aggregated by membership here and then mapped to a venue
-    // via the memberships list, instead of a (non-existent) groupBy on entries.venue_id.
-    const [scanCount, entryCount, scansByVenue, entriesByMembership] =
+    const scanScope = venueId ? { venue_id: venueId } : {};
+    // `entries` has no venue_id column of its own (only event_id), so its venue is resolved
+    // through the event it belongs to.
+    const [scanCount, entryCount, scansByVenue, entryRows] =
       await Promise.all([
         this.prisma.venue_pr_qr_scans.count({
-          where: { pr_membership_id: { in: membershipIds } },
+          where: { pr_membership_id: { in: membershipIds }, ...scanScope },
         }),
         this.prisma.entries.count({
-          where: { pr_membership_id: { in: membershipIds } },
+          where: {
+            pr_membership_id: { in: membershipIds },
+            ...(venueId ? { event: { venue_id: venueId } } : {}),
+          },
         }),
         this.prisma.venue_pr_qr_scans.groupBy({
           by: ['venue_id'],
-          where: { pr_membership_id: { in: membershipIds } },
+          where: { pr_membership_id: { in: membershipIds }, ...scanScope },
           _count: { _all: true },
         }),
-        this.prisma.entries.groupBy({
-          by: ['pr_membership_id'],
+        this.prisma.entries.findMany({
           where: { pr_membership_id: { in: membershipIds } },
-          _count: { _all: true },
+          select: { event: { select: { venue_id: true } } },
         }),
       ]);
 
-    const venueIdByMembershipId = new Map(
-      memberships.map((m) => [m.id, m.venue_id]),
-    );
     const entryCountByVenue = new Map<string, number>();
-    for (const row of entriesByMembership) {
-      const venueId = row.pr_membership_id
-        ? venueIdByMembershipId.get(row.pr_membership_id)
-        : undefined;
-      if (!venueId) continue;
-      entryCountByVenue.set(
-        venueId,
-        (entryCountByVenue.get(venueId) ?? 0) + row._count._all,
-      );
+    for (const row of entryRows) {
+      const vId = row.event.venue_id;
+      entryCountByVenue.set(vId, (entryCountByVenue.get(vId) ?? 0) + 1);
     }
 
-    const venueIds = [...new Set(memberships.map((m) => m.venue_id))];
-    const venues = await this.prisma.venues.findMany({
-      where: { id: { in: venueIds } },
-      select: { id: true, name: true, city: true },
-    });
-
-    const byVenue = venues.map((venue) => ({
-      venue,
-      active_pr_count: memberships.filter(
-        (m) => m.venue_id === venue.id && m.is_active,
-      ).length,
+    const byVenue = venueLinks.map((link) => ({
+      venue: link.venue,
+      active_pr_count: activePrCount,
       total_scans:
-        scansByVenue.find((s) => s.venue_id === venue.id)?._count._all ?? 0,
-      total_attributed_entries: entryCountByVenue.get(venue.id) ?? 0,
+        scansByVenue.find((s) => s.venue_id === link.venue.id)?._count
+          ._all ?? 0,
+      total_attributed_entries: entryCountByVenue.get(link.venue.id) ?? 0,
     }));
 
     return {
-      active_pr_count: memberships.filter((m) => m.is_active).length,
+      active_pr_count: activePrCount,
       total_pr_count: memberships.length,
       total_scans: scanCount,
       total_attributed_entries: entryCount,
@@ -436,10 +444,13 @@ export class OrganizationsService {
 
   // getStats requires org-actor-based authorization; this venue-facing variant already did
   // its own authorization above (venue ownership, not org ownership), so it computes the
-  // same aggregate directly instead of routing through getStats's org access check.
+  // same aggregate directly instead of routing through getStats's org access check. Since
+  // every org PR membership now covers every linked venue (no venue_id of its own), "the
+  // org's PR memberships at this venue" is just all of them, given the caller already
+  // verified the org-venue link.
   private async getStatsUnscoped(organizationId: string, venueId: string) {
     const memberships = await this.prisma.venue_pr_memberships.findMany({
-      where: { organization_id: organizationId, venue_id: venueId },
+      where: { organization_id: organizationId },
       select: { id: true, is_active: true },
     });
     const membershipIds = memberships.map((m) => m.id);
@@ -453,10 +464,13 @@ export class OrganizationsService {
     }
     const [totalScans, totalEntries] = await Promise.all([
       this.prisma.venue_pr_qr_scans.count({
-        where: { pr_membership_id: { in: membershipIds } },
+        where: { pr_membership_id: { in: membershipIds }, venue_id: venueId },
       }),
       this.prisma.entries.count({
-        where: { pr_membership_id: { in: membershipIds } },
+        where: {
+          pr_membership_id: { in: membershipIds },
+          event: { venue_id: venueId },
+        },
       }),
     ]);
     return {
@@ -477,16 +491,20 @@ export class OrganizationsService {
     organizationId: string,
     dto: CreateOrganizationPrMemberDto,
   ) {
-    return this.venuesService.createOrganizationPrMember(
-      dto.venue_id,
-      organizationId,
-      {
-        user_id: dto.user_id,
-        role: dto.role,
-        parent_membership_id: dto.parent_membership_id,
-        ref_code: dto.ref_code,
-      },
-    );
+    return this.venuesService.createOrganizationPrMember(organizationId, {
+      user_id: dto.user_id,
+      role: dto.role,
+      parent_membership_id: dto.parent_membership_id,
+      ref_code: dto.ref_code,
+    });
+  }
+
+  /** Resolves an id/email/username into a user before inviting them to the organization's PR
+   * network - org-scoped counterpart to VenuesService.lookupUserForPrInvite, since an
+   * organization-invited PR isn't tied to any one of the org's venues (see
+   * createOrganizationPrMember). */
+  async lookupPrInviteUser(identifier: string) {
+    return this.venuesService.lookupUserForPrInvite(identifier);
   }
 
   async updatePrMember(
@@ -506,6 +524,106 @@ export class OrganizationsService {
       organizationId,
       memberId,
     );
+  }
+
+  /** This organization's consumption against its subscription plan for the current calendar
+   * month - every non-cancelled event dated this month (`organization_id`, any status:
+   * draft/live/closed), and "clienti analizzati": everyone this org put on a door list
+   * (`entry` reservations) for those same events, whether or not they actually showed up.
+   * Deliberately *not* real check-ins (`venue_stays`) - the plan meters what the attendance
+   * forecast's personal-rate model (AttendanceForecastService) had to process to learn each
+   * person's reliability, and a no-show is exactly as much analysis work as a show. Confirmed
+   * decision 2026-08-20: this quota only applies at the organization level (an organization's
+   * own plan), not to venues still on their own legacy `venues.plan_id`.
+   *
+   * The usage count itself resets every calendar month (a fresh query each time, nothing
+   * persisted) - but the personal reliability data it's built from is never reset by this:
+   * AttendanceForecastService.getPersonalRates keeps looking at a person's full reservation
+   * history regardless of which month "clienti analizzati" happens to be counting right now.
+   * The two are deliberately decoupled - see the doc comment there.
+   *
+   * Reuses the same resolvePlanTerms/computeOverage math AdminService uses for the per-venue
+   * equivalent (getVenues/getDashboardUncached), via the shared billing util. */
+  async getUsage(organizationId: string) {
+    const organization = await this.prisma.organizations.findUnique({
+      where: { id: organizationId },
+      include: {
+        plan: {
+          select: {
+            id: true,
+            key: true,
+            name: true,
+            icon: true,
+            monthly_price: true,
+            included_events: true,
+            included_people: true,
+            extra_event_price: true,
+            extra_person_price: true,
+            is_custom: true,
+          },
+        },
+      },
+    });
+    if (!organization) throw new NotFoundException('Organization not found');
+
+    const now = new Date();
+    const periodStart = startOfMonth(now);
+    const periodEnd = nextMonth(now);
+
+    const [eventsCount, peopleAnalyzed] = await Promise.all([
+      // Every event this organization has on the books this month regardless of where it is
+      // in its lifecycle (draft/live/closed) - a cancelled event doesn't count, since it never
+      // actually consumed anything. Deliberately not restricted to CLOSED-only (that would
+      // undercount: an event created for later this month wouldn't show up until it's over).
+      this.prisma.events.count({
+        where: {
+          organization_id: organizationId,
+          status: { not: 'CANCELLED' },
+          date: { gte: periodStart, lt: periodEnd },
+        },
+      }),
+      // Same event set as eventsCount above (this org's own events, same period) - sum of
+      // door-list guests, cancelled reservations excluded (never actually reached the list).
+      this.prisma.reservations.aggregate({
+        where: {
+          type: 'entry',
+          status: { in: ['confirmed', 'completed'] },
+          event: {
+            organization_id: organizationId,
+            status: { not: 'CANCELLED' },
+            date: { gte: periodStart, lt: periodEnd },
+          },
+        },
+        _sum: { guests: true },
+      }),
+    ]);
+    const peopleCount = peopleAnalyzed._sum.guests ?? 0;
+
+    const terms = resolvePlanTerms(organization.plan, null);
+    const overage = organization.plan
+      ? computeOverage(terms, eventsCount, peopleCount)
+      : null;
+
+    return {
+      plan: organization.plan
+        ? {
+            id: organization.plan.id,
+            key: organization.plan.key,
+            name: organization.plan.name,
+            icon: organization.plan.icon,
+          }
+        : null,
+      period: { start: periodStart, end: periodEnd },
+      events_count: eventsCount,
+      people_count: peopleCount,
+      included_events: overage?.includedEvents ?? null,
+      included_people: overage?.includedPeople ?? null,
+      extra_events_count: overage?.extraEventsCount ?? 0,
+      extra_people_count: overage?.extraPeopleCount ?? 0,
+      extra_events_cost: overage?.extraEventsCost ?? 0,
+      extra_people_cost: overage?.extraPeopleCost ?? 0,
+      overage_cost: overage?.overageCost ?? 0,
+    };
   }
 
   /** Every event this organization has created, across all its linked venues - both

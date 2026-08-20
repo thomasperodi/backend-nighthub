@@ -338,13 +338,27 @@ export class ReservationsService {
       ...(invitedByUserId ? [{ user_id: invitedByUserId }] : []),
     ];
 
+    // A venue-owned membership matches this venue directly; an org-owned membership (no
+    // venue_id of its own - see venue_pr_memberships.organization_id's doc comment) matches
+    // if its organization is linked to this venue.
     const prMembership =
       (referralCode || invitedByUserId) && params.venueId
         ? await this.prisma.venue_pr_memberships.findFirst({
             where: {
-              venue_id: params.venueId,
               is_active: true,
               OR: prMembershipOrFilters,
+              AND: [
+                {
+                  OR: [
+                    { venue_id: params.venueId },
+                    {
+                      organization: {
+                        venue_links: { some: { venue_id: params.venueId } },
+                      },
+                    },
+                  ],
+                },
+              ],
             },
             select: {
               id: true,

@@ -1217,6 +1217,54 @@ export class VenuesService {
     `);
   }
 
+  private async loadOrganizationPrMemberRows(
+    organizationId: string,
+  ): Promise<PrMemberListRow[]> {
+    return this.prisma.$queryRaw<PrMemberListRow[]>(Prisma.sql`
+      SELECT
+        m.id,
+        m.venue_id,
+        m.user_id,
+        m.role::text AS role,
+        m.parent_membership_id,
+        m.ref_code,
+        m.is_active,
+        m.created_by_user_id,
+        m.created_at,
+        m.updated_at,
+        m.organization_id,
+        u.name AS user_name,
+        u.username AS user_username,
+        u.email AS user_email,
+        u.role::text AS user_role,
+        o.name AS organization_name
+      FROM venue_pr_memberships m
+      JOIN users u ON u.id = m.user_id
+      LEFT JOIN organizations o ON o.id = m.organization_id
+      WHERE m.organization_id = ${organizationId}::uuid
+      ORDER BY
+        CASE m.role
+          WHEN 'responsabile' THEN 0
+          ELSE 1
+        END,
+        COALESCE(u.name, u.username, u.email) ASC
+    `);
+  }
+
+  // Hierarchy/subtree checks (who can this actor manage or scan for) need the actor's full
+  // team: for a venue-owned actor that's every row at this venue; for an org-owned actor
+  // (organization_id set, no venue_id of its own) it's every row in that organization,
+  // regardless of which of the org's linked venues the action is happening at - matching how
+  // updateOrganizationPrMember scopes its own hierarchy checks.
+  private async loadPrHierarchyRowsForActor(
+    venueId: string,
+    actorMembership: PrMembershipRow,
+  ): Promise<PrMemberListRow[]> {
+    return actorMembership.organization_id
+      ? this.loadOrganizationPrMemberRows(actorMembership.organization_id)
+      : this.loadPrMemberRows(venueId);
+  }
+
   private async loadPrMemberRowById(
     venueId: string,
     memberId: string,
@@ -1249,29 +1297,87 @@ export class VenuesService {
     return rows[0] ?? null;
   }
 
+  // Org-owned rows have no venue_id - see loadPrMembershipByIdGlobal's doc comment.
+  private async loadPrMemberRowByIdGlobal(
+    memberId: string,
+  ): Promise<PrMemberListRow | null> {
+    const rows = await this.prisma.$queryRaw<PrMemberListRow[]>(Prisma.sql`
+      SELECT
+        m.id,
+        m.venue_id,
+        m.user_id,
+        m.role::text AS role,
+        m.parent_membership_id,
+        m.ref_code,
+        m.is_active,
+        m.created_by_user_id,
+        m.created_at,
+        m.updated_at,
+        m.organization_id,
+        u.name AS user_name,
+        u.username AS user_username,
+        u.email AS user_email,
+        u.role::text AS user_role,
+        o.name AS organization_name
+      FROM venue_pr_memberships m
+      JOIN users u ON u.id = m.user_id
+      LEFT JOIN organizations o ON o.id = m.organization_id
+      WHERE m.id = ${memberId}::uuid
+      LIMIT 1
+    `);
+    return rows[0] ?? null;
+  }
+
+  // Resolves this user's PR membership at this venue - either a venue-owned row (venue_id
+  // matches directly) or an org-owned row whose organization is linked to this venue
+  // (org-owned rows have no venue_id of their own, see venue_pr_memberships.organization_id's
+  // doc comment). This is what lets a PR invited by an organization access every venue it's
+  // linked to, not just one.
   private async loadPrMembershipByUser(
     venueId: string,
     userId: string,
   ): Promise<PrMembershipRow | null> {
     const rows = await this.prisma.$queryRaw<PrMembershipRow[]>(Prisma.sql`
       SELECT
-        id,
-        venue_id,
-        user_id,
-        role::text AS role,
-        parent_membership_id,
-        ref_code,
-        is_active,
-        created_by_user_id,
-        created_at,
-        updated_at,
-        organization_id
-      FROM venue_pr_memberships
-      WHERE venue_id = ${venueId}::uuid
-        AND user_id = ${userId}::uuid
+        m.id,
+        m.venue_id,
+        m.user_id,
+        m.role::text AS role,
+        m.parent_membership_id,
+        m.ref_code,
+        m.is_active,
+        m.created_by_user_id,
+        m.created_at,
+        m.updated_at,
+        m.organization_id
+      FROM venue_pr_memberships m
+      WHERE m.venue_id = ${venueId}::uuid
+        AND m.user_id = ${userId}::uuid
       LIMIT 1
     `);
-    return rows[0] ?? null;
+    if (rows[0]) return rows[0];
+
+    const orgRows = await this.prisma.$queryRaw<PrMembershipRow[]>(Prisma.sql`
+      SELECT
+        m.id,
+        m.venue_id,
+        m.user_id,
+        m.role::text AS role,
+        m.parent_membership_id,
+        m.ref_code,
+        m.is_active,
+        m.created_by_user_id,
+        m.created_at,
+        m.updated_at,
+        m.organization_id
+      FROM venue_pr_memberships m
+      JOIN organization_venue_links l
+        ON l.organization_id = m.organization_id AND l.venue_id = ${venueId}::uuid
+      WHERE m.user_id = ${userId}::uuid
+        AND m.organization_id IS NOT NULL
+      LIMIT 1
+    `);
+    return orgRows[0] ?? null;
   }
 
   private async loadPrMembershipById(
@@ -1294,6 +1400,32 @@ export class VenuesService {
       FROM venue_pr_memberships
       WHERE venue_id = ${venueId}::uuid
         AND id = ${memberId}::uuid
+      LIMIT 1
+    `);
+    return rows[0] ?? null;
+  }
+
+  // Org-owned rows have no venue_id (they cover every venue the organization is linked to -
+  // see venue_pr_memberships.organization_id's doc comment), so organization-scoped call
+  // sites resolve by id/ref_code alone instead of the venue-scoped loaders above.
+  private async loadPrMembershipByIdGlobal(
+    memberId: string,
+  ): Promise<PrMembershipRow | null> {
+    const rows = await this.prisma.$queryRaw<PrMembershipRow[]>(Prisma.sql`
+      SELECT
+        id,
+        venue_id,
+        user_id,
+        role::text AS role,
+        parent_membership_id,
+        ref_code,
+        is_active,
+        created_by_user_id,
+        created_at,
+        updated_at,
+        organization_id
+      FROM venue_pr_memberships
+      WHERE id = ${memberId}::uuid
       LIMIT 1
     `);
     return rows[0] ?? null;
@@ -1332,8 +1464,10 @@ export class VenuesService {
     }
   }
 
+  // ref_code is globally unique now (not venue-scoped), so lookup no longer needs a venue_id
+  // filter - the caller checks scope (venue match, or organization linked to the scanning
+  // venue) afterward. See resolveScannablePrMembership.
   private async loadPrMembershipByRefCode(
-    venueId: string,
     refCode: string,
   ): Promise<PrMembershipRow | null> {
     const rows = await this.prisma.$queryRaw<PrMembershipRow[]>(Prisma.sql`
@@ -1347,13 +1481,48 @@ export class VenuesService {
         is_active,
         created_by_user_id,
         created_at,
-        updated_at
+        updated_at,
+        organization_id
       FROM venue_pr_memberships
-      WHERE venue_id = ${venueId}::uuid
-        AND upper(ref_code) = upper(${refCode})
+      WHERE upper(ref_code) = upper(${refCode})
       LIMIT 1
     `);
     return rows[0] ?? null;
+  }
+
+  // Resolves a PR membership for a QR scan at a specific venue/event, regardless of whether
+  // it's a venue-owned row (venue_id set) or an org-owned row (organization_id set, works
+  // every venue the org is linked to). Returns null if the membership doesn't actually work
+  // this venue.
+  private async resolveScannablePrMembership(
+    venueId: string,
+    lookup: { id?: string; refCode?: string },
+  ): Promise<PrMembershipRow | null> {
+    const row = lookup.id
+      ? await this.loadPrMembershipByIdGlobal(lookup.id)
+      : lookup.refCode
+        ? await this.loadPrMembershipByRefCode(lookup.refCode)
+        : null;
+    if (!row) return null;
+
+    if (row.venue_id) {
+      return row.venue_id === venueId ? row : null;
+    }
+
+    if (row.organization_id) {
+      const link = await this.prisma.organization_venue_links.findUnique({
+        where: {
+          organization_id_venue_id: {
+            organization_id: row.organization_id,
+            venue_id: venueId,
+          },
+        },
+        select: { id: true },
+      });
+      return link ? row : null;
+    }
+
+    return null;
   }
 
   private collectPrSubtree(
@@ -1411,8 +1580,10 @@ export class VenuesService {
     }
   }
 
+  // ref_code is globally unique across venue_pr_memberships (not venue-scoped), since
+  // org-owned rows have no venue to scope against - so uniqueness is always checked globally,
+  // for venue-owned rows too.
   private async buildUniquePrRefCode(
-    venueId: string,
     seed: string,
     excludeMemberId?: string,
   ): Promise<string> {
@@ -1430,16 +1601,14 @@ export class VenuesService {
         ? await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
             SELECT id
             FROM venue_pr_memberships
-            WHERE venue_id = ${venueId}::uuid
-              AND upper(ref_code) = upper(${candidate})
+            WHERE upper(ref_code) = upper(${candidate})
               AND id <> ${excludeMemberId}::uuid
             LIMIT 1
           `)
         : await this.prisma.$queryRaw<Array<{ id: string }>>(Prisma.sql`
             SELECT id
             FROM venue_pr_memberships
-            WHERE venue_id = ${venueId}::uuid
-              AND upper(ref_code) = upper(${candidate})
+            WHERE upper(ref_code) = upper(${candidate})
             LIMIT 1
           `);
 
@@ -3267,7 +3436,7 @@ export class VenuesService {
       targetUser.username ||
       targetUser.name ||
       targetUser.email;
-    const refCode = await this.buildUniquePrRefCode(venueId, refSeed);
+    const refCode = await this.buildUniquePrRefCode(refSeed);
 
     const inserted = await this.prisma.$queryRaw<
       Array<{ id: string }>
@@ -3381,7 +3550,6 @@ export class VenuesService {
 
       if (payload.ref_code !== undefined) {
         nextRefCode = await this.buildUniquePrRefCode(
-          venueId,
           payload.ref_code || existing.ref_code,
           existing.id,
         );
@@ -3544,8 +3712,9 @@ export class VenuesService {
   // another organization's. Confirmed decision: the venue no longer sees or manages these
   // memberships at all (see listVenuePrNetworkMembers's organization_id filter below).
 
+  // Org-owned rows have no venue_id - a PR invited by an organization works every venue that
+  // organization is linked to (organization_venue_links), not one chosen at invite time.
   async createOrganizationPrMember(
-    venueId: string,
     organizationId: string,
     payload: {
       user_id: string;
@@ -3554,8 +3723,13 @@ export class VenuesService {
       ref_code?: string | null;
     },
   ) {
-    await this.getVenue(venueId);
-    await this.assertOrganizationLinkedToVenue(organizationId, venueId);
+    const org = await this.prisma.organizations.findUnique({
+      where: { id: organizationId },
+      select: { id: true, is_active: true },
+    });
+    if (!org || !org.is_active) {
+      throw new BadRequestException('Organization not found or inactive');
+    }
 
     if (!payload?.user_id) {
       throw new BadRequestException('user_id is required');
@@ -3569,19 +3743,20 @@ export class VenuesService {
     });
     if (!targetUser) throw new NotFoundException('User not found');
 
-    const existingMembership = await this.loadPrMembershipByUser(
-      venueId,
-      payload.user_id,
-    );
+    const existingMembership =
+      await this.prisma.venue_pr_memberships.findFirst({
+        where: { organization_id: organizationId, user_id: payload.user_id },
+        select: { id: true },
+      });
     if (existingMembership) {
       throw new BadRequestException(
-        'User already assigned to this venue PR network',
+        'User already assigned to this organization PR network',
       );
     }
 
     const resolvedParentId = payload.parent_membership_id ?? null;
     const parent = resolvedParentId
-      ? await this.loadPrMembershipById(venueId, resolvedParentId)
+      ? await this.loadPrMembershipByIdGlobal(resolvedParentId)
       : null;
     if (resolvedParentId && !parent) {
       throw new BadRequestException('Parent membership not found');
@@ -3599,7 +3774,7 @@ export class VenuesService {
       targetUser.username ||
       targetUser.name ||
       targetUser.email;
-    const refCode = await this.buildUniquePrRefCode(venueId, refSeed);
+    const refCode = await this.buildUniquePrRefCode(refSeed);
 
     const inserted = await this.prisma.$queryRaw<
       Array<{ id: string }>
@@ -3615,7 +3790,7 @@ export class VenuesService {
         updated_at
       )
       VALUES (
-        ${venueId}::uuid,
+        NULL,
         ${payload.user_id}::uuid,
         ${targetRole}::"VenuePrRole",
         ${resolvedParentId}::uuid,
@@ -3632,26 +3807,23 @@ export class VenuesService {
       throw new BadRequestException('Unable to create PR membership');
     }
 
-    const row = await this.loadPrMemberRowById(venueId, createdId);
+    const row = await this.loadPrMemberRowByIdGlobal(createdId);
     if (!row) throw new NotFoundException('Created PR membership not found');
 
     return this.mapPrMember(row);
   }
 
   // No venue_id in the URL for organization-scoped endpoints (see
-  // OrganizationsController) - resolved here from the membership itself, then
-  // double-checked against organization_id, since venue_pr_memberships.id alone is
+  // OrganizationsController), and org-owned rows have no venue_id of their own - resolved by
+  // id alone, double-checked against organization_id, since venue_pr_memberships.id is
   // already a globally unique primary key.
   private async findOrganizationMembership(
     organizationId: string,
     memberId: string,
   ): Promise<PrMembershipRow | null> {
-    const row = await this.prisma.venue_pr_memberships.findUnique({
-      where: { id: memberId },
-      select: { venue_id: true, organization_id: true },
-    });
+    const row = await this.loadPrMembershipByIdGlobal(memberId);
     if (!row || row.organization_id !== organizationId) return null;
-    return this.loadPrMembershipById(row.venue_id, memberId);
+    return row;
   }
 
   async updateOrganizationPrMember(
@@ -3669,7 +3841,6 @@ export class VenuesService {
       memberId,
     );
     if (!existing) throw new NotFoundException('PR membership not found');
-    const venueId = existing.venue_id;
 
     let nextRole = existing.role;
     let nextParentId = existing.parent_membership_id;
@@ -3684,7 +3855,6 @@ export class VenuesService {
     }
     if (payload.ref_code !== undefined) {
       nextRefCode = await this.buildUniquePrRefCode(
-        venueId,
         payload.ref_code || existing.ref_code,
         existing.id,
       );
@@ -3700,7 +3870,7 @@ export class VenuesService {
     }
 
     const parent = nextParentId
-      ? await this.loadPrMembershipById(venueId, nextParentId)
+      ? await this.loadPrMembershipByIdGlobal(nextParentId)
       : null;
     if (nextParentId && !parent) {
       throw new BadRequestException('Parent membership not found');
@@ -3715,7 +3885,7 @@ export class VenuesService {
       >(Prisma.sql`
         SELECT id, parent_membership_id
         FROM venue_pr_memberships
-        WHERE venue_id = ${venueId}::uuid AND organization_id = ${organizationId}::uuid
+        WHERE organization_id = ${organizationId}::uuid
       `);
       const selfAndDescendants = this.collectPrSubtree(existing.id, treeRows);
       if (selfAndDescendants.has(nextParentId)) {
@@ -3740,7 +3910,7 @@ export class VenuesService {
     }
 
     if (!updates.length) {
-      const row = await this.loadPrMemberRowById(venueId, memberId);
+      const row = await this.loadPrMemberRowByIdGlobal(memberId);
       if (!row) throw new NotFoundException('PR membership not found');
       return this.mapPrMember(row);
     }
@@ -3750,12 +3920,11 @@ export class VenuesService {
     await this.prisma.$executeRaw(Prisma.sql`
       UPDATE venue_pr_memberships
       SET ${Prisma.join(updates, ', ')}
-      WHERE venue_id = ${venueId}::uuid
-        AND id = ${memberId}::uuid
+      WHERE id = ${memberId}::uuid
         AND organization_id = ${organizationId}::uuid
     `);
 
-    const row = await this.loadPrMemberRowById(venueId, memberId);
+    const row = await this.loadPrMemberRowByIdGlobal(memberId);
     if (!row) throw new NotFoundException('PR membership not found');
 
     return this.mapPrMember(row);
@@ -3767,14 +3936,13 @@ export class VenuesService {
       memberId,
     );
     if (!existing) throw new NotFoundException('PR membership not found');
-    const venueId = existing.venue_id;
 
     const children = await this.prisma.$queryRaw<
       Array<{ id: string }>
     >(Prisma.sql`
       SELECT id
       FROM venue_pr_memberships
-      WHERE venue_id = ${venueId}::uuid
+      WHERE organization_id = ${organizationId}::uuid
         AND parent_membership_id = ${memberId}::uuid
       LIMIT 1
     `);
@@ -3786,8 +3954,7 @@ export class VenuesService {
 
     await this.prisma.$executeRaw(Prisma.sql`
       DELETE FROM venue_pr_memberships
-      WHERE venue_id = ${venueId}::uuid
-        AND id = ${memberId}::uuid
+      WHERE id = ${memberId}::uuid
         AND organization_id = ${organizationId}::uuid
     `);
 
@@ -3797,10 +3964,13 @@ export class VenuesService {
   async listMyPrVenueMemberships(user?: RequestUser) {
     if (!user?.id) throw new ForbiddenException('Forbidden');
 
+    // An org-owned membership has no venue_id of its own - it fans out to one row per venue
+    // the organization is linked to (organization_venue_links), same shape as a venue-owned
+    // row, so callers of this "which venues do I work" list don't need to special-case it.
     const rows = await this.prisma.$queryRaw<PrMembershipVenueRow[]>(Prisma.sql`
       SELECT
         m.id AS membership_id,
-        m.venue_id,
+        v.id AS venue_id,
         v.name AS venue_name,
         v.city AS venue_city,
         m.role::text AS role,
@@ -3813,7 +3983,28 @@ export class VenuesService {
       JOIN venues v ON v.id = m.venue_id
       WHERE m.user_id = ${user.id}::uuid
         AND m.is_active = true
-      ORDER BY m.updated_at DESC
+
+      UNION ALL
+
+      SELECT
+        m.id AS membership_id,
+        v.id AS venue_id,
+        v.name AS venue_name,
+        v.city AS venue_city,
+        m.role::text AS role,
+        m.parent_membership_id,
+        m.ref_code,
+        m.is_active,
+        m.created_at,
+        m.updated_at
+      FROM venue_pr_memberships m
+      JOIN organization_venue_links l ON l.organization_id = m.organization_id
+      JOIN venues v ON v.id = l.venue_id
+      WHERE m.user_id = ${user.id}::uuid
+        AND m.is_active = true
+        AND m.organization_id IS NOT NULL
+
+      ORDER BY updated_at DESC
     `);
 
     return rows.map((row) => ({
@@ -3996,7 +4187,10 @@ export class VenuesService {
     const actorMembership = actorContext.membership;
     if (!actorMembership) return [];
 
-    const allMembers = await this.loadPrMemberRows(venueId);
+    const allMembers = await this.loadPrHierarchyRowsForActor(
+      venueId,
+      actorMembership,
+    );
     const allowed = this.collectPrSubtree(actorMembership.id, allMembers);
     return rows
       .filter((row) => allowed.has(row.pr_membership_id))
@@ -4021,15 +4215,13 @@ export class VenuesService {
 
     let targetMembership: PrMembershipRow | null = null;
     if (payload.pr_membership_id) {
-      targetMembership = await this.loadPrMembershipById(
-        venueId,
-        payload.pr_membership_id,
-      );
+      targetMembership = await this.resolveScannablePrMembership(venueId, {
+        id: payload.pr_membership_id,
+      });
     } else if (payload.ref_code?.trim()) {
-      targetMembership = await this.loadPrMembershipByRefCode(
-        venueId,
-        payload.ref_code.trim(),
-      );
+      targetMembership = await this.resolveScannablePrMembership(venueId, {
+        refCode: payload.ref_code.trim(),
+      });
     } else if (actorContext.membership) {
       targetMembership = actorContext.membership;
     }
@@ -4042,7 +4234,10 @@ export class VenuesService {
     }
 
     if (!actorContext.owner && actorContext.membership) {
-      const allMembers = await this.loadPrMemberRows(venueId);
+      const allMembers = await this.loadPrHierarchyRowsForActor(
+        venueId,
+        actorContext.membership,
+      );
       const allowed = this.collectPrSubtree(
         actorContext.membership.id,
         allMembers,
@@ -4205,7 +4400,10 @@ export class VenuesService {
     if (!scan) throw new NotFoundException('PR scan not found');
 
     if (!actorContext.owner && actorContext.membership) {
-      const allMembers = await this.loadPrMemberRows(venueId);
+      const allMembers = await this.loadPrHierarchyRowsForActor(
+        venueId,
+        actorContext.membership,
+      );
       const allowed = this.collectPrSubtree(
         actorContext.membership.id,
         allMembers,

@@ -457,7 +457,11 @@ model subscription_plans {
 
 model venue_pr_memberships {
   id                   String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  venue_id             String      @db.Uuid
+  // Nullable as of the "org PRs work every linked venue" change: null for org-owned rows
+  // (organization_id set instead), required in application logic for venue-only rows
+  // (organization_id null). Not a DB CHECK constraint - enforced in the services that create
+  // each kind of row.
+  venue_id             String?     @db.Uuid
   user_id              String      @db.Uuid
   role                 VenuePrRole
   parent_membership_id String?     @db.Uuid
@@ -467,17 +471,16 @@ model venue_pr_memberships {
   created_at           DateTime    @default(now())
   updated_at           DateTime    @updatedAt
 
-  // Which organization this PR currently works for at this venue - nullable because
-  // existing memberships predate organizations and need a backfill decision (see the
-  // Organizations audit doc), and because a PR is not required to belong to one. A PR works
-  // for at most one organization at a time (confirmed business rule): this is a plain FK,
-  // not a join table. Scoped through the venue like the rest of this model - if the
-  // organization stops working this venue, this membership's organization_id should be
-  // cleared/deactivated along with it, not kept dangling.
+  // Which organization this PR works for - nullable because existing memberships predate
+  // organizations, and because a venue-only PR is not required to belong to one. A PR works
+  // for at most one organization at a time (confirmed business rule): this is a plain FK, not
+  // a join table. Unlike venue-only rows, an org-owned row is NOT scoped to a single venue -
+  // it implicitly covers every venue in organization_venue_links for this organization_id, so
+  // there is exactly one row per (organization_id, user_id), not one per venue.
   organization_id String?        @db.Uuid
   organization    organizations? @relation(fields: [organization_id], references: [id], onDelete: SetNull)
 
-  venue             venues                           @relation(fields: [venue_id], references: [id], onDelete: Cascade)
+  venue             venues?                          @relation(fields: [venue_id], references: [id], onDelete: Cascade)
   user              users                            @relation("VenuePrMembershipUser", fields: [user_id], references: [id], onDelete: Cascade)
   parent_membership venue_pr_memberships?            @relation("VenuePrMembershipHierarchy", fields: [parent_membership_id], references: [id], onDelete: SetNull)
   child_memberships venue_pr_memberships[]           @relation("VenuePrMembershipHierarchy")
@@ -488,8 +491,11 @@ model venue_pr_memberships {
   season_pass       venue_pr_membership_passes?
   season_pass_scans venue_pr_membership_pass_scans[]
 
+  // ref_code lookup is global now (was venue-scoped) so a QR scan can resolve a membership
+  // without knowing in advance whether it's a venue-only or org-owned row.
+  @@unique([ref_code])
   @@unique([venue_id, user_id])
-  @@unique([venue_id, ref_code])
+  @@unique([organization_id, user_id])
   @@index([venue_id, role, is_active])
   @@index([parent_membership_id])
   @@index([organization_id, is_active])

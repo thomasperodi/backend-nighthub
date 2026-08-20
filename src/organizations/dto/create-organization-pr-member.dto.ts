@@ -7,11 +7,6 @@ import {
 } from 'class-validator';
 
 export class CreateOrganizationPrMemberDto {
-  // Which of the organization's linked venues this PR will work at - required, since
-  // (unlike a venue account) an organization can be linked to several.
-  @IsUUID()
-  venue_id: string;
-
   @IsUUID()
   user_id: string;
 

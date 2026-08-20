@@ -35,11 +35,30 @@ export class UsersService {
     private readonly storage: SupabaseStorageService,
   ) {}
 
-  private async findActivePrMembership(userId: string) {
-    return this.prisma.venue_pr_memberships.findFirst({
+  // An org-owned PR membership has no venue_id of its own - it works every venue the
+  // organization is linked to (see venue_pr_memberships.organization_id's doc comment) - so
+  // for the single "pr_venue_id" this endpoint exposes, fall back to one of the org's linked
+  // venues (first one created) as a representative default landing venue.
+  private async findActivePrMembership(
+    userId: string,
+  ): Promise<{ venue_id: string } | null> {
+    const membership = await this.prisma.venue_pr_memberships.findFirst({
       where: { user_id: userId, is_active: true },
-      select: { venue_id: true },
+      select: { venue_id: true, organization_id: true },
     });
+    if (!membership) return null;
+    if (membership.venue_id) return { venue_id: membership.venue_id };
+
+    if (membership.organization_id) {
+      const link = await this.prisma.organization_venue_links.findFirst({
+        where: { organization_id: membership.organization_id },
+        orderBy: { created_at: 'asc' },
+        select: { venue_id: true },
+      });
+      if (link) return { venue_id: link.venue_id };
+    }
+
+    return null;
   }
 
   private resolvePrDisplayContext(
