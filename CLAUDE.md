@@ -42,12 +42,12 @@ New module `src/organizations/` (`OrganizationsController`/`OrganizationsService
 
 `VenuesService`'s PR-network methods (`createVenuePrNetworkMember`/`updateVenuePrNetworkMember`/`listVenuePrNetworkMembers`) now accept/return `organization_id` — only the venue owner (not team managers) can tag a PR with an organization, and only if `organization_venue_links` actually has that pairing (`assertOrganizationLinkedToVenue`). New venue-side endpoints: `GET /venues/:id/organizations` (linked orgs) and `GET /venues/:id/organizations/:orgId/stats` (that org's performance, scoped to this venue's own events only — entries/scans carry `venue_id` directly, so the scoping is structural, not an extra filter someone could forget).
 
-Unlinking an org from a venue (`OrganizationsService.unlinkVenue`) soft-deactivates (`is_active: false`, never deletes) any PR memberships that org held at that venue — confirmed rule: a PR is scoped through the venue link, so losing the link loses that venue too, for now.
+Unlinking an org from a venue (`OrganizationsService.unlinkVenue`) only deletes the link row. Organization PR memberships have no `venue_id` of their own (one row per organization, covering every linked venue), so they are **not** deactivated: they simply stop covering that venue and keep working the others. (An earlier version soft-deactivated them; that is no longer true.)
 
 **Fase 5 gap-closing (added 2026-08-18, same day)**: three items flagged as missing from the original Fase 5 pass were built:
 - **Reusable ownership guards**: `src/common/guards/venue-ownership.guard.ts` (`@RequireVenueOwnership()`) and `organization-ownership.guard.ts` (`@RequireOrganizationOwnership()`) — applied to every Organizations-related endpoint (`OrganizationsController`'s `:id`-scoped routes, `venues.controller.ts`'s new `/organizations` routes). The service layer no longer re-checks ownership for those routes (removed the redundant `assertOrgAccess`/inline role checks) — this is what closes the "guard centralizzata" recommendation from the audit. **Not retrofitted**: the ~20+ pre-existing copy-pasted ownership checks elsewhere in `venues.controller.ts`/`events.controller.ts`/`reservations.controller.ts`/`staff.controller.ts` — the guard is available for that but retrofitting all of them is a separate, larger pass.
 - **Push test endpoint**: `POST /auth/push-test` — authenticated, sends a test push to the calling user's own devices only (Expo + every Web Push subscription via `PushDispatchService`), throttled 5/min. Cannot target anyone else.
-- **Organization billing**: `organizations.plan_id` (FK to `subscription_plans`, same catalog venues use) + `PATCH /organizations/:id/plan` (admin-only). Confirmed decision: billing moves to organizations, one flat plan per org regardless of venue count. `venues.plan_id` is **not** migrated or dropped — left in place and documented as legacy in the schema, since existing venue plan assignments in production shouldn't be silently destroyed by this change.
+- **Organization billing**: `organizations.plan_id` (FK to `subscription_plans`) + `PATCH /organizations/:id/plan` (admin-only). Confirmed decision: billing lives on organizations, one flat plan per org regardless of venue count. **Update 2026-08-20**: the legacy per-venue equivalent (`venues.plan_id`/`plan_custom_terms`, `PATCH /admin/venues/:id/plan`, and all venue-side "clienti analizzati"/overage metering in `AdminService`) has been removed entirely — organizations are now the only billing subject with a plan. `venues.contract_*` (flat contract fee, separate concept) is untouched.
 
 **Still not built**: UI/endpoint for a request-to-venue flow when a client wants to cancel an already-confirmed table reservation (client just gets a blocking message today). Multi-owner organizations and multi-org-per-PR remain out of scope per the confirmed decisions (not gaps, deliberate).
 
@@ -67,3 +67,36 @@ Ran a one-off QA script (Prisma-seeded test data + real logins via `POST /auth/l
 - Stripe/payments not implemented despite schema support.
 
 For the full line-cited audit (endpoints tables, migration history, every model's fields), see the conversation history of the 2026-08-18 audit, or re-run an Explore-agent pass over `src/` and `prisma/schema.prisma` — this file intentionally summarizes rather than reproduces that level of detail so it stays maintainable.
+
+## Organization & PR rework (2026-09-27)
+
+Domain rules and official metrics: `docs/spec/01-domain/pr-network.md` (source of truth). Key points for this codebase:
+
+- **Official PR metrics** live in `src/common/pr/pr-metrics.util.ts` (`referral_reservations`, `referral_guests`, `attributed_entries`, `conversion_rate`, `scans`, plus `rollupTeamCounters` for `team_*`). `VenuesService.queryPrCounters({ venueIds?, eventIds?, membershipIds?, from?, to?, bucket })` computes them in **one** SQL round trip for any set of memberships, grouped by venue / event / nothing. Every consumer (venue PR dashboard, organization stats, PR guests/history) goes through it — don't add a second definition of "ingressi portati".
+- **Venue PR rows vs organization PR rows**: `loadPrMemberRowsForVenue(venueId)` returns both (venue rows + rows of organizations linked to the venue). Use it whenever the question is "who works at venue X". The `venue` role must still filter out `organization_id` rows (exclusivity). `loadPrMemberRows(venueId)` (venue rows only) is kept for venue-only callers.
+- **Membership resolution for org PRs**: never `loadPrMembershipById(venueId, …)` (venue_id-only). Use `resolveScannablePrMembership(venueId, { id })` and `loadPrHierarchyRowsForActor` for subtree checks.
+- **Check-in attribution**: `ReservationsService.checkInEntryReservationByQr` copies `reservation.meta.pr_membership_id` onto every `entries` row it creates (validated UUID + existing membership). Historic data: `npm run backfill:pr-entries` (dry run, prints the count) then `npm run backfill:pr-entries -- --apply`. Idempotent (only `pr_membership_id IS NULL`).
+- **Never wipe history**: `assertPrMembershipDeletable` → 409 `{ code: 'HAS_TEAM' | 'HAS_HISTORY' }` on both venue and organization deletes; `assertRoleChangeKeepsHierarchy` → 409 `HAS_TEAM` on responsabile → pr with children. One organization per PR: 409 `OTHER_ORGANIZATION` / `IN_NETWORK` on create.
+- **Season pass per venue**: migration `20260927120000_pr_season_pass_per_venue` replaces `@unique(pr_membership_id)` with `@@unique([venue_id, pr_membership_id])` (relation renamed `season_passes`). The door scanner resolves by `qr_token` and rejects a pass of another venue. `GET /venues/:id/pr-network/me/season-pass` also returns `template` (venue branding).
+- **Event status is time-driven** (`EventsService.computeEffectiveStatus`): `DRAFT` = scheduled, `LIVE` = happening now, `CLOSED` = over. "Upcoming" = `DRAFT | LIVE` from the current night (06:00 rollover, `currentNightDate()` in `pr-network.service.ts`).
+
+New endpoints (all behind `@Roles` + `RequireOrganizationOwnership` or the PR subtree checks in `PrNetworkService`):
+
+| Endpoint | Notes |
+|---|---|
+| `GET /organizations/:id/stats?venue_id&from&to` | official metrics: totals, `by_venue`, `by_member` (with `team_*`). `by_venue.active_pr_count` removed |
+| `GET /organizations/:id/pr-network?include=stats&from&to` | + `parent`, `team_count`, `stats`, `team_stats` |
+| `GET /organizations/:id/pr-network/:memberId` | profile, metrics, per venue, last 8 nights, assigned events |
+| `GET /organizations/:id/pr-network/lookup` | + `status: available / in_network / other_organization`, `avatar` |
+| `POST /organizations/:id/pr-network/:memberId/regenerate-code` | new `ref_code`; old links stop attributing |
+| `GET/PUT /organizations/:id/events/:eventId/pr-assignments` | PUT body `{ membership_ids }` (full set) or `{ all_active: true }`; never deletes rows |
+| `GET /organizations/:id/events` | + `list_count`, `entries_count`, `pr_assigned_count`, `referral_reservations`, `attributed_entries` |
+| `GET /organizations/:id/usage` | + `terms` (unit prices; estimates only, no in-app payment) |
+| `GET /venues/:id/pr-dashboard` | official metrics in `totals`/`stats`/`team_stats` (`entries` kept as alias), `actor_membership_id` |
+| `GET /venues/:id/pr-dashboard/guests?eventId&membershipId&scope=team` | name + avatar only, never email/phone |
+| `GET /venues/:id/pr-dashboard/history?limit&membershipId&scope` | last N nights, bookings vs entries |
+| `GET /venues/pr-network/me` | + `source`, `organization_id/name`, `parent` |
+| `GET /pr-network/me/events?past` | events of every venue the PR works (direct + organization) |
+| `GET/POST /pr-network/me/team`, `GET /pr-network/me/team/lookup`, `PATCH /pr-network/me/team/:memberId` | responsabile's own team; org responsabile → org row, venue responsabile → venue row; PATCH only `is_active`, only own subtree |
+
+Tests: `src/venues/venues.pr-network.spec.ts`, `src/venues/pr-network.service.spec.ts`, `src/organizations/organizations.pr-stats.spec.ts`, `src/reservations/reservations.pr-attribution.spec.ts`.

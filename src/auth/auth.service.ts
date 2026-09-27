@@ -432,6 +432,19 @@ export class AuthService {
     };
   }
 
+  /** GET /auth/username-available - live check for the signup form. Case-insensitive,
+   * same normalization as register(). Usernames are already public (friend search), so
+   * answering this leaks nothing new; the controller throttles it. */
+  async isUsernameAvailable(raw: string): Promise<{ available: boolean }> {
+    const username = this.normalizeIdentifier(raw);
+    if (username.length < 3) return { available: false };
+    const existing = await this.prisma.users.findFirst({
+      where: { username: { equals: username, mode: 'insensitive' } },
+      select: { id: true },
+    });
+    return { available: !existing };
+  }
+
   async register(
     dto: RegisterDto,
     meta: SessionMeta = {},
@@ -453,6 +466,13 @@ export class AuthService {
     const name = String(dto.name || '').trim();
     if (!name) {
       throw new BadRequestException('name required');
+    }
+
+    // The DB unique constraint is case-sensitive, but usernames created outside this flow
+    // (admin tools, legacy rows) may be mixed-case: without this check "giulia" could be
+    // registered next to an existing "Giulia". The P2002 catch below still covers races.
+    if (!(await this.isUsernameAvailable(username)).available) {
+      throw new ConflictException('User already exists (username)');
     }
 
     const birthDate = dto.birth_date ? new Date(dto.birth_date) : undefined;

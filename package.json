@@ -12,6 +12,7 @@
     "migrate:event-images": "ts-node scripts/migrate-event-images-to-supabase.ts",
     "seed:badges": "ts-node scripts/seed-badges.ts",
     "seed:plans": "ts-node scripts/seed-plans.ts",
+    "backfill:pr-entries": "ts-node scripts/backfill-pr-entry-attribution.ts",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
     "start:dev": "nest start --watch",
@@ -48,6 +49,7 @@
     "prisma": "^5.22.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
+    "sharp": "^0.34.5",
     "web-push": "^3.6.7"
   },
   "devDependencies": {

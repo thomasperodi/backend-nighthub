@@ -16,6 +16,7 @@ import {
 import type { Response } from 'express';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { VenuesService } from './venues.service';
+import { PrNetworkService } from './pr-network.service';
 import { EventsService } from '../events/events.service';
 import { OrganizationsService } from '../organizations/organizations.service';
 import { RequireVenueOwnership } from '../common/guards/venue-ownership.guard';
@@ -50,6 +51,7 @@ export class VenuesController {
     private readonly venuesService: VenuesService,
     private readonly eventsService: EventsService,
     private readonly organizationsService: OrganizationsService,
+    private readonly prNetworkService: PrNetworkService,
   ) {}
 
   @Get()
@@ -421,6 +423,40 @@ export class VenuesController {
     return this.venuesService.getPrDashboardStats(id, user, {
       event_id: eventId,
       membership_id: membershipId,
+    });
+  }
+
+  // Guests who booked through the PR's link for one night (name + avatar only). The PR sees
+  // its own; a responsabile can pass `membershipId` of a teammate or `scope=team`.
+  @Get(':id/pr-dashboard/guests')
+  @Roles('client', 'staff', 'venue', 'admin')
+  getPrDashboardGuests(
+    @Param('id') id: string,
+    @Query('eventId') eventId: string | undefined,
+    @Query('membershipId') membershipId: string | undefined,
+    @Query('scope') scope: string | undefined,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.prNetworkService.listDashboardGuests(id, user, {
+      eventId,
+      membershipId: membershipId || undefined,
+      scope: scope === 'team' ? 'team' : 'me',
+    });
+  }
+
+  @Get(':id/pr-dashboard/history')
+  @Roles('client', 'staff', 'venue', 'admin')
+  getPrDashboardHistory(
+    @Param('id') id: string,
+    @Query('limit') limit: string | undefined,
+    @Query('membershipId') membershipId: string | undefined,
+    @Query('scope') scope: string | undefined,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.prNetworkService.getDashboardHistory(id, user, {
+      limit: limit ? Number(limit) : undefined,
+      membershipId: membershipId || undefined,
+      scope: scope === 'team' ? 'team' : 'me',
     });
   }
 

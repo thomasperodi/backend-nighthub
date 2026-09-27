@@ -16,15 +16,9 @@ import { UpdateVenueContractDto } from './dto/update-venue-contract.dto';
 import { UpdateUserAssignmentDto } from './dto/update-user-assignment.dto';
 import { CreatePlanDto } from './dto/create-plan.dto';
 import { UpdatePlanDto } from './dto/update-plan.dto';
-import { AssignVenuePlanDto } from './dto/assign-venue-plan.dto';
 import { TtlCache } from '../common/ttl-cache';
 import { geocodeAddress } from '../common/geocoding';
 import { AuditLogService } from '../common/audit/audit-log.service';
-import {
-  resolvePlanTerms as resolvePlanTermsShared,
-  computeOverage as computeOverageShared,
-  type PlanCustomTerms,
-} from '../common/billing/plan-usage.util';
 
 type RevenuePoint = { label: string; value: number };
 
@@ -41,7 +35,6 @@ type DashboardMetrics = {
   contractsMissingData: number;
   revenueMonth: number;
   platformRevenueMonth: number;
-  platformOverageRevenueMonth: number;
   reservationsToday: number;
   newUsers30d: number;
   avgOrderValue: number;
@@ -345,16 +338,6 @@ export class AdminService {
           contract_monthly_fee: true,
           contract_auto_renew: true,
           contract_notes: true,
-          plan_custom_terms: true,
-          plan: {
-            select: {
-              monthly_price: true,
-              included_events: true,
-              included_people: true,
-              extra_event_price: true,
-              extra_person_price: true,
-            },
-          },
         },
       }),
       this.prisma.events.findMany({
@@ -508,11 +491,11 @@ export class AdminService {
 
     // revenueMonth is the gross volume transacted through venues (ticket orders +
     // table reservations) - it is NOT what the app earns. The app's actual revenue today
-    // is the flat monthly plan/contract fee charged to venues with an active contract,
-    // plus metered overage (extra events/people beyond the plan's included quota - see
-    // platformOverageRevenueMonth below, filled in once eventsCompletedByVenueMonth/
-    // peopleAnalyzedByVenueMonth are available). Per-transaction commission exists in
-    // payments.service.ts but PLATFORM_FEE_CENTS is currently 0, so it contributes nothing.
+    // is the flat monthly contract fee charged to venues with an active contract (venue
+    // plan/overage metering was removed 2026-08-20 - billing consumption is now tracked
+    // per organization, see OrganizationsService.getUsage). Per-transaction commission
+    // exists in payments.service.ts but PLATFORM_FEE_CENTS is currently 0, so it
+    // contributes nothing.
     const platformSubscriptionRevenueMonth =
       Math.round(
         venuesRaw
@@ -539,7 +522,6 @@ export class AdminService {
       contractsMissingData,
       revenueMonth,
       platformRevenueMonth: platformSubscriptionRevenueMonth,
-      platformOverageRevenueMonth: 0,
       reservationsToday,
       newUsers30d,
       avgOrderValue,
@@ -584,33 +566,25 @@ export class AdminService {
       .sort((a, b) => b.revenue - a.revenue)
       .slice(0, 5);
 
-    const [
-      eventsActiveByVenue,
-      eventsCompletedByVenueMonth,
-      peopleAnalyzedByVenueMonth,
-    ] = await Promise.all([
-      this.prisma.events.groupBy({
-        by: ['venue_id'],
-        where: {
-          status: 'LIVE',
-          date: { gte: todayStart, lt: tomorrowStart },
-        },
-        _count: { _all: true },
-      }),
-      this.prisma.events.groupBy({
-        by: ['venue_id'],
-        where: {
-          status: 'CLOSED',
-          date: { gte: monthStart, lt: nextMonthStart },
-        },
-        _count: { _all: true },
-      }),
-      this.prisma.venue_stays.groupBy({
-        by: ['venue_id'],
-        where: { entered_at: { gte: monthStart, lt: nextMonthStart } },
-        _count: { _all: true },
-      }),
-    ]);
+    const [eventsActiveByVenue, eventsCompletedByVenueMonth] =
+      await Promise.all([
+        this.prisma.events.groupBy({
+          by: ['venue_id'],
+          where: {
+            status: 'LIVE',
+            date: { gte: todayStart, lt: tomorrowStart },
+          },
+          _count: { _all: true },
+        }),
+        this.prisma.events.groupBy({
+          by: ['venue_id'],
+          where: {
+            status: 'CLOSED',
+            date: { gte: monthStart, lt: nextMonthStart },
+          },
+          _count: { _all: true },
+        }),
+      ]);
 
     const activeMap = new Map<string, number>();
     for (const row of eventsActiveByVenue)
@@ -620,42 +594,6 @@ export class AdminService {
     for (const row of eventsCompletedByVenueMonth) {
       completedMap.set(row.venue_id, row._count._all);
     }
-
-    const peopleMonthMap = new Map<string, number>();
-    for (const row of peopleAnalyzedByVenueMonth) {
-      peopleMonthMap.set(row.venue_id, row._count._all);
-    }
-
-    // Extra events/people beyond each active venue's effective quota (plan, merged with any
-    // negotiated custom_terms override - see resolvePlanTerms), priced at the effective
-    // extra_event_price/extra_person_price. Venues without a plan, or on a custom/Elite plan
-    // with no quota set, contribute 0 (no metered quota to exceed).
-    const platformOverageRevenueMonth =
-      Math.round(
-        venuesRaw
-          .filter(
-            (venue) =>
-              this.normalizeContractStatus(venue.contract_status) === 'active',
-          )
-          .reduce((sum, venue) => {
-            const terms = this.resolvePlanTerms(
-              venue.plan,
-              this.parseCustomTerms(venue.plan_custom_terms),
-            );
-            const overage = this.computeOverage(
-              terms,
-              completedMap.get(venue.id) ?? 0,
-              peopleMonthMap.get(venue.id) ?? 0,
-            );
-            return sum + overage.overageCost;
-          }, 0) * 100,
-      ) / 100;
-
-    metrics.platformOverageRevenueMonth = platformOverageRevenueMonth;
-    metrics.platformRevenueMonth =
-      Math.round(
-        (platformSubscriptionRevenueMonth + platformOverageRevenueMonth) * 100,
-      ) / 100;
 
     const expiringContracts = contractsExpiringIn30d
       .sort((a, b) => a.daysLeft - b.daysLeft)
@@ -750,13 +688,11 @@ export class AdminService {
     const [
       allVenues,
       openStaysByVenue,
-      monthStaysByVenue,
       tableCapacityByVenue,
       monthPaidOrders,
       monthTableReservations,
       todayReservations,
       activeEventsByVenue,
-      completedEventsByVenue,
     ] = await Promise.all([
       this.prisma.venues.findMany({
         orderBy: { created_at: 'desc' },
@@ -775,22 +711,6 @@ export class AdminService {
           contract_monthly_fee: true,
           contract_auto_renew: true,
           contract_notes: true,
-          plan_id: true,
-          plan_custom_terms: true,
-          plan: {
-            select: {
-              id: true,
-              key: true,
-              name: true,
-              icon: true,
-              monthly_price: true,
-              included_events: true,
-              included_people: true,
-              extra_event_price: true,
-              extra_person_price: true,
-              is_custom: true,
-            },
-          },
           users: {
             where: { role: UserRole.venue },
             orderBy: { updated_at: 'desc' },
@@ -806,11 +726,6 @@ export class AdminService {
       this.prisma.venue_stays.groupBy({
         by: ['venue_id'],
         where: { exited_at: null },
-        _count: { _all: true },
-      }),
-      this.prisma.venue_stays.groupBy({
-        by: ['venue_id'],
-        where: { entered_at: { gte: monthStart, lt: nextMonthStart } },
         _count: { _all: true },
       }),
       this.prisma.venue_tables.groupBy({
@@ -859,24 +774,11 @@ export class AdminService {
         where: { status: 'LIVE', date: { gte: todayStart, lt: tomorrowStart } },
         _count: { _all: true },
       }),
-      this.prisma.events.groupBy({
-        by: ['venue_id'],
-        where: {
-          status: 'CLOSED',
-          date: { gte: monthStart, lt: nextMonthStart },
-        },
-        _count: { _all: true },
-      }),
     ]);
 
     const openStaysMap = new Map<string, number>();
     for (const row of openStaysByVenue) {
       openStaysMap.set(row.venue_id, row._count._all);
-    }
-
-    const monthStaysMap = new Map<string, number>();
-    for (const row of monthStaysByVenue) {
-      monthStaysMap.set(row.venue_id, row._count._all);
     }
 
     const capacityMap = new Map<string, number>();
@@ -920,11 +822,6 @@ export class AdminService {
       eventsActiveMap.set(row.venue_id, row._count._all);
     }
 
-    const eventsCompletedMap = new Map<string, number>();
-    for (const row of completedEventsByVenue) {
-      eventsCompletedMap.set(row.venue_id, row._count._all);
-    }
-
     const venuesWithContract = allVenues as Array<{
       id: string;
       name: string;
@@ -940,20 +837,6 @@ export class AdminService {
       contract_monthly_fee: unknown;
       contract_auto_renew: boolean;
       contract_notes: string | null;
-      plan_id: string | null;
-      plan_custom_terms: unknown;
-      plan: {
-        id: string;
-        key: string;
-        name: string;
-        icon: string | null;
-        monthly_price: unknown;
-        included_events: number | null;
-        included_people: number | null;
-        extra_event_price: unknown;
-        extra_person_price: unknown;
-        is_custom: boolean;
-      } | null;
       users: Array<{
         id: string;
         name: string | null;
@@ -975,8 +858,6 @@ export class AdminService {
       );
 
       const eventsActive = eventsActiveMap.get(venue.id) ?? 0;
-      const eventsCompletedMonth = eventsCompletedMap.get(venue.id) ?? 0;
-      const analyzedPeopleMonth = monthStaysMap.get(venue.id) ?? 0;
       const contract = this.estimateContract({
         id: venue.id,
         name: venue.name,
@@ -991,13 +872,6 @@ export class AdminService {
         contract_notes: venue.contract_notes,
       });
       const manager = venue.users[0] ?? null;
-      const customTerms = this.parseCustomTerms(venue.plan_custom_terms);
-      const terms = this.resolvePlanTerms(venue.plan, customTerms);
-      const overage = this.computeOverage(
-        terms,
-        eventsCompletedMonth,
-        analyzedPeopleMonth,
-      );
 
       return {
         id: venue.id,
@@ -1009,8 +883,6 @@ export class AdminService {
         activeGuests,
         revenue: Math.round((revenueMap.get(venue.id) ?? 0) * 100) / 100,
         eventsActive,
-        eventsCompletedMonth,
-        analyzedPeopleMonth,
         contractExpiresAt: contract.expiresAt.toISOString(),
         contractDaysLeft: contract.daysLeft,
         contractEstimated: contract.estimated,
@@ -1022,23 +894,7 @@ export class AdminService {
         contractMonthlyFee: contract.monthlyFee,
         contractAutoRenew: contract.autoRenew,
         contractNotes: contract.notes,
-        planId: venue.plan_id,
-        planKey: venue.plan?.key ?? null,
-        planName: venue.plan?.name ?? null,
-        planIcon: venue.plan?.icon ?? null,
-        planIsCustom: venue.plan?.is_custom ?? false,
-        planCustomTerms: customTerms,
-        planMonthlyPrice: terms.monthlyPrice,
-        planIncludedEvents: overage.includedEvents,
-        planIncludedPeople: overage.includedPeople,
-        extraEventsCount: overage.extraEventsCount,
-        extraPeopleCount: overage.extraPeopleCount,
-        extraEventsCost: overage.extraEventsCost,
-        extraPeopleCost: overage.extraPeopleCost,
-        overageCostMonth: overage.overageCost,
-        billedThisMonth:
-          Math.round(((contract.monthlyFee ?? 0) + overage.overageCost) * 100) /
-          100,
+        billedThisMonth: Math.round((contract.monthlyFee ?? 0) * 100) / 100,
         managerUserId: manager?.id ?? null,
         managerName: manager?.name?.trim() || manager?.email || null,
         managerEmail: manager?.email ?? null,
@@ -1632,69 +1488,6 @@ export class AdminService {
     };
   }
 
-  // Narrows a venue's `plan_custom_terms` JSON column back into a typed partial override.
-  // Unknown/malformed shapes (manual DB edits, future schema drift) degrade to "no override"
-  // per-field rather than throwing, since this is read on every dashboard/venues-list hit.
-  private parseCustomTerms(value: unknown): {
-    monthly_price?: number;
-    included_events?: number;
-    included_people?: number;
-    extra_event_price?: number;
-    extra_person_price?: number;
-    notes?: string;
-  } | null {
-    if (value == null || typeof value !== 'object' || Array.isArray(value)) {
-      return null;
-    }
-    const raw = value as Record<string, unknown>;
-    const out: ReturnType<AdminService['parseCustomTerms']> = {};
-    if (typeof raw.monthly_price === 'number')
-      out.monthly_price = raw.monthly_price;
-    if (typeof raw.included_events === 'number')
-      out.included_events = raw.included_events;
-    if (typeof raw.included_people === 'number')
-      out.included_people = raw.included_people;
-    if (typeof raw.extra_event_price === 'number')
-      out.extra_event_price = raw.extra_event_price;
-    if (typeof raw.extra_person_price === 'number')
-      out.extra_person_price = raw.extra_person_price;
-    if (typeof raw.notes === 'string') out.notes = raw.notes;
-    return out;
-  }
-
-  // Merges a plan's own price/quotas with a venue's negotiated overrides (if any) - an
-  // override wins field-by-field when present. For a custom plan (is_custom, no defaults
-  // of its own) every field effectively comes from the override.
-  // Delegates to the shared util (also used by OrganizationsService.getUsage) - kept as a
-  // method here since call sites in this file reference `this.resolvePlanTerms`.
-  private resolvePlanTerms(
-    plan: {
-      monthly_price: unknown;
-      included_events: number | null;
-      included_people: number | null;
-      extra_event_price: unknown;
-      extra_person_price: unknown;
-    } | null,
-    customTerms: ReturnType<AdminService['parseCustomTerms']>,
-  ) {
-    return resolvePlanTermsShared(plan, customTerms as PlanCustomTerms);
-  }
-
-  // Delegates to the shared util (also used by OrganizationsService.getUsage) - kept as a
-  // method here since call sites in this file reference `this.computeOverage`.
-  private computeOverage(
-    terms: {
-      includedEvents: number | null;
-      includedPeople: number | null;
-      extraEventPrice: number;
-      extraPersonPrice: number;
-    },
-    eventsCount: number,
-    peopleCount: number,
-  ) {
-    return computeOverageShared(terms, eventsCount, peopleCount);
-  }
-
   private serializePlan(plan: {
     id: string;
     key: string;
@@ -1834,97 +1627,8 @@ export class AdminService {
     });
     if (!existing) throw new NotFoundException('Plan not found');
 
-    const assignedVenues = await this.prisma.venues.count({
-      where: { plan_id: planId },
-    });
-    if (assignedVenues > 0) {
-      throw new BadRequestException(
-        `Cannot delete plan: ${assignedVenues} venue(s) are still assigned to it. Reassign them first.`,
-      );
-    }
-
     await this.prisma.subscription_plans.delete({ where: { id: planId } });
     return { success: true };
-  }
-
-  async assignVenuePlan(venueId: string, input: AssignVenuePlanDto) {
-    const venue = await this.prisma.venues.findUnique({
-      where: { id: venueId },
-      select: { id: true },
-    });
-    if (!venue) throw new NotFoundException('Venue not found');
-
-    if (input.plan_id === undefined) {
-      throw new BadRequestException('plan_id is required');
-    }
-
-    if (input.plan_id === null) {
-      // Unassigning: custom terms are meaningless without a plan, so they're cleared too.
-      // contract_monthly_fee is left untouched - it's a general contract field, not
-      // exclusively plan-owned, and the admin may still want the venue billed manually.
-      const updated = await this.prisma.venues.update({
-        where: { id: venueId },
-        data: { plan_id: null, plan_custom_terms: Prisma.JsonNull },
-        select: { id: true, plan_id: true, contract_monthly_fee: true },
-      });
-      return {
-        id: updated.id,
-        planId: updated.plan_id,
-        planCustomTerms: null,
-        contractMonthlyFee:
-          updated.contract_monthly_fee == null
-            ? null
-            : this.toNumber(updated.contract_monthly_fee),
-      };
-    }
-
-    const plan = await this.prisma.subscription_plans.findUnique({
-      where: { id: input.plan_id },
-    });
-    if (!plan) throw new NotFoundException('Plan not found');
-
-    // custom_terms is the full override for this assignment (not a partial merge with
-    // whatever was saved before) - omitting it clears any previous override.
-    const customTerms = input.custom_terms ?? null;
-
-    if (plan.is_custom && customTerms?.monthly_price === undefined) {
-      throw new BadRequestException(
-        'custom_terms.monthly_price is required when assigning a custom-priced plan',
-      );
-    }
-
-    const terms = this.resolvePlanTerms(plan, customTerms);
-    if (terms.monthlyPrice == null) {
-      throw new BadRequestException(
-        'Unable to resolve a monthly price for this plan - pass custom_terms.monthly_price',
-      );
-    }
-
-    const updated = await this.prisma.venues.update({
-      where: { id: venueId },
-      data: {
-        plan_id: plan.id,
-        plan_custom_terms: customTerms
-          ? (customTerms as unknown as Prisma.InputJsonValue)
-          : Prisma.JsonNull,
-        contract_monthly_fee: terms.monthlyPrice,
-      },
-      select: {
-        id: true,
-        plan_id: true,
-        plan_custom_terms: true,
-        contract_monthly_fee: true,
-      },
-    });
-
-    return {
-      id: updated.id,
-      planId: updated.plan_id,
-      planCustomTerms: customTerms,
-      contractMonthlyFee: this.toNumber(updated.contract_monthly_fee),
-      plan: this.serializePlan(plan),
-      effectiveTerms: terms,
-    };
   }
 
   // Looks a user up by id, email, or username - whichever the caller has on hand, so an

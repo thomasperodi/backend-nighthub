@@ -1,7 +1,6 @@
-// Shared by AdminService (venue billing detail/dashboard totals) and OrganizationsService
-// (organization plan-usage endpoint) - moved here so both compute overage the same way
-// instead of maintaining two copies. Behavior unchanged from AdminService's original
-// resolvePlanTerms/computeOverage.
+// Used by OrganizationsService.getUsage to compute plan overage. Previously also shared with
+// AdminService's venue-plan billing, but that legacy per-venue plan concept was removed
+// 2026-08-20 - organizations are now the only billing subject with a plan.
 
 export function toNumber(value: unknown): number {
   if (value == null) return 0;

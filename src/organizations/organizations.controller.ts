@@ -6,8 +6,11 @@ import {
   Param,
   Patch,
   Post,
+  Put,
   Query,
 } from '@nestjs/common';
+import { parseDateQuery } from '../common/http/date-query.util';
+import { SetEventPrAssignmentsDto } from './dto/set-event-pr-assignments.dto';
 import { OrganizationsService } from './organizations.service';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
@@ -99,11 +102,24 @@ export class OrganizationsController {
     return this.organizationsService.listVenues(id);
   }
 
+  // `?include=stats` adds the official metrics per member (own + team), in one aggregate
+  // query; `from`/`to` restrict them to events in that date range.
   @Get(':id/pr-network')
   @Roles('admin', 'organization')
   @RequireOrganizationOwnership()
-  listPrNetwork(@Param('id') id: string) {
-    return this.organizationsService.listPrNetwork(id);
+  listPrNetwork(
+    @Param('id') id: string,
+    @Query('include') include?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.organizationsService.listPrNetwork(id, {
+      includeStats: String(include || '')
+        .split(',')
+        .includes('stats'),
+      from: parseDateQuery(from, 'from'),
+      to: parseDateQuery(to, 'to'),
+    });
   }
 
   // Resolves an id/email/username into a user before inviting them - org-scoped counterpart
@@ -116,7 +132,33 @@ export class OrganizationsController {
     @Param('id') id: string,
     @Query('identifier') identifier: string,
   ) {
-    return this.organizationsService.lookupPrInviteUser(identifier);
+    return this.organizationsService.lookupPrInviteUser(id, identifier);
+  }
+
+  // Declared after `lookup` so the static segment wins over `:memberId`.
+  @Get(':id/pr-network/:memberId')
+  @Roles('admin', 'organization')
+  @RequireOrganizationOwnership()
+  getPrMemberDetail(
+    @Param('id') id: string,
+    @Param('memberId') memberId: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.organizationsService.getPrMemberDetail(id, memberId, {
+      from: parseDateQuery(from, 'from'),
+      to: parseDateQuery(to, 'to'),
+    });
+  }
+
+  @Post(':id/pr-network/:memberId/regenerate-code')
+  @Roles('admin', 'organization')
+  @RequireOrganizationOwnership()
+  regeneratePrRefCode(
+    @Param('id') id: string,
+    @Param('memberId') memberId: string,
+  ) {
+    return this.organizationsService.regeneratePrRefCode(id, memberId);
   }
 
   @Post(':id/pr-network')
@@ -154,11 +196,47 @@ export class OrganizationsController {
     return this.organizationsService.listEvents(id);
   }
 
+  @Get(':id/events/:eventId/pr-assignments')
+  @Roles('admin', 'organization')
+  @RequireOrganizationOwnership()
+  listEventPrAssignments(
+    @Param('id') id: string,
+    @Param('eventId') eventId: string,
+  ) {
+    return this.organizationsService.listEventPrAssignments(id, eventId);
+  }
+
+  @Put(':id/events/:eventId/pr-assignments')
+  @Roles('admin', 'organization')
+  @RequireOrganizationOwnership()
+  setEventPrAssignments(
+    @Param('id') id: string,
+    @Param('eventId') eventId: string,
+    @Body() dto: SetEventPrAssignmentsDto,
+    @CurrentUser() user?: RequestUser,
+  ) {
+    return this.organizationsService.setEventPrAssignments(
+      id,
+      eventId,
+      dto,
+      user,
+    );
+  }
+
   @Get(':id/stats')
   @Roles('admin', 'organization')
   @RequireOrganizationOwnership()
-  getStats(@Param('id') id: string, @Query('venue_id') venueId?: string) {
-    return this.organizationsService.getStats(id, venueId);
+  getStats(
+    @Param('id') id: string,
+    @Query('venue_id') venueId?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.organizationsService.getStats(id, {
+      venue_id: venueId || undefined,
+      from: parseDateQuery(from, 'from'),
+      to: parseDateQuery(to, 'to'),
+    });
   }
 
   @Get(':id/usage')

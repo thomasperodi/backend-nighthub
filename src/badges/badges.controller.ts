@@ -42,6 +42,17 @@ export class BadgesController {
     return this.badgesService.getNightLevel(user.id);
   }
 
+  /** Night level of yourself (`me`) or a friend - non-friends get 403. */
+  @Get('level/:userId')
+  @Roles('client')
+  levelForUser(
+    @Param('userId') userId: string,
+    @CurrentUser() user: RequestUser,
+  ) {
+    const targetUserId = userId === 'me' ? user.id : userId;
+    return this.badgesService.getNightLevelForViewer(user.id, targetUserId);
+  }
+
   @Post('sync')
   @Roles('client')
   sync(@CurrentUser() user: RequestUser) {

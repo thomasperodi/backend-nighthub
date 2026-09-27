@@ -1,6 +1,8 @@
 import { Module, forwardRef } from '@nestjs/common';
 import { VenuesController } from './venues.controller';
 import { VenuesService } from './venues.service';
+import { PrNetworkController } from './pr-network.controller';
+import { PrNetworkService } from './pr-network.service';
 import { EventsModule } from '../events/events.module';
 import { BadgesModule } from '../badges/badges.module';
 import { AuditLogModule } from '../common/audit/audit-log.module';
@@ -16,8 +18,8 @@ import { OrganizationsModule } from '../organizations/organizations.module';
     // organizations.module.ts.
     forwardRef(() => OrganizationsModule),
   ],
-  controllers: [VenuesController],
-  providers: [VenuesService],
+  controllers: [VenuesController, PrNetworkController],
+  providers: [VenuesService, PrNetworkService],
   exports: [VenuesService],
 })
 export class VenuesModule {}

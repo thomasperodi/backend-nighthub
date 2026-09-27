@@ -113,6 +113,13 @@ export class AuthController {
     return { access_token: result.accessToken, user: result.user };
   }
 
+  @Get('username-available')
+  @Public()
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  usernameAvailable(@Query('username') username?: string) {
+    return this.authService.isUsernameAvailable(username ?? '');
+  }
+
   @Post('login')
   @Public()
   @Throttle({ default: { limit: 10, ttl: 60_000 } })

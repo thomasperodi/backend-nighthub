@@ -17,7 +17,6 @@ import { UpdateVenueContractDto } from './dto/update-venue-contract.dto';
 import { UpdateUserAssignmentDto } from './dto/update-user-assignment.dto';
 import { CreatePlanDto } from './dto/create-plan.dto';
 import { UpdatePlanDto } from './dto/update-plan.dto';
-import { AssignVenuePlanDto } from './dto/assign-venue-plan.dto';
 
 @Controller('admin')
 @Roles('admin')
@@ -121,14 +120,6 @@ export class AdminController {
   @Delete('plans/:id')
   deletePlan(@Param('id') planId: string) {
     return this.adminService.deletePlan(planId);
-  }
-
-  @Patch('venues/:id/plan')
-  assignVenuePlan(
-    @Param('id') venueId: string,
-    @Body() body: AssignVenuePlanDto,
-  ) {
-    return this.adminService.assignVenuePlan(venueId, body);
   }
 
   @Get('reports')

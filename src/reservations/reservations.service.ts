@@ -174,6 +174,31 @@ export class ReservationsService {
     return value as Record<string, unknown>;
   }
 
+  // The PR a reservation was booked through (resolveReferralAttribution wrote it into
+  // meta.pr_membership_id at booking time). Only a well-formed id of a membership that still
+  // exists is trusted - meta is JSON and an FK violation here would abort the check-in.
+  private async resolveAttributedPrMembershipId(
+    meta: unknown,
+  ): Promise<string | null> {
+    const id = this.readMetaString(
+      this.asObjectRecord(meta),
+      'pr_membership_id',
+    );
+    if (
+      !id ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        id,
+      )
+    ) {
+      return null;
+    }
+    const membership = await this.prisma.venue_pr_memberships.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    return membership?.id ?? null;
+  }
+
   private readMetaString(
     meta: Record<string, unknown> | null,
     key: string,
@@ -1839,6 +1864,13 @@ export class ReservationsService {
       isComplimentary: reservationIsComplimentary,
     });
 
+    // Guests who booked through a PR's link are that PR's "ingressi portati": every entry
+    // created below carries the membership, so it rolls up to the PR, its responsabile and
+    // the organization. Before this, only the PR's own season-pass entry was attributed.
+    const attributedPrMembershipId = await this.resolveAttributedPrMembershipId(
+      reservation.meta,
+    );
+
     // A list reservation books `guests` people under one QR; scanning it once must record
     // everyone who actually walked in, not just the one code that got scanned - otherwise
     // entries systematically undercounts group bookings and skews any show-up-rate derived
@@ -1882,6 +1914,7 @@ export class ReservationsService {
         is_complimentary: reservationIsComplimentary,
         age_bucket: ageBucket,
         method: EntryMethod.QR,
+        pr_membership_id: attributedPrMembershipId,
       };
       const createdEntries: Array<
         Awaited<ReturnType<typeof tx.entries.create>>

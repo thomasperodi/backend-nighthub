@@ -400,12 +400,6 @@ model venues {
   contract_monthly_fee           Decimal?  @db.Decimal(10, 2)
   contract_auto_renew            Boolean   @default(false)
   contract_notes                 String?
-  // Legacy: billing is moving to organizations.plan_id (confirmed business decision - see
-  // that field's doc comment). Kept as-is (not migrated/removed) so venues with a plan
-  // already assigned today don't lose that data or break the existing admin UI; new billing
-  // relationships should be created on organizations, not here.
-  plan_id                        String?   @db.Uuid
-  plan_custom_terms              Json?
   created_at                     DateTime  @default(now())
   updated_at                     DateTime  @updatedAt
 
@@ -423,15 +417,12 @@ model venues {
   table_zones              venue_table_zones[]
   floor_plan               venue_floor_plans?
   group_table_proposals    group_table_proposals[]
-  plan                     subscription_plans?              @relation(fields: [plan_id], references: [id], onDelete: SetNull)
   organization_links       organization_venue_links[]
   wallet_template          venue_wallet_templates?
-
-  @@index([plan_id])
 }
 
-// NightHub listino: catalog of subscription plans sold to venues (Essential/Pulse/Peak/Elite).
-// `monthly_price`/`included_events`/`included_people` null = custom, negotiated per venue
+// NightHub listino: catalog of subscription plans sold to organizations (Essential/Pulse/Peak/Elite).
+// `monthly_price`/`included_events`/`included_people` null = custom, negotiated per organization
 // (Elite) - `is_custom` flags that case for the UI instead of inferring it from nulls.
 model subscription_plans {
   id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
@@ -451,7 +442,6 @@ model subscription_plans {
   created_at         DateTime @default(now())
   updated_at         DateTime @updatedAt
 
-  venues        venues[]
   organizations organizations[] @relation("OrganizationPlan")
 }
 
@@ -488,7 +478,7 @@ model venue_pr_memberships {
   event_assignments venue_pr_event_assignments[]
   qr_scans          venue_pr_qr_scans[]
   tracked_entries   entries[]                        @relation("PrMembershipEntries")
-  season_pass       venue_pr_membership_passes?
+  season_passes     venue_pr_membership_passes[]
   season_pass_scans venue_pr_membership_pass_scans[]
 
   // ref_code lookup is global now (was venue-scoped) so a QR scan can resolve a membership
@@ -553,7 +543,7 @@ model venue_pr_qr_scans {
 model venue_pr_membership_passes {
   id                    String                      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   venue_id              String                      @db.Uuid
-  pr_membership_id      String                      @unique @db.Uuid
+  pr_membership_id      String                      @db.Uuid
   user_id               String                      @db.Uuid
   status                VenuePrMembershipPassStatus @default(active)
   valid_from            DateTime                    @default(now())
@@ -573,6 +563,11 @@ model venue_pr_membership_passes {
   user          users                            @relation("VenuePrMembershipPassUser", fields: [user_id], references: [id], onDelete: Cascade)
   scans         venue_pr_membership_pass_scans[]
 
+  // One pass per (venue, membership): an organization PR works several venues and each
+  // venue brands its own pass (venue_wallet_templates). qr_token stays globally unique, so the
+  // door scanner still resolves a pass by token and then checks its venue_id.
+  @@unique([venue_id, pr_membership_id])
+  @@index([pr_membership_id])
   @@index([venue_id, status])
   @@index([user_id, status])
   @@index([valid_until])

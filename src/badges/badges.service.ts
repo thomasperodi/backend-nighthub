@@ -70,15 +70,7 @@ export class BadgesService {
     const isSelf = viewerId === targetUserId;
 
     if (!isSelf) {
-      const isFriend = await this.prisma.friendships.findUnique({
-        where: {
-          user_id_friend_id: { user_id: viewerId, friend_id: targetUserId },
-        },
-      });
-      if (!isFriend) {
-        throw new ForbiddenException('Puoi vedere solo i badge dei tuoi amici');
-      }
-
+      await this.assertFriends(viewerId, targetUserId);
       return this.computeBadgesForFriend(targetUserId);
     }
 
@@ -90,6 +82,18 @@ export class BadgesService {
       BadgesService.SELF_BADGES_CACHE_TTL_MS,
       () => this.computeBadgesForSelf(targetUserId),
     );
+  }
+
+  /** Badges and night level of another user are only visible to their friends. */
+  private async assertFriends(viewerId: string, targetUserId: string) {
+    const isFriend = await this.prisma.friendships.findUnique({
+      where: {
+        user_id_friend_id: { user_id: viewerId, friend_id: targetUserId },
+      },
+    });
+    if (!isFriend) {
+      throw new ForbiddenException('Puoi vedere solo i badge dei tuoi amici');
+    }
   }
 
   private async computeBadgesForFriend(targetUserId: string) {
@@ -160,6 +164,7 @@ export class BadgesService {
       name: string;
       description: string;
       is_secret: boolean;
+      is_public: boolean;
     },
     state: {
       isUnlocked: boolean;
@@ -177,6 +182,7 @@ export class BadgesService {
         name: badge.name,
         description: badge.description,
         isSecret: true,
+        isPublic: badge.is_public,
         isUnlocked: false,
         unlockedAt: null,
         progress: null,
@@ -192,15 +198,17 @@ export class BadgesService {
       name: badge.name,
       description: badge.description,
       isSecret: badge.is_secret,
+      isPublic: badge.is_public,
       isUnlocked: state.isUnlocked,
       unlockedAt: state.unlockedAt ?? null,
       progress: state.progress ?? null,
     };
   }
 
+  /** Retired (inactive) badges stay in user_badges as history but are no longer shown. */
   getUnlockedForUser(userId: string) {
     return this.prisma.user_badges.findMany({
-      where: { user_id: userId },
+      where: { user_id: userId, badge: { is_active: true } },
       include: { badge: true },
       orderBy: { unlocked_at: 'desc' },
     });
@@ -257,6 +265,14 @@ export class BadgesService {
       minEvents: 200,
     },
   ] as const;
+
+  /** Night level of `targetUserId` as seen by `viewerId`: yourself or a friend (else 403). */
+  async getNightLevelForViewer(viewerId: string, targetUserId: string) {
+    if (viewerId !== targetUserId) {
+      await this.assertFriends(viewerId, targetUserId);
+    }
+    return this.getNightLevel(targetUserId);
+  }
 
   /** Separate from the badge collection: reflects overall activity via events attended. */
   async getNightLevel(userId: string) {
@@ -364,6 +380,10 @@ export class BadgesService {
       }
     }
 
+    // The self view is cached for minutes: without this, a badge just unlocked here would
+    // keep showing as locked (with stale progress) right after the unlock celebration.
+    if (newlyUnlocked.length > 0) this.selfBadgesCache.invalidate(userId);
+
     return newlyUnlocked;
   }
 
@@ -374,11 +394,13 @@ export class BadgesService {
     });
     if (!badge) return null;
 
-    return this.prisma.user_badges.upsert({
+    const awarded = await this.prisma.user_badges.upsert({
       where: { user_id_badge_id: { user_id: userId, badge_id: badge.id } },
       update: {},
       create: { user_id: userId, badge_id: badge.id },
     });
+    this.selfBadgesCache.invalidate(userId);
+    return awarded;
   }
 
   // ---------------------------------------------------------------------

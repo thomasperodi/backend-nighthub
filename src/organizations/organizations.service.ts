@@ -15,11 +15,40 @@ import {
   startOfMonth,
   nextMonth,
 } from '../common/billing/plan-usage.util';
+import {
+  addPrCounters,
+  emptyPrCounters,
+  foldPrCounterRows,
+  rollupTeamCounters,
+  sumBuckets,
+  toPrMetrics,
+} from '../common/pr/pr-metrics.util';
+import { Prisma } from '@prisma/client';
 import type { RequestUser } from '../auth/types';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
 import { CreateOrganizationPrMemberDto } from './dto/create-organization-pr-member.dto';
 import { UpdateOrganizationPrMemberDto } from './dto/update-organization-pr-member.dto';
+
+export interface PrStatsFilters {
+  venue_id?: string;
+  /** Inclusive lower bound on the event date. */
+  from?: Date;
+  /** Exclusive upper bound on the event date. */
+  to?: Date;
+}
+
+function displayName(user: {
+  name: string | null;
+  username: string | null;
+  email?: string | null;
+}) {
+  return user.name || user.username || user.email || 'Utente';
+}
+
+function startOfDay(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
 
 @Injectable()
 export class OrganizationsService {
@@ -68,7 +97,9 @@ export class OrganizationsService {
       include: {
         _count: { select: { venue_links: true, pr_memberships: true } },
         plan: { select: { id: true, key: true, name: true, icon: true } },
-        owners: { select: { id: true, name: true, username: true, email: true } },
+        owners: {
+          select: { id: true, name: true, username: true, email: true },
+        },
       },
     });
   }
@@ -81,7 +112,9 @@ export class OrganizationsService {
           include: { venue: { select: { id: true, name: true, city: true } } },
         },
         plan: { select: { id: true, key: true, name: true, icon: true } },
-        owners: { select: { id: true, name: true, username: true, email: true } },
+        owners: {
+          select: { id: true, name: true, username: true, email: true },
+        },
       },
     });
     if (!organization) throw new NotFoundException('Organization not found');
@@ -92,7 +125,7 @@ export class OrganizationsService {
   async getMine(actor: RequestUser | undefined) {
     if (!actor?.organization_id) {
       throw new NotFoundException(
-        'No organization associated with this account',
+        'Nessuna organizzazione collegata a questo account',
       );
     }
     return this.getById(actor.organization_id);
@@ -135,9 +168,9 @@ export class OrganizationsService {
     return organization;
   }
 
-  // Billing moves to organizations (confirmed business decision) - one flat plan per
-  // organization, reusing the same subscription_plans catalog venues.plan_id already uses.
-  // Mirrors AdminService.assignVenuePlan's shape/behavior for consistency.
+  // Billing lives on organizations (confirmed business decision) - one flat plan per
+  // organization, using the shared subscription_plans catalog. The equivalent legacy
+  // per-venue plan (venues.plan_id) was removed entirely 2026-08-20.
   async assignPlan(
     organizationId: string,
     planId: string | null | undefined,
@@ -301,17 +334,16 @@ export class OrganizationsService {
    * or admin. This is the org-side counterpart to VenuesService.listVenuePrNetworkMembers,
    * which is scoped to one venue; this one intentionally spans all of them (confirmed
    * business rule: the organization sees its own PRs across every venue it works). Each PR
-   * is now a single row (not one per venue - see venue_pr_memberships.organization_id's doc
-   * comment), tagged with the full list of venues it currently covers. */
-  async listPrNetwork(organizationId: string) {
+   * is a single row (not one per venue - see venue_pr_memberships.organization_id's doc
+   * comment), tagged with the full list of venues it currently covers, its resolved
+   * responsabile and - with `include=stats` - the official metrics (own and team), computed
+   * in one aggregate query for the whole network. */
+  async listPrNetwork(
+    organizationId: string,
+    options: { includeStats?: boolean } & PrStatsFilters = {},
+  ) {
     const [memberships, venueLinks] = await Promise.all([
-      this.prisma.venue_pr_memberships.findMany({
-        where: { organization_id: organizationId },
-        include: {
-          user: { select: { id: true, name: true, username: true, email: true } },
-        },
-        orderBy: { created_at: 'asc' },
-      }),
+      this.loadOrganizationMemberships(organizationId),
       this.prisma.organization_venue_links.findMany({
         where: { organization_id: organizationId },
         include: { venue: { select: { id: true, name: true, city: true } } },
@@ -319,114 +351,241 @@ export class OrganizationsService {
     ]);
 
     const venues = venueLinks.map((link) => link.venue);
+    const byId = new Map(memberships.map((m) => [m.id, m]));
+    const metrics = options.includeStats
+      ? await this.computeMemberMetrics(
+          memberships,
+          venues.map((v) => v.id),
+          options,
+        )
+      : null;
 
-    return memberships.map((m) => ({
-      id: m.id,
-      role: m.role,
-      parent_membership_id: m.parent_membership_id,
-      is_active: m.is_active,
-      ref_code: m.ref_code,
-      venues,
-      user: m.user,
-      display_name: m.user.name || m.user.username || m.user.email,
-      created_at: m.created_at,
-    }));
+    return memberships.map((m) => {
+      const parent = m.parent_membership_id
+        ? byId.get(m.parent_membership_id)
+        : undefined;
+      return {
+        id: m.id,
+        role: m.role,
+        parent_membership_id: m.parent_membership_id,
+        parent: parent
+          ? { id: parent.id, display_name: displayName(parent.user) }
+          : null,
+        is_active: m.is_active,
+        ref_code: m.ref_code,
+        venues,
+        user: m.user,
+        display_name: displayName(m.user),
+        team_count: memberships.filter((c) => c.parent_membership_id === m.id)
+          .length,
+        created_at: m.created_at,
+        ...(metrics
+          ? {
+              stats: toPrMetrics(metrics.own(m.id)),
+              team_stats: toPrMetrics(
+                metrics.team.get(m.id) ?? metrics.own(m.id),
+              ),
+            }
+          : {}),
+      };
+    });
   }
 
-  /** Aggregate performance for this organization's PRs, across all its venues by default,
-   * or scoped to one venue via `venueId`. Deliberately a first cut built from the tables
-   * that already exist (qr scans, attributed door entries) rather than a new
-   * analytics/snapshot pipeline - refine once real KPI requirements are defined. */
-  async getStats(organizationId: string, venueId?: string) {
-    // Every PR membership now covers every venue the organization is linked to (no venue_id
-    // of its own - see venue_pr_memberships.organization_id's doc comment), so the
-    // membership set itself no longer needs (or can be) filtered by venue; only the
-    // scan/entry counts below are venue-scoped.
+  /** Full detail of one organization PR: profile, own/team metrics, per-venue metrics, the
+   * last 8 nights at the organization's venues and the events it's assigned to. */
+  async getPrMemberDetail(
+    organizationId: string,
+    memberId: string,
+    filters: PrStatsFilters = {},
+  ) {
     const [memberships, venueLinks] = await Promise.all([
-      this.prisma.venue_pr_memberships.findMany({
+      this.loadOrganizationMemberships(organizationId),
+      this.prisma.organization_venue_links.findMany({
         where: { organization_id: organizationId },
-        select: { id: true, is_active: true },
+        include: { venue: { select: { id: true, name: true, city: true } } },
       }),
+    ]);
+    const member = memberships.find((m) => m.id === memberId);
+    if (!member) throw new NotFoundException('PR non trovato nel tuo network');
+
+    const venues = venueLinks.map((link) => link.venue);
+    const venueIds = venues.map((v) => v.id);
+    const now = new Date();
+
+    const [metrics, pastEvents, assignments] = await Promise.all([
+      this.computeMemberMetrics(memberships, venueIds, filters),
+      venueIds.length
+        ? this.prisma.events.findMany({
+            where: {
+              venue_id: { in: venueIds },
+              status: { not: 'CANCELLED' },
+              date: { lt: now },
+            },
+            orderBy: { date: 'desc' },
+            take: 8,
+            select: { id: true, name: true, date: true, venue_id: true },
+          })
+        : Promise.resolve(
+            [] as Array<{
+              id: string;
+              name: string;
+              date: Date;
+              venue_id: string;
+            }>,
+          ),
+      this.prisma.venue_pr_event_assignments.findMany({
+        where: {
+          pr_membership_id: memberId,
+          is_active: true,
+          event: { date: { gte: startOfDay(now) } },
+        },
+        orderBy: { event: { date: 'asc' } },
+        select: {
+          event: {
+            select: {
+              id: true,
+              name: true,
+              date: true,
+              status: true,
+              venue: { select: { id: true, name: true } },
+            },
+          },
+        },
+      }),
+    ]);
+
+    const historyRows = pastEvents.length
+      ? await this.venuesService.queryPrCounters({
+          membershipIds: [memberId],
+          eventIds: pastEvents.map((e) => e.id),
+          bucket: 'event',
+        })
+      : [];
+    const perEvent = foldPrCounterRows(historyRows).get(memberId);
+
+    const parent = member.parent_membership_id
+      ? memberships.find((m) => m.id === member.parent_membership_id)
+      : undefined;
+    const children = memberships.filter(
+      (m) => m.parent_membership_id === member.id,
+    );
+
+    return {
+      id: member.id,
+      role: member.role,
+      is_active: member.is_active,
+      ref_code: member.ref_code,
+      created_at: member.created_at,
+      user: { ...member.user, email: member.user.email },
+      display_name: displayName(member.user),
+      parent: parent
+        ? { id: parent.id, display_name: displayName(parent.user) }
+        : null,
+      team: children.map((c) => ({
+        id: c.id,
+        display_name: displayName(c.user),
+        is_active: c.is_active,
+      })),
+      stats: toPrMetrics(metrics.own(member.id)),
+      team_stats: toPrMetrics(
+        metrics.team.get(member.id) ?? metrics.own(member.id),
+      ),
+      by_venue: venues.map((venue) => ({
+        venue,
+        ...toPrMetrics(sumBuckets(metrics.counters.get(member.id), venue.id)),
+      })),
+      // Oldest first, ready to be drawn left-to-right.
+      history: [...pastEvents].reverse().map((event) => {
+        const c = perEvent?.get(event.id) ?? emptyPrCounters();
+        return {
+          event_id: event.id,
+          name: event.name,
+          date: event.date,
+          venue_id: event.venue_id,
+          referral_reservations: c.referral_reservations,
+          attributed_entries: c.attributed_entries,
+        };
+      }),
+      assigned_events: assignments.map((a) => a.event),
+    };
+  }
+
+  /** Aggregate performance of this organization's PRs with the official metrics
+   * (common/pr/pr-metrics.util.ts): totals, per linked venue and per member (own + team_*),
+   * optionally scoped to one venue and/or a date range on the event date. One aggregate
+   * query for the whole network, so the PR screen can render every row without N+1. */
+  async getStats(organizationId: string, filters: PrStatsFilters = {}) {
+    const [memberships, venueLinks] = await Promise.all([
+      this.loadOrganizationMemberships(organizationId),
       this.prisma.organization_venue_links.findMany({
         where: {
           organization_id: organizationId,
-          ...(venueId ? { venue_id: venueId } : {}),
+          ...(filters.venue_id ? { venue_id: filters.venue_id } : {}),
         },
         include: { venue: { select: { id: true, name: true, city: true } } },
       }),
     ]);
-    const membershipIds = memberships.map((m) => m.id);
-    const activePrCount = memberships.filter((m) => m.is_active).length;
 
-    if (membershipIds.length === 0) {
+    const metrics = await this.computeMemberMetrics(
+      memberships,
+      venueLinks.map((link) => link.venue.id),
+      filters,
+    );
+
+    const totals = emptyPrCounters();
+    for (const m of memberships) addPrCounters(totals, metrics.own(m.id));
+
+    const byVenue = venueLinks.map((link) => {
+      const venueCounters = emptyPrCounters();
+      for (const m of memberships) {
+        addPrCounters(
+          venueCounters,
+          sumBuckets(metrics.counters.get(m.id), link.venue.id),
+        );
+      }
       return {
-        active_pr_count: 0,
-        total_pr_count: 0,
-        total_scans: 0,
-        total_attributed_entries: 0,
-        by_venue: venueLinks.map((link) => ({
-          venue: link.venue,
-          active_pr_count: 0,
-          total_scans: 0,
-          total_attributed_entries: 0,
-        })),
+        venue: link.venue,
+        linked_at: link.created_at,
+        ...toPrMetrics(venueCounters),
+        // Legacy names, kept while clients migrate to the official ones above.
+        total_scans: venueCounters.scans,
+        total_attributed_entries: venueCounters.attributed_entries,
       };
-    }
+    });
 
-    const scanScope = venueId ? { venue_id: venueId } : {};
-    // `entries` has no venue_id column of its own (only event_id), so its venue is resolved
-    // through the event it belongs to.
-    const [scanCount, entryCount, scansByVenue, entryRows] =
-      await Promise.all([
-        this.prisma.venue_pr_qr_scans.count({
-          where: { pr_membership_id: { in: membershipIds }, ...scanScope },
-        }),
-        this.prisma.entries.count({
-          where: {
-            pr_membership_id: { in: membershipIds },
-            ...(venueId ? { event: { venue_id: venueId } } : {}),
-          },
-        }),
-        this.prisma.venue_pr_qr_scans.groupBy({
-          by: ['venue_id'],
-          where: { pr_membership_id: { in: membershipIds }, ...scanScope },
-          _count: { _all: true },
-        }),
-        this.prisma.entries.findMany({
-          where: { pr_membership_id: { in: membershipIds } },
-          select: { event: { select: { venue_id: true } } },
-        }),
-      ]);
-
-    const entryCountByVenue = new Map<string, number>();
-    for (const row of entryRows) {
-      const vId = row.event.venue_id;
-      entryCountByVenue.set(vId, (entryCountByVenue.get(vId) ?? 0) + 1);
-    }
-
-    const byVenue = venueLinks.map((link) => ({
-      venue: link.venue,
-      active_pr_count: activePrCount,
-      total_scans:
-        scansByVenue.find((s) => s.venue_id === link.venue.id)?._count
-          ._all ?? 0,
-      total_attributed_entries: entryCountByVenue.get(link.venue.id) ?? 0,
-    }));
+    const byMember = memberships.map((m) => {
+      const team = toPrMetrics(metrics.team.get(m.id) ?? metrics.own(m.id));
+      return {
+        membership_id: m.id,
+        ...toPrMetrics(metrics.own(m.id)),
+        team_referral_reservations: team.referral_reservations,
+        team_referral_guests: team.referral_guests,
+        team_attributed_entries: team.attributed_entries,
+        team_conversion_rate: team.conversion_rate,
+        team_scans: team.scans,
+      };
+    });
 
     return {
-      active_pr_count: activePrCount,
+      venue_id: filters.venue_id ?? null,
+      from: filters.from?.toISOString() ?? null,
+      to: filters.to?.toISOString() ?? null,
+      active_pr_count: memberships.filter((m) => m.is_active).length,
       total_pr_count: memberships.length,
-      total_scans: scanCount,
-      total_attributed_entries: entryCount,
+      responsabili_count: memberships.filter((m) => m.role === 'responsabile')
+        .length,
+      ...toPrMetrics(totals),
+      total_scans: totals.scans,
+      total_attributed_entries: totals.attributed_entries,
       by_venue: byVenue,
+      by_member: byMember,
     };
   }
 
   /** Performance of the organizations working a given venue's events — venue ownership
-   * enforced by VenueOwnershipGuard at the controller level. Deliberately scoped to
-   * entries/scans that carry this venue_id, which is how the "locale sees org performance
-   * only within its own events" rule is enforced: there is no cross-venue leak by
-   * construction, not by an extra filter that could be forgotten. */
+   * enforced by VenueOwnershipGuard at the controller level. Exclusivity rule: the venue only
+   * ever sees the organization's aggregate at its own venue, never the individual PRs, so
+   * by_member / by_venue are deliberately dropped here. */
   async getStatsForVenue(venueId: string, organizationId: string) {
     const link = await this.prisma.organization_venue_links.findUnique({
       where: {
@@ -437,48 +596,70 @@ export class OrganizationsService {
       },
     });
     if (!link)
-      throw new NotFoundException('Organization is not linked to this venue');
+      throw new NotFoundException(
+        'Organizzazione non collegata a questo locale',
+      );
 
-    return this.getStatsUnscoped(organizationId, venueId);
+    const stats = await this.getStats(organizationId, { venue_id: venueId });
+    return {
+      active_pr_count: stats.active_pr_count,
+      total_pr_count: stats.total_pr_count,
+      referral_reservations: stats.referral_reservations,
+      referral_guests: stats.referral_guests,
+      attributed_entries: stats.attributed_entries,
+      conversion_rate: stats.conversion_rate,
+      scans: stats.scans,
+      total_scans: stats.total_scans,
+      total_attributed_entries: stats.total_attributed_entries,
+    };
   }
 
-  // getStats requires org-actor-based authorization; this venue-facing variant already did
-  // its own authorization above (venue ownership, not org ownership), so it computes the
-  // same aggregate directly instead of routing through getStats's org access check. Since
-  // every org PR membership now covers every linked venue (no venue_id of its own), "the
-  // org's PR memberships at this venue" is just all of them, given the caller already
-  // verified the org-venue link.
-  private async getStatsUnscoped(organizationId: string, venueId: string) {
-    const memberships = await this.prisma.venue_pr_memberships.findMany({
+  private async loadOrganizationMemberships(organizationId: string) {
+    const rows = await this.prisma.venue_pr_memberships.findMany({
       where: { organization_id: organizationId },
-      select: { id: true, is_active: true },
-    });
-    const membershipIds = memberships.map((m) => m.id);
-    if (membershipIds.length === 0) {
-      return {
-        active_pr_count: 0,
-        total_pr_count: 0,
-        total_scans: 0,
-        total_attributed_entries: 0,
-      };
-    }
-    const [totalScans, totalEntries] = await Promise.all([
-      this.prisma.venue_pr_qr_scans.count({
-        where: { pr_membership_id: { in: membershipIds }, venue_id: venueId },
-      }),
-      this.prisma.entries.count({
-        where: {
-          pr_membership_id: { in: membershipIds },
-          event: { venue_id: venueId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+            email: true,
+            avatar: true,
+          },
         },
-      }),
-    ]);
-    return {
-      active_pr_count: memberships.filter((m) => m.is_active).length,
-      total_pr_count: memberships.length,
-      total_scans: totalScans,
-      total_attributed_entries: totalEntries,
-    };
+      },
+      orderBy: { created_at: 'asc' },
+    });
+    return rows.map((m) => ({
+      id: m.id,
+      role: m.role,
+      parent_membership_id: m.parent_membership_id,
+      is_active: m.is_active,
+      ref_code: m.ref_code,
+      created_at: m.created_at,
+      user: m.user,
+    }));
+  }
+
+  private async computeMemberMetrics(
+    memberships: Array<{ id: string; parent_membership_id: string | null }>,
+    venueIds: string[],
+    filters: PrStatsFilters,
+  ) {
+    const rows =
+      memberships.length && venueIds.length
+        ? await this.venuesService.queryPrCounters({
+            membershipIds: memberships.map((m) => m.id),
+            venueIds,
+            from: filters.from,
+            to: filters.to,
+            bucket: 'venue',
+          })
+        : [];
+    const counters = foldPrCounterRows(rows);
+    const own = (id: string) => sumBuckets(counters.get(id));
+    const team = rollupTeamCounters(memberships, own);
+    return { counters, own, team };
   }
 
   // PR-network mutations - organization ownership already enforced by
@@ -503,8 +684,174 @@ export class OrganizationsService {
    * network - org-scoped counterpart to VenuesService.lookupUserForPrInvite, since an
    * organization-invited PR isn't tied to any one of the org's venues (see
    * createOrganizationPrMember). */
-  async lookupPrInviteUser(identifier: string) {
-    return this.venuesService.lookupUserForPrInvite(identifier);
+  async lookupPrInviteUser(organizationId: string, identifier: string) {
+    const user = await this.venuesService.lookupUserForPrInvite(identifier);
+    // Tells the invite sheet up front what createOrganizationPrMember would answer, so it
+    // can show "Già nel tuo network" / "Lavora già per un'altra organizzazione" on step 1.
+    const memberships = await this.prisma.venue_pr_memberships.findMany({
+      where: { user_id: user.id, organization_id: { not: null } },
+      select: { organization_id: true, is_active: true },
+    });
+    const status = memberships.some((m) => m.organization_id === organizationId)
+      ? ('in_network' as const)
+      : memberships.some((m) => m.is_active)
+        ? ('other_organization' as const)
+        : ('available' as const);
+    return { ...user, status };
+  }
+
+  async regeneratePrRefCode(organizationId: string, memberId: string) {
+    return this.venuesService.regenerateOrganizationPrRefCode(
+      organizationId,
+      memberId,
+    );
+  }
+
+  private async loadOrganizationEvent(organizationId: string, eventId: string) {
+    const event = await this.prisma.events.findUnique({
+      where: { id: eventId },
+      select: {
+        id: true,
+        name: true,
+        date: true,
+        status: true,
+        venue_id: true,
+        organization_id: true,
+      },
+    });
+    if (!event) throw new NotFoundException('Evento non trovato');
+    if (event.organization_id === organizationId) return event;
+    // The organization's PRs work every night at its linked venues, including the venue's
+    // own events - so it may assign them there too. Anything else: 404 (not 403), no
+    // existence leak across tenants.
+    const link = await this.prisma.organization_venue_links.findUnique({
+      where: {
+        organization_id_venue_id: {
+          organization_id: organizationId,
+          venue_id: event.venue_id,
+        },
+      },
+      select: { id: true },
+    });
+    if (!link) throw new NotFoundException('Evento non trovato');
+    return event;
+  }
+
+  /** The organization's PRs with an `assigned` flag for one of its events. Only assigned PRs
+   * can have their QR scans registered by the staff; the referral link works regardless. */
+  async listEventPrAssignments(organizationId: string, eventId: string) {
+    await this.loadOrganizationEvent(organizationId, eventId);
+    const [memberships, assignments] = await Promise.all([
+      this.loadOrganizationMemberships(organizationId),
+      this.prisma.venue_pr_event_assignments.findMany({
+        where: {
+          event_id: eventId,
+          pr_membership: { organization_id: organizationId },
+        },
+        select: { pr_membership_id: true, is_active: true },
+      }),
+    ]);
+    const assigned = new Set(
+      assignments.filter((a) => a.is_active).map((a) => a.pr_membership_id),
+    );
+    const byId = new Map(memberships.map((m) => [m.id, m]));
+    return memberships.map((m) => {
+      const parent = m.parent_membership_id
+        ? byId.get(m.parent_membership_id)
+        : undefined;
+      return {
+        membership_id: m.id,
+        role: m.role,
+        is_active: m.is_active,
+        ref_code: m.ref_code,
+        display_name: displayName(m.user),
+        user: {
+          id: m.user.id,
+          name: m.user.name,
+          username: m.user.username,
+          avatar: m.user.avatar,
+        },
+        parent: parent
+          ? { id: parent.id, display_name: displayName(parent.user) }
+          : null,
+        assigned: assigned.has(m.id),
+      };
+    });
+  }
+
+  /** Replaces the assigned set for an event: `membership_ids` is the complete list (anything
+   * not in it gets is_active=false, never deleted), `all_active` assigns every active PR. */
+  async setEventPrAssignments(
+    organizationId: string,
+    eventId: string,
+    body: { membership_ids?: string[]; all_active?: boolean },
+    actor: RequestUser | undefined,
+  ) {
+    const event = await this.loadOrganizationEvent(organizationId, eventId);
+    if (!body.all_active && !Array.isArray(body.membership_ids)) {
+      throw new BadRequestException(
+        'Indica i PR da assegnare (membership_ids) oppure all_active',
+      );
+    }
+
+    const memberships = await this.loadOrganizationMemberships(organizationId);
+    const byId = new Map(memberships.map((m) => [m.id, m]));
+    const target = new Set<string>(
+      body.all_active
+        ? memberships.filter((m) => m.is_active).map((m) => m.id)
+        : (body.membership_ids ?? []),
+    );
+    for (const id of target) {
+      const m = byId.get(id);
+      if (!m) throw new BadRequestException('PR non trovato nel tuo network');
+      if (!m.is_active) {
+        throw new BadRequestException(
+          `${displayName(m.user)} è disattivato: riattivalo prima di assegnarlo`,
+        );
+      }
+    }
+
+    const toDeactivate = memberships
+      .filter((m) => !target.has(m.id))
+      .map((m) => m.id);
+
+    await this.prisma.$transaction([
+      ...[...target].map((membershipId) =>
+        this.prisma.venue_pr_event_assignments.upsert({
+          where: {
+            event_id_pr_membership_id: {
+              event_id: eventId,
+              pr_membership_id: membershipId,
+            },
+          },
+          create: {
+            venue_id: event.venue_id,
+            event_id: eventId,
+            pr_membership_id: membershipId,
+            is_active: true,
+            assigned_by_user_id: actor?.id ?? null,
+          },
+          update: {
+            is_active: true,
+            assigned_by_user_id: actor?.id ?? null,
+          },
+        }),
+      ),
+      ...(toDeactivate.length
+        ? [
+            this.prisma.venue_pr_event_assignments.updateMany({
+              where: {
+                event_id: eventId,
+                pr_membership_id: { in: toDeactivate },
+                is_active: true,
+              },
+              data: { is_active: false },
+            }),
+          ]
+        : []),
+    ]);
+
+    return this.listEventPrAssignments(organizationId, eventId);
   }
 
   async updatePrMember(
@@ -534,7 +881,7 @@ export class OrganizationsService {
    * forecast's personal-rate model (AttendanceForecastService) had to process to learn each
    * person's reliability, and a no-show is exactly as much analysis work as a show. Confirmed
    * decision 2026-08-20: this quota only applies at the organization level (an organization's
-   * own plan), not to venues still on their own legacy `venues.plan_id`.
+   * own plan) - the legacy per-venue equivalent (`venues.plan_id`) was removed the same day.
    *
    * The usage count itself resets every calendar month (a fresh query each time, nothing
    * persisted) - but the personal reliability data it's built from is never reset by this:
@@ -542,8 +889,7 @@ export class OrganizationsService {
    * history regardless of which month "clienti analizzati" happens to be counting right now.
    * The two are deliberately decoupled - see the doc comment there.
    *
-   * Reuses the same resolvePlanTerms/computeOverage math AdminService uses for the per-venue
-   * equivalent (getVenues/getDashboardUncached), via the shared billing util. */
+   * Uses the shared resolvePlanTerms/computeOverage billing util (common/billing/plan-usage.util.ts). */
   async getUsage(organizationId: string) {
     const organization = await this.prisma.organizations.findUnique({
       where: { id: organizationId },
@@ -623,21 +969,119 @@ export class OrganizationsService {
       extra_events_cost: overage?.extraEventsCost ?? 0,
       extra_people_cost: overage?.extraPeopleCost ?? 0,
       overage_cost: overage?.overageCost ?? 0,
+      // Unit prices, so the organization can see what the next extra event/person would
+      // cost (estimates only: NightHub invoices at month end, nothing is paid in-app).
+      terms: organization.plan
+        ? {
+            monthly_price: terms.monthlyPrice,
+            extra_event_price: terms.extraEventPrice,
+            extra_person_price: terms.extraPersonPrice,
+            is_custom: organization.plan.is_custom,
+          }
+        : null,
     };
   }
 
-  /** Every event this organization has created, across all its linked venues - both
-   * exclusive management is confirmed to have no exclusivity: the venue can also manage it
-   * (see EventsService.assertEventBelongsToOrganization's doc comment), this is just the
-   * organization's own view of what it created. */
+  /** Every event at the venues this organization works (organization_venue_links), plus any
+   * event it created at a venue it's no longer linked to - the organization's PRs work all of
+   * those nights, so they all belong in its view. `is_own` marks the ones it created (only
+   * those can be edited/cancelled by the organization, see EventsService). `status` is the
+   * effective, time-driven status (DRAFT = scheduled, LIVE = now, CLOSED = over), computed
+   * with the same DB function the status cron uses, so a stale row never shows "in
+   * programma" for a night that's already over. */
   async listEvents(organizationId: string) {
-    return this.prisma.events.findMany({
+    const links = await this.prisma.organization_venue_links.findMany({
       where: { organization_id: organizationId },
+      select: { venue_id: true },
+    });
+    const venueIds = links.map((l) => l.venue_id);
+    const scope: Prisma.eventsWhereInput = {
+      OR: [
+        { organization_id: organizationId },
+        ...(venueIds.length ? [{ venue_id: { in: venueIds } }] : []),
+      ],
+    };
+
+    const events = await this.prisma.events.findMany({
+      where: scope,
       include: {
-        venue: { select: { id: true, name: true, city: true } },
+        venue: { select: { id: true, name: true, city: true, image: true } },
         entry_prices: true,
       },
       orderBy: { date: 'desc' },
+      take: 500,
+    });
+    if (!events.length) return [];
+
+    // Per-event counters in one query. PR-related counts only include this organization's
+    // own PRs (the venue's own PRs work the same nights, but they're not the org's business).
+    const counts = await this.prisma.$queryRaw<
+      Array<{
+        event_id: string;
+        effective_status: string;
+        list_count: number;
+        entries_count: number;
+        pr_assigned_count: number;
+        referral_reservations: number;
+        attributed_entries: number;
+      }>
+    >(Prisma.sql`
+      SELECT
+        ev.id AS event_id,
+        public.compute_event_status(ev.date, ev.start_time, ev.end_time, ev.status)::text AS effective_status,
+        (
+          SELECT COALESCE(SUM(r.guests), 0)::int
+          FROM reservations r
+          WHERE r.event_id = ev.id
+            AND r.type = 'entry'
+            AND r.status <> 'cancelled'
+        ) AS list_count,
+        (
+          SELECT COUNT(*)::int FROM entries e WHERE e.event_id = ev.id
+        ) AS entries_count,
+        (
+          SELECT COUNT(*)::int
+          FROM venue_pr_event_assignments a
+          JOIN venue_pr_memberships m ON m.id = a.pr_membership_id
+          WHERE a.event_id = ev.id
+            AND a.is_active = true
+            AND m.organization_id = ${organizationId}::uuid
+        ) AS pr_assigned_count,
+        (
+          SELECT COUNT(*)::int
+          FROM reservations r
+          WHERE r.event_id = ev.id
+            AND r.status <> 'cancelled'
+            AND r.meta->>'pr_membership_id' IN (
+              SELECT m.id::text
+              FROM venue_pr_memberships m
+              WHERE m.organization_id = ${organizationId}::uuid
+            )
+        ) AS referral_reservations,
+        (
+          SELECT COUNT(*)::int
+          FROM entries e
+          JOIN venue_pr_memberships m ON m.id = e.pr_membership_id
+          WHERE e.event_id = ev.id
+            AND m.organization_id = ${organizationId}::uuid
+        ) AS attributed_entries
+      FROM events ev
+      WHERE ev.id IN (${Prisma.join(events.map((e) => Prisma.sql`${e.id}::uuid`))})
+    `);
+
+    const countsByEvent = new Map(counts.map((c) => [c.event_id, c]));
+    return events.map((event) => {
+      const c = countsByEvent.get(event.id);
+      return {
+        ...event,
+        status: (c?.effective_status as typeof event.status) ?? event.status,
+        is_own: event.organization_id === organizationId,
+        list_count: Number(c?.list_count ?? 0),
+        entries_count: Number(c?.entries_count ?? 0),
+        pr_assigned_count: Number(c?.pr_assigned_count ?? 0),
+        referral_reservations: Number(c?.referral_reservations ?? 0),
+        attributed_entries: Number(c?.attributed_entries ?? 0),
+      };
     });
   }
 }

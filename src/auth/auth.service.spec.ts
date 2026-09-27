@@ -168,6 +168,49 @@ describe('AuthService', () => {
     });
   });
 
+  describe('username availability', () => {
+    it('reports a taken username case-insensitively', async () => {
+      prisma.users.findFirst.mockResolvedValue({ id: 'u1' });
+
+      await expect(service.isUsernameAvailable('  Giulia ')).resolves.toEqual({
+        available: false,
+      });
+      expect(prisma.users.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { username: { equals: 'giulia', mode: 'insensitive' } },
+        }),
+      );
+    });
+
+    it('reports a free username as available', async () => {
+      prisma.users.findFirst.mockResolvedValue(null);
+      await expect(service.isUsernameAvailable('giulia')).resolves.toEqual({
+        available: true,
+      });
+    });
+
+    it('treats usernames shorter than 3 chars as unavailable without querying', async () => {
+      await expect(service.isUsernameAvailable('ab')).resolves.toEqual({
+        available: false,
+      });
+      expect(prisma.users.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('register rejects a username already taken with different casing', async () => {
+      prisma.users.findFirst.mockResolvedValue({ id: 'u1' });
+
+      await expect(
+        service.register({
+          email: 'new@example.com',
+          username: 'giulia',
+          password: 'password123',
+          name: 'Giulia',
+        }),
+      ).rejects.toThrow('User already exists (username)');
+      expect(prisma.users.create).not.toHaveBeenCalled();
+    });
+  });
+
   describe('verifyAccessToken', () => {
     it('accepts a token it signed and returns the RequestUser it encodes', () => {
       const jwt = new JwtService({ secret: TEST_JWT_SECRET });

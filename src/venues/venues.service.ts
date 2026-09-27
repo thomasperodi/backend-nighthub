@@ -2,6 +2,7 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   InternalServerErrorException,
 } from '@nestjs/common';
@@ -33,16 +34,24 @@ import {
   venues,
 } from '@prisma/client';
 import { resolveEntryUnitPrice } from '../common/entry-pricing';
+import {
+  addPrCounters,
+  emptyPrCounters,
+  foldPrCounterRows,
+  rollupTeamCounters,
+  sumBuckets,
+  toPrMetrics,
+  type PrCounterRow,
+  type PrMetrics,
+} from '../common/pr/pr-metrics.util';
 import { CreateVenueTablesBulkDto } from './dto/create-venue-tables-bulk.dto';
 import { CreateVenueStationsBulkDto } from './dto/create-venue-stations-bulk.dto';
 import { UpdateVenueTableDto } from './dto/update-venue-table.dto';
 import { UpdateVenueStationDto } from './dto/update-venue-station.dto';
 import { UpdateVenuePricingDto } from './dto/update-venue-pricing.dto';
 import {
-  BAR_PRICE_KEYS,
   DEFAULT_BAR_PRICE_LIST,
   DEFAULT_CLOAKROOM_UNIT_PRICE,
-  VenueBarPriceKey,
 } from './venue-pricing.constants';
 import { randomBytes, randomUUID } from 'crypto';
 import { readFileSync } from 'fs';
@@ -86,10 +95,10 @@ type VenueFloorPlanPayload = venue_floor_plans & {
 
 // 2-tier hierarchy (confirmed 2026-08-18, was 3-tier with capo_squadra - see the migration
 // that dropped it from the DB enum).
-type PrNetworkRoleDb = 'responsabile' | 'pr';
-type PrNetworkRoleApi = 'RESPONSABILE' | 'PR';
+export type PrNetworkRoleDb = 'responsabile' | 'pr';
+export type PrNetworkRoleApi = 'RESPONSABILE' | 'PR';
 
-type PrMembershipRow = {
+export type PrMembershipRow = {
   id: string;
   venue_id: string;
   user_id: string;
@@ -103,11 +112,12 @@ type PrMembershipRow = {
   organization_id: string | null;
 };
 
-type PrMemberListRow = PrMembershipRow & {
+export type PrMemberListRow = PrMembershipRow & {
   user_name: string | null;
   user_username: string | null;
   user_email: string;
   user_role: string;
+  user_avatar: string | null;
   organization_name: string | null;
 };
 
@@ -123,6 +133,7 @@ type PrEventAssignmentRow = {
   role: PrNetworkRoleDb;
   ref_code: string;
   parent_membership_id: string | null;
+  organization_id?: string | null;
   user_name: string | null;
   user_username: string | null;
   user_email: string;
@@ -566,25 +577,34 @@ export class VenuesService {
     ).test(value.replace(/[?#].*$/, ''));
   }
 
+  // Bar price list is per venue and free-form (like the bottle list). A venue that never
+  // saved one (column null) starts from DEFAULT_BAR_PRICE_LIST; once saved, the venue's own
+  // list is returned as-is, custom items included.
   private normalizeBarPriceList(value: unknown) {
-    const incomingList = Array.isArray(value) ? value : [];
-    const byKey = new Map<string, number>();
-
-    for (const raw of incomingList) {
-      if (!raw || typeof raw !== 'object') continue;
-      const row = raw as { key?: unknown; price?: unknown };
-      const key = typeof row.key === 'string' ? row.key.trim() : '';
-      if (!key || !BAR_PRICE_KEYS.has(key as VenueBarPriceKey)) continue;
-      const price = Number(row.price);
-      if (!Number.isFinite(price) || price < 0) continue;
-      byKey.set(key, Number(price.toFixed(2)));
+    if (!Array.isArray(value)) {
+      return DEFAULT_BAR_PRICE_LIST.map((item) => ({ ...item }));
     }
 
-    return DEFAULT_BAR_PRICE_LIST.map((item) => ({
-      key: item.key,
-      label: item.label,
-      price: Number((byKey.get(item.key) ?? item.price).toFixed(2)),
-    }));
+    const list: Array<{ key: string; label: string; price: number }> = [];
+    const seenKeys = new Set<string>();
+
+    for (const raw of value) {
+      if (!raw || typeof raw !== 'object') continue;
+      const row = raw as { key?: unknown; label?: unknown; price?: unknown };
+      const key = typeof row.key === 'string' ? row.key.trim() : '';
+      if (!key || seenKeys.has(key)) continue;
+      const price = Number(row.price);
+      if (!Number.isFinite(price) || price < 0) continue;
+      const label =
+        (typeof row.label === 'string' && row.label.trim()) ||
+        DEFAULT_BAR_PRICE_LIST.find((item) => item.key === key)?.label ||
+        key;
+
+      seenKeys.add(key);
+      list.push({ key, label, price: Number(price.toFixed(2)) });
+    }
+
+    return list;
   }
 
   private normalizeBarPriceListInput(value: unknown) {
@@ -593,12 +613,12 @@ export class VenuesService {
     }
 
     const seenKeys = new Set<string>();
-    const list = value.map((raw) => {
+    return value.map((raw) => {
       const row = raw as { key?: unknown; label?: unknown; price?: unknown };
       const key = typeof row.key === 'string' ? row.key.trim() : '';
-      if (!key || !BAR_PRICE_KEYS.has(key as VenueBarPriceKey)) {
+      if (!key || key.length > 64) {
         throw new BadRequestException(
-          `Unsupported bar price key: ${key || 'unknown'}`,
+          'Bar item key is required (max 64 chars)',
         );
       }
       if (seenKeys.has(key)) {
@@ -611,25 +631,15 @@ export class VenuesService {
         throw new BadRequestException(`Invalid price for ${key}`);
       }
 
-      const defaultLabel =
-        DEFAULT_BAR_PRICE_LIST.find((item) => item.key === key)?.label ?? key;
       const label =
-        typeof row.label === 'string' && row.label.trim().length
-          ? row.label.trim()
-          : defaultLabel;
+        (typeof row.label === 'string' && row.label.trim()) ||
+        DEFAULT_BAR_PRICE_LIST.find((item) => item.key === key)?.label;
+      if (!label) {
+        throw new BadRequestException(`Bar label is required for ${key}`);
+      }
 
-      return {
-        key,
-        label,
-        price: Number(price.toFixed(2)),
-      };
+      return { key, label, price: Number(price.toFixed(2)) };
     });
-
-    if (list.length === 0) {
-      throw new BadRequestException('bar_price_list cannot be empty');
-    }
-
-    return list;
   }
 
   private normalizeBottlePriceList(value: unknown) {
@@ -828,9 +838,7 @@ export class VenuesService {
     return 'Tavoli';
   }
 
-  private normalizeAppRole(
-    role: unknown,
-  ): 'client' | 'staff' | 'venue' | 'admin' | '' {
+  normalizeAppRole(role: unknown): 'client' | 'staff' | 'venue' | 'admin' | '' {
     const normalized = String(role ?? '')
       .trim()
       .toLowerCase();
@@ -845,7 +853,7 @@ export class VenuesService {
     return '';
   }
 
-  private toPrRoleApi(role: PrNetworkRoleDb): PrNetworkRoleApi {
+  toPrRoleApi(role: PrNetworkRoleDb): PrNetworkRoleApi {
     if (role === 'responsabile') return 'RESPONSABILE';
     return 'PR';
   }
@@ -859,7 +867,7 @@ export class VenuesService {
     throw new BadRequestException('Unsupported PR role');
   }
 
-  private canManagePrTeam(role: PrNetworkRoleDb): boolean {
+  canManagePrTeam(role: PrNetworkRoleDb): boolean {
     return role === 'responsabile';
   }
 
@@ -929,7 +937,7 @@ export class VenuesService {
     return out;
   }
 
-  private toIsoString(value: Date | string | null | undefined): string {
+  toIsoString(value: Date | string | null | undefined): string {
     if (value instanceof Date) return value.toISOString();
     if (!value) return new Date().toISOString();
     const parsed = new Date(value);
@@ -937,7 +945,7 @@ export class VenuesService {
     return parsed.toISOString();
   }
 
-  private mapPrMember(row: PrMemberListRow) {
+  mapPrMember(row: PrMemberListRow) {
     return {
       id: row.id,
       venue_id: row.venue_id,
@@ -955,6 +963,7 @@ export class VenuesService {
         username: row.user_username,
         email: row.user_email,
         role: String(row.user_role || '').toLowerCase(),
+        avatar: row.user_avatar ?? null,
       },
       display_name: row.user_name || row.user_username || row.user_email,
       organization_id: row.organization_id,
@@ -1203,6 +1212,7 @@ export class VenuesService {
         u.username AS user_username,
         u.email AS user_email,
         u.role::text AS user_role,
+        u.avatar AS user_avatar,
         o.name AS organization_name
       FROM venue_pr_memberships m
       JOIN users u ON u.id = m.user_id
@@ -1237,6 +1247,7 @@ export class VenuesService {
         u.username AS user_username,
         u.email AS user_email,
         u.role::text AS user_role,
+        u.avatar AS user_avatar,
         o.name AS organization_name
       FROM venue_pr_memberships m
       JOIN users u ON u.id = m.user_id
@@ -1251,12 +1262,55 @@ export class VenuesService {
     `);
   }
 
+  // Every PR who works this venue: its own venue-owned rows PLUS the rows of every
+  // organization linked to it (org-owned rows have venue_id NULL and cover all the org's
+  // linked venues). loadPrMemberRows alone misses the latter, which is why an
+  // organization's PR used to see an empty dashboard. Callers acting as the `venue` role
+  // must still drop organization rows (exclusivity rule: the venue never sees org PRs).
+  async loadPrMemberRowsForVenue(venueId: string): Promise<PrMemberListRow[]> {
+    return this.prisma.$queryRaw<PrMemberListRow[]>(Prisma.sql`
+      SELECT
+        m.id,
+        m.venue_id,
+        m.user_id,
+        m.role::text AS role,
+        m.parent_membership_id,
+        m.ref_code,
+        m.is_active,
+        m.created_by_user_id,
+        m.created_at,
+        m.updated_at,
+        m.organization_id,
+        u.name AS user_name,
+        u.username AS user_username,
+        u.email AS user_email,
+        u.role::text AS user_role,
+        u.avatar AS user_avatar,
+        o.name AS organization_name
+      FROM venue_pr_memberships m
+      JOIN users u ON u.id = m.user_id
+      LEFT JOIN organizations o ON o.id = m.organization_id
+      WHERE m.venue_id = ${venueId}::uuid
+         OR m.organization_id IN (
+           SELECT l.organization_id
+           FROM organization_venue_links l
+           WHERE l.venue_id = ${venueId}::uuid
+         )
+      ORDER BY
+        CASE m.role
+          WHEN 'responsabile' THEN 0
+          ELSE 1
+        END,
+        COALESCE(u.name, u.username, u.email) ASC
+    `);
+  }
+
   // Hierarchy/subtree checks (who can this actor manage or scan for) need the actor's full
   // team: for a venue-owned actor that's every row at this venue; for an org-owned actor
   // (organization_id set, no venue_id of its own) it's every row in that organization,
   // regardless of which of the org's linked venues the action is happening at - matching how
   // updateOrganizationPrMember scopes its own hierarchy checks.
-  private async loadPrHierarchyRowsForActor(
+  async loadPrHierarchyRowsForActor(
     venueId: string,
     actorMembership: PrMembershipRow,
   ): Promise<PrMemberListRow[]> {
@@ -1286,6 +1340,7 @@ export class VenuesService {
         u.username AS user_username,
         u.email AS user_email,
         u.role::text AS user_role,
+        u.avatar AS user_avatar,
         o.name AS organization_name
       FROM venue_pr_memberships m
       JOIN users u ON u.id = m.user_id
@@ -1298,7 +1353,7 @@ export class VenuesService {
   }
 
   // Org-owned rows have no venue_id - see loadPrMembershipByIdGlobal's doc comment.
-  private async loadPrMemberRowByIdGlobal(
+  async loadPrMemberRowByIdGlobal(
     memberId: string,
   ): Promise<PrMemberListRow | null> {
     const rows = await this.prisma.$queryRaw<PrMemberListRow[]>(Prisma.sql`
@@ -1318,6 +1373,7 @@ export class VenuesService {
         u.username AS user_username,
         u.email AS user_email,
         u.role::text AS user_role,
+        u.avatar AS user_avatar,
         o.name AS organization_name
       FROM venue_pr_memberships m
       JOIN users u ON u.id = m.user_id
@@ -1333,7 +1389,7 @@ export class VenuesService {
   // (org-owned rows have no venue_id of their own, see venue_pr_memberships.organization_id's
   // doc comment). This is what lets a PR invited by an organization access every venue it's
   // linked to, not just one.
-  private async loadPrMembershipByUser(
+  async loadPrMembershipByUser(
     venueId: string,
     userId: string,
   ): Promise<PrMembershipRow | null> {
@@ -1408,7 +1464,7 @@ export class VenuesService {
   // Org-owned rows have no venue_id (they cover every venue the organization is linked to -
   // see venue_pr_memberships.organization_id's doc comment), so organization-scoped call
   // sites resolve by id/ref_code alone instead of the venue-scoped loaders above.
-  private async loadPrMembershipByIdGlobal(
+  async loadPrMembershipByIdGlobal(
     memberId: string,
   ): Promise<PrMembershipRow | null> {
     const rows = await this.prisma.$queryRaw<PrMembershipRow[]>(Prisma.sql`
@@ -1494,7 +1550,7 @@ export class VenuesService {
   // it's a venue-owned row (venue_id set) or an org-owned row (organization_id set, works
   // every venue the org is linked to). Returns null if the membership doesn't actually work
   // this venue.
-  private async resolveScannablePrMembership(
+  async resolveScannablePrMembership(
     venueId: string,
     lookup: { id?: string; refCode?: string },
   ): Promise<PrMembershipRow | null> {
@@ -1525,7 +1581,7 @@ export class VenuesService {
     return null;
   }
 
-  private collectPrSubtree(
+  collectPrSubtree(
     rootId: string,
     rows: Array<{ id: string; parent_membership_id: string | null }>,
   ): Set<string> {
@@ -1561,29 +1617,107 @@ export class VenuesService {
     if (role === 'responsabile') {
       if (parent) {
         throw new BadRequestException(
-          'Il ruolo RESPONSABILE non puo avere un superiore',
+          'Un responsabile non può avere un superiore',
         );
       }
       return;
     }
 
     if (!parent) {
-      throw new BadRequestException('Questo ruolo richiede un superiore');
+      throw new BadRequestException(
+        'Un PR deve stare sotto un responsabile: sceglilo prima di salvare',
+      );
     }
 
     // Only 'pr' reaches here (role === 'responsabile' already returned above) - with the
     // 2-tier hierarchy, its parent must always be a responsabile.
     if (parent.role !== 'responsabile') {
       throw new BadRequestException(
-        'PR deve essere assegnato sotto un RESPONSABILE',
+        'Il superiore di un PR deve essere un responsabile',
       );
+    }
+  }
+
+  /** How many memberships (active or not) sit directly under this one. */
+  async countPrChildren(membershipId: string): Promise<number> {
+    return this.prisma.venue_pr_memberships.count({
+      where: { parent_membership_id: membershipId },
+    });
+  }
+
+  // "Storico" = anything the metrics are built from. A membership with history must never be
+  // hard-deleted: the FK cascades would wipe its scans, event assignments and season pass,
+  // and SET NULL would silently orphan its attributed entries - rewriting past numbers of
+  // the PR, its responsabile and the organization. Deactivation keeps all of it.
+  async getPrMembershipHistory(membershipId: string) {
+    const [scans, entries, reservations, passScans] = await Promise.all([
+      this.prisma.venue_pr_qr_scans.count({
+        where: { pr_membership_id: membershipId },
+      }),
+      this.prisma.entries.count({
+        where: { pr_membership_id: membershipId },
+      }),
+      this.prisma.$queryRaw<Array<{ count: number }>>(Prisma.sql`
+        SELECT COUNT(*)::int AS count
+        FROM reservations
+        WHERE meta->>'pr_membership_id' = ${membershipId}
+      `),
+      this.prisma.venue_pr_membership_pass_scans.count({
+        where: { pr_membership_id: membershipId },
+      }),
+    ]);
+    const reservationCount = Number(reservations[0]?.count ?? 0);
+    return {
+      scans,
+      entries,
+      reservations: reservationCount,
+      pass_scans: passScans,
+      has_history: scans + entries + reservationCount + passScans > 0,
+    };
+  }
+
+  /** Shared delete guard for venue- and organization-side removals (409s the UI turns into
+   * "sposta prima il team" / "disattiva invece"). */
+  async assertPrMembershipDeletable(membershipId: string) {
+    const children = await this.countPrChildren(membershipId);
+    if (children > 0) {
+      throw new ConflictException({
+        code: 'HAS_TEAM',
+        team_count: children,
+        message: `Sposta prima i suoi ${children} PR sotto un altro responsabile`,
+      });
+    }
+    const history = await this.getPrMembershipHistory(membershipId);
+    if (history.has_history) {
+      throw new ConflictException({
+        code: 'HAS_HISTORY',
+        history,
+        message:
+          'Ha già dello storico (scan, ingressi o prenotazioni): disattivalo invece di rimuoverlo, così le statistiche restano corrette',
+      });
+    }
+  }
+
+  /** responsabile → pr would leave its PRs under a plain PR, breaking the 2-level rule. */
+  async assertRoleChangeKeepsHierarchy(
+    existing: PrMembershipRow,
+    nextRole: PrNetworkRoleDb,
+  ) {
+    if (existing.role !== 'responsabile' || nextRole !== 'pr') return;
+    const children = await this.countPrChildren(existing.id);
+    if (children > 0) {
+      throw new ConflictException({
+        code: 'HAS_TEAM',
+        team_count: children,
+        message: `Sposta prima i suoi ${children} PR sotto un altro responsabile`,
+      });
     }
   }
 
   // ref_code is globally unique across venue_pr_memberships (not venue-scoped), since
   // org-owned rows have no venue to scope against - so uniqueness is always checked globally,
   // for venue-owned rows too.
-  private async buildUniquePrRefCode(
+  async buildUniquePrRefCode(
     seed: string,
     excludeMemberId?: string,
   ): Promise<string> {
@@ -1619,7 +1753,7 @@ export class VenuesService {
     throw new BadRequestException('Impossibile generare un ref_code univoco');
   }
 
-  private async resolvePrActorContext(
+  async resolvePrActorContext(
     venueId: string,
     user?: RequestUser,
     requireManagePermission = false,
@@ -1658,7 +1792,7 @@ export class VenuesService {
   // that. `allSettled` (not `all`) preserves the original error priority: if both would
   // fail, "venue not found" still wins over "forbidden", matching the previous sequential
   // `await getVenue(); await resolvePrActorContext();` behavior.
-  private async getVenueAndPrActorContext(
+  async getVenueAndPrActorContext(
     venueId: string,
     user?: RequestUser,
     requireManagePermission = false,
@@ -3205,11 +3339,29 @@ export class VenuesService {
       passRow = updatedRows[0] ?? passRow;
     }
 
+    // Same branding the .pkpass uses (venue_wallet_templates), so the in-app preview matches
+    // what lands in Apple Wallet. null fields = NightHub's default dark/gold pass.
+    const template = await this.prisma.venue_wallet_templates.findUnique({
+      where: { venue_id: venueId },
+      select: {
+        logo_path: true,
+        background_color: true,
+        foreground_color: true,
+        label_color: true,
+      },
+    });
+
     return {
       venue_id: venueId,
       venue_name: venue.name,
       membership_id: membership.id,
       pass: this.mapPrSeasonPass(passRow),
+      template: {
+        logo_path: template?.logo_path ?? null,
+        background_color: template?.background_color ?? null,
+        foreground_color: template?.foreground_color ?? null,
+        label_color: template?.label_color ?? null,
+      },
       generated_at: now.toISOString(),
     };
   }
@@ -3292,9 +3444,12 @@ export class VenuesService {
     // `loadPrMemberRows` doesn't depend on the actor-context check (only used afterward to
     // filter `visibleRows`), so it runs alongside it instead of after - same fix as
     // `getPrDashboardStats` (PERFORMANCE_CHANGES.md #24).
+    // Venue rows + rows of the organizations linked to this venue: an organization's PR
+    // (venue_id NULL) must see its own team here too. The `venue` role still gets the org
+    // rows filtered out below.
     const [actorContext, rows] = await Promise.all([
       this.getVenueAndPrActorContext(venueId, user, false),
-      this.loadPrMemberRows(venueId),
+      this.loadPrMemberRowsForVenue(venueId),
     ]);
     const visibleRows =
       !actorContext.owner && actorContext.membership
@@ -3324,8 +3479,12 @@ export class VenuesService {
   // minimal fields the invite form needs to confirm it found the right person - never the
   // full user row.
   async lookupUserForPrInvite(identifier: string) {
-    const value = String(identifier || '').trim();
-    if (!value) throw new BadRequestException('identifier is required');
+    const value = String(identifier || '')
+      .trim()
+      .replace(/^@/, '');
+    if (!value) {
+      throw new BadRequestException('Scrivi email, username o ID');
+    }
 
     const isUuid =
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
@@ -3340,13 +3499,14 @@ export class VenuesService {
           })
         : await this.prisma.users.findUnique({ where: { username: value } });
 
-    if (!user) throw new NotFoundException('User not found');
+    if (!user) throw new NotFoundException('Nessun utente trovato');
 
     return {
       id: user.id,
       name: user.name,
       email: user.email,
       username: user.username,
+      avatar: user.avatar,
       role: user.role,
     };
   }
@@ -3546,7 +3706,12 @@ export class VenuesService {
 
       if (payload.parent_membership_id !== undefined) {
         nextParentId = payload.parent_membership_id ?? null;
+      } else if (nextRole === 'responsabile') {
+        // Promoting a PR: a responsabile never has a superior.
+        nextParentId = null;
       }
+
+      await this.assertRoleChangeKeepsHierarchy(existing, nextRole);
 
       if (payload.ref_code !== undefined) {
         nextRefCode = await this.buildUniquePrRefCode(
@@ -3680,21 +3845,8 @@ export class VenuesService {
       }
     }
 
-    const children = await this.prisma.$queryRaw<
-      Array<{ id: string }>
-    >(Prisma.sql`
-      SELECT id
-      FROM venue_pr_memberships
-      WHERE venue_id = ${venueId}::uuid
-        AND parent_membership_id = ${memberId}::uuid
-      LIMIT 1
-    `);
-
-    if (children.length > 0) {
-      throw new BadRequestException(
-        'Impossibile eliminare: riassegna prima i membri del team collegati',
-      );
-    }
+    // Never wipes history: 409 HAS_TEAM / HAS_HISTORY (the UI offers "Disattiva" instead).
+    await this.assertPrMembershipDeletable(memberId);
 
     await this.prisma.$executeRaw(Prisma.sql`
       DELETE FROM venue_pr_memberships
@@ -3721,6 +3873,8 @@ export class VenuesService {
       role: string;
       parent_membership_id?: string | null;
       ref_code?: string | null;
+      /** Set when a responsabile adds to their own team (POST /pr-network/me/team). */
+      created_by_user_id?: string | null;
     },
   ) {
     const org = await this.prisma.organizations.findUnique({
@@ -3728,11 +3882,11 @@ export class VenuesService {
       select: { id: true, is_active: true },
     });
     if (!org || !org.is_active) {
-      throw new BadRequestException('Organization not found or inactive');
+      throw new BadRequestException('Organizzazione non trovata o disattivata');
     }
 
     if (!payload?.user_id) {
-      throw new BadRequestException('user_id is required');
+      throw new BadRequestException('Seleziona un utente da aggiungere');
     }
 
     const targetRole = this.toPrRoleDb(payload.role);
@@ -3741,30 +3895,45 @@ export class VenuesService {
       where: { id: payload.user_id },
       select: { id: true, email: true, username: true, name: true },
     });
-    if (!targetUser) throw new NotFoundException('User not found');
+    if (!targetUser) throw new NotFoundException('Utente non trovato');
 
-    const existingMembership =
-      await this.prisma.venue_pr_memberships.findFirst({
-        where: { organization_id: organizationId, user_id: payload.user_id },
-        select: { id: true },
+    const existingMemberships = await this.prisma.venue_pr_memberships.findMany(
+      {
+        where: { user_id: payload.user_id, organization_id: { not: null } },
+        select: { id: true, organization_id: true, is_active: true },
+      },
+    );
+    if (existingMemberships.some((m) => m.organization_id === organizationId)) {
+      throw new ConflictException({
+        code: 'IN_NETWORK',
+        message: 'È già nel tuo network',
       });
-    if (existingMembership) {
-      throw new BadRequestException(
-        'User already assigned to this organization PR network',
-      );
+    }
+    // Confirmed rule: a PR works for at most one organization at a time. A deactivated
+    // membership elsewhere doesn't block (the PR has left that organization).
+    if (existingMemberships.some((m) => m.is_active)) {
+      throw new ConflictException({
+        code: 'OTHER_ORGANIZATION',
+        message: "Lavora già per un'altra organizzazione",
+      });
     }
 
     const resolvedParentId = payload.parent_membership_id ?? null;
     const parent = resolvedParentId
       ? await this.loadPrMembershipByIdGlobal(resolvedParentId)
       : null;
-    if (resolvedParentId && !parent) {
-      throw new BadRequestException('Parent membership not found');
-    }
     // A PR hierarchy stays within one organization - can't chain to a venue-owned or
     // another organization's responsabile.
-    if (parent && parent.organization_id !== organizationId) {
-      throw new BadRequestException('Parent membership not found');
+    if (
+      (resolvedParentId && !parent) ||
+      (parent && parent.organization_id !== organizationId)
+    ) {
+      throw new BadRequestException('Responsabile non trovato nel tuo network');
+    }
+    if (parent && !parent.is_active) {
+      throw new BadRequestException(
+        'Il responsabile scelto è disattivato: scegline un altro',
+      );
     }
 
     this.validatePrHierarchy(targetRole, parent);
@@ -3787,6 +3956,7 @@ export class VenuesService {
         ref_code,
         is_active,
         organization_id,
+        created_by_user_id,
         updated_at
       )
       VALUES (
@@ -3797,6 +3967,7 @@ export class VenuesService {
         ${refCode},
         true,
         ${organizationId}::uuid,
+        ${payload.created_by_user_id ?? null}::uuid,
         NOW()
       )
       RETURNING id
@@ -3804,7 +3975,7 @@ export class VenuesService {
 
     const createdId = inserted[0]?.id;
     if (!createdId) {
-      throw new BadRequestException('Unable to create PR membership');
+      throw new BadRequestException('Impossibile aggiungere il PR, riprova');
     }
 
     const row = await this.loadPrMemberRowByIdGlobal(createdId);
@@ -3840,7 +4011,8 @@ export class VenuesService {
       organizationId,
       memberId,
     );
-    if (!existing) throw new NotFoundException('PR membership not found');
+    if (!existing)
+      throw new NotFoundException('PR non trovato nel tuo network');
 
     let nextRole = existing.role;
     let nextParentId = existing.parent_membership_id;
@@ -3852,6 +4024,9 @@ export class VenuesService {
     }
     if (payload.parent_membership_id !== undefined) {
       nextParentId = payload.parent_membership_id ?? null;
+    } else if (nextRole === 'responsabile') {
+      // Promoting a PR: a responsabile never has a superior.
+      nextParentId = null;
     }
     if (payload.ref_code !== undefined) {
       nextRefCode = await this.buildUniquePrRefCode(
@@ -3863,20 +4038,29 @@ export class VenuesService {
       nextIsActive = Boolean(payload.is_active);
     }
 
+    await this.assertRoleChangeKeepsHierarchy(existing, nextRole);
+
     if (nextParentId && nextParentId === existing.id) {
       throw new BadRequestException(
-        'Un membro non puo essere il proprio superiore',
+        'Un membro non può essere il superiore di sé stesso',
       );
     }
 
     const parent = nextParentId
       ? await this.loadPrMembershipByIdGlobal(nextParentId)
       : null;
-    if (nextParentId && !parent) {
-      throw new BadRequestException('Parent membership not found');
+    if (
+      (nextParentId && !parent) ||
+      (parent && parent.organization_id !== organizationId)
+    ) {
+      throw new BadRequestException('Responsabile non trovato nel tuo network');
     }
-    if (parent && parent.organization_id !== organizationId) {
-      throw new BadRequestException('Parent membership not found');
+    const parentChanged =
+      (nextParentId ?? null) !== (existing.parent_membership_id ?? null);
+    if (parent && parentChanged && !parent.is_active) {
+      throw new BadRequestException(
+        'Il responsabile scelto è disattivato: scegline un altro',
+      );
     }
 
     if (nextParentId) {
@@ -3935,22 +4119,11 @@ export class VenuesService {
       organizationId,
       memberId,
     );
-    if (!existing) throw new NotFoundException('PR membership not found');
+    if (!existing)
+      throw new NotFoundException('PR non trovato nel tuo network');
 
-    const children = await this.prisma.$queryRaw<
-      Array<{ id: string }>
-    >(Prisma.sql`
-      SELECT id
-      FROM venue_pr_memberships
-      WHERE organization_id = ${organizationId}::uuid
-        AND parent_membership_id = ${memberId}::uuid
-      LIMIT 1
-    `);
-    if (children.length > 0) {
-      throw new BadRequestException(
-        'Impossibile eliminare: riassegna prima i membri del team collegati',
-      );
-    }
+    // Never wipes history: 409 HAS_TEAM / HAS_HISTORY (the UI offers "Disattiva" instead).
+    await this.assertPrMembershipDeletable(memberId);
 
     await this.prisma.$executeRaw(Prisma.sql`
       DELETE FROM venue_pr_memberships
@@ -3961,50 +4134,106 @@ export class VenuesService {
     return { deleted: true, id: memberId };
   }
 
+  // New ref_code for an organization PR - the old `?pr=` links stop attributing on purpose
+  // (use case: a leaked or abused link). Seeded from the username like the original one.
+  async regenerateOrganizationPrRefCode(
+    organizationId: string,
+    memberId: string,
+  ) {
+    const existing = await this.findOrganizationMembership(
+      organizationId,
+      memberId,
+    );
+    if (!existing)
+      throw new NotFoundException('PR non trovato nel tuo network');
+
+    const current = await this.loadPrMemberRowByIdGlobal(memberId);
+    const seed =
+      current?.user_username ||
+      current?.user_name ||
+      existing.ref_code.split('-')[0] ||
+      'PR';
+    const refCode = await this.buildUniquePrRefCode(seed, memberId);
+
+    await this.prisma.$executeRaw(Prisma.sql`
+      UPDATE venue_pr_memberships
+      SET ref_code = ${refCode}, updated_at = NOW()
+      WHERE id = ${memberId}::uuid
+        AND organization_id = ${organizationId}::uuid
+    `);
+
+    const row = await this.loadPrMemberRowByIdGlobal(memberId);
+    if (!row) throw new NotFoundException('PR non trovato nel tuo network');
+    return this.mapPrMember(row);
+  }
+
   async listMyPrVenueMemberships(user?: RequestUser) {
     if (!user?.id) throw new ForbiddenException('Forbidden');
 
     // An org-owned membership has no venue_id of its own - it fans out to one row per venue
     // the organization is linked to (organization_venue_links), same shape as a venue-owned
     // row, so callers of this "which venues do I work" list don't need to special-case it.
-    const rows = await this.prisma.$queryRaw<PrMembershipVenueRow[]>(Prisma.sql`
-      SELECT
-        m.id AS membership_id,
-        v.id AS venue_id,
-        v.name AS venue_name,
-        v.city AS venue_city,
-        m.role::text AS role,
-        m.parent_membership_id,
-        m.ref_code,
-        m.is_active,
-        m.created_at,
-        m.updated_at
-      FROM venue_pr_memberships m
-      JOIN venues v ON v.id = m.venue_id
-      WHERE m.user_id = ${user.id}::uuid
-        AND m.is_active = true
+    // `source` + organization_* let the PR app group them back into work contexts.
+    const rows = await this.prisma.$queryRaw<
+      Array<
+        PrMembershipVenueRow & {
+          organization_id: string | null;
+          organization_name: string | null;
+          parent_name: string | null;
+          parent_username: string | null;
+        }
+      >
+    >(Prisma.sql`
+      SELECT *
+      FROM (
+        SELECT
+          m.id AS membership_id,
+          v.id AS venue_id,
+          v.name AS venue_name,
+          v.city AS venue_city,
+          m.role::text AS role,
+          m.parent_membership_id,
+          m.ref_code,
+          m.is_active,
+          m.created_at,
+          m.updated_at,
+          NULL::uuid AS organization_id,
+          NULL::text AS organization_name
+        FROM venue_pr_memberships m
+        JOIN venues v ON v.id = m.venue_id
+        WHERE m.user_id = ${user.id}::uuid
+          AND m.is_active = true
 
-      UNION ALL
+        UNION ALL
 
-      SELECT
-        m.id AS membership_id,
-        v.id AS venue_id,
-        v.name AS venue_name,
-        v.city AS venue_city,
-        m.role::text AS role,
-        m.parent_membership_id,
-        m.ref_code,
-        m.is_active,
-        m.created_at,
-        m.updated_at
-      FROM venue_pr_memberships m
-      JOIN organization_venue_links l ON l.organization_id = m.organization_id
-      JOIN venues v ON v.id = l.venue_id
-      WHERE m.user_id = ${user.id}::uuid
-        AND m.is_active = true
-        AND m.organization_id IS NOT NULL
-
-      ORDER BY updated_at DESC
+        SELECT
+          m.id AS membership_id,
+          v.id AS venue_id,
+          v.name AS venue_name,
+          v.city AS venue_city,
+          m.role::text AS role,
+          m.parent_membership_id,
+          m.ref_code,
+          m.is_active,
+          m.created_at,
+          m.updated_at,
+          o.id AS organization_id,
+          o.name AS organization_name
+        FROM venue_pr_memberships m
+        JOIN organizations o ON o.id = m.organization_id
+        JOIN organization_venue_links l ON l.organization_id = m.organization_id
+        JOIN venues v ON v.id = l.venue_id
+        WHERE m.user_id = ${user.id}::uuid
+          AND m.is_active = true
+          AND m.organization_id IS NOT NULL
+      ) mv
+      LEFT JOIN LATERAL (
+        SELECT pu.name AS parent_name, pu.username AS parent_username
+        FROM venue_pr_memberships pm
+        JOIN users pu ON pu.id = pm.user_id
+        WHERE pm.id = mv.parent_membership_id
+      ) parent ON TRUE
+      ORDER BY mv.updated_at DESC
     `);
 
     return rows.map((row) => ({
@@ -4014,6 +4243,17 @@ export class VenuesService {
       venue_city: row.venue_city,
       role: this.toPrRoleApi(row.role),
       parent_membership_id: row.parent_membership_id,
+      parent: row.parent_membership_id
+        ? {
+            id: row.parent_membership_id,
+            name: row.parent_name || row.parent_username || null,
+          }
+        : null,
+      source: row.organization_id
+        ? ('organization' as const)
+        : ('venue' as const),
+      organization_id: row.organization_id,
+      organization_name: row.organization_name,
       ref_code: row.ref_code,
       is_active: Boolean(row.is_active),
       can_manage_team: this.canManagePrTeam(row.role),
@@ -4035,31 +4275,36 @@ export class VenuesService {
     await this.ensureEventBelongsToVenue(payload.event_id, venueId);
 
     const actorContext = await this.resolvePrActorContext(venueId, user, true);
-    const membership = await this.loadPrMembershipById(
-      venueId,
-      payload.pr_membership_id,
-    );
-    if (!membership) {
-      throw new NotFoundException('PR membership not found');
+    // Resolves both kinds of row: a venue-owned membership at this venue, or an org-owned
+    // one (venue_id NULL) whose organization is linked here. The old venue_id-only lookup
+    // answered "PR membership not found" for every organization PR, which in turn made
+    // registerPrQrScan fail with "PR is not assigned to this event".
+    const membership = await this.resolveScannablePrMembership(venueId, {
+      id: payload.pr_membership_id,
+    });
+    // Exclusivity: the venue can't manage (or even learn about) an organization's PRs.
+    if (
+      !membership ||
+      (membership.organization_id &&
+        this.normalizeAppRole(user?.role) === 'venue')
+    ) {
+      throw new NotFoundException('PR non trovato');
     }
     if (!membership.is_active) {
-      throw new BadRequestException('PR membership is not active');
+      throw new BadRequestException('Questo PR è disattivato');
     }
 
     if (!actorContext.owner && actorContext.membership) {
-      const treeRows = await this.prisma.$queryRaw<
-        Array<{ id: string; parent_membership_id: string | null }>
-      >(Prisma.sql`
-        SELECT id, parent_membership_id
-        FROM venue_pr_memberships
-        WHERE venue_id = ${venueId}::uuid
-      `);
+      const treeRows = await this.loadPrHierarchyRowsForActor(
+        venueId,
+        actorContext.membership,
+      );
       const allowed = this.collectPrSubtree(
         actorContext.membership.id,
         treeRows,
       );
       if (!allowed.has(membership.id)) {
-        throw new ForbiddenException('Forbidden');
+        throw new ForbiddenException('Puoi assegnare solo i PR del tuo team');
       }
     }
 
@@ -4158,6 +4403,7 @@ export class VenuesService {
         m.role::text AS role,
         m.ref_code,
         m.parent_membership_id,
+        m.organization_id,
         u.name AS user_name,
         u.username AS user_username,
         u.email AS user_email
@@ -4181,7 +4427,11 @@ export class VenuesService {
     const actorContext = actorContextResult.value;
 
     if (actorContext.owner) {
-      return rows.map((row) => this.mapPrEventAssignment(row));
+      // Exclusivity: the venue doesn't see which organization PRs work its events.
+      const isVenueRole = this.normalizeAppRole(user?.role) === 'venue';
+      return rows
+        .filter((row) => !isVenueRole || !row.organization_id)
+        .map((row) => this.mapPrEventAssignment(row));
     }
 
     const actorMembership = actorContext.membership;
@@ -4559,6 +4809,131 @@ export class VenuesService {
     };
   }
 
+  // One round trip for the official PR metrics (common/pr/pr-metrics.util.ts) of any set of
+  // memberships, grouped per membership and per `bucket` (venue, event, or nothing). Every
+  // counter is scoped through the event it belongs to, so an organization PR's numbers at
+  // venue A can never leak into venue B's figures. Used by the venue/PR dashboard and by the
+  // organization stats - which is what keeps "ingressi portati" identical on every screen.
+  async queryPrCounters(params: {
+    venueIds?: string[];
+    eventIds?: string[];
+    membershipIds?: string[];
+    from?: Date;
+    to?: Date;
+    bucket: 'none' | 'venue' | 'event';
+  }): Promise<PrCounterRow[]> {
+    if (
+      params.venueIds?.length === 0 ||
+      params.eventIds?.length === 0 ||
+      params.membershipIds?.length === 0
+    ) {
+      return [];
+    }
+
+    const uuidList = (ids: string[]) =>
+      Prisma.join(ids.map((id) => Prisma.sql`${id}::uuid`));
+
+    const eventFilters: Prisma.Sql[] = [];
+    if (params.venueIds) {
+      eventFilters.push(
+        Prisma.sql`AND ev.venue_id IN (${uuidList(params.venueIds)})`,
+      );
+    }
+    if (params.eventIds) {
+      eventFilters.push(
+        Prisma.sql`AND ev.id IN (${uuidList(params.eventIds)})`,
+      );
+    }
+    if (params.from)
+      eventFilters.push(Prisma.sql`AND ev.date >= ${params.from}`);
+    if (params.to) eventFilters.push(Prisma.sql`AND ev.date < ${params.to}`);
+    const eventWhere = eventFilters.length
+      ? Prisma.join(eventFilters, ' ')
+      : Prisma.empty;
+
+    const ids = params.membershipIds;
+    const reservationMembers = ids
+      ? Prisma.sql`AND r.meta->>'pr_membership_id' IN (${Prisma.join(ids)})`
+      : Prisma.sql`AND r.meta->>'pr_membership_id' IS NOT NULL`;
+    const entryMembers = ids
+      ? Prisma.sql`AND e.pr_membership_id IN (${uuidList(ids)})`
+      : Prisma.sql`AND e.pr_membership_id IS NOT NULL`;
+    const scanMembers = ids
+      ? Prisma.sql`AND s.pr_membership_id IN (${uuidList(ids)})`
+      : Prisma.empty;
+
+    const bucket =
+      params.bucket === 'venue'
+        ? Prisma.sql`ev.venue_id::text`
+        : params.bucket === 'event'
+          ? Prisma.sql`ev.id::text`
+          : Prisma.sql`''`;
+
+    return this.prisma.$queryRaw<PrCounterRow[]>(Prisma.sql`
+      SELECT
+        t.pr_membership_id,
+        t.bucket,
+        SUM(t.referral_reservations)::int AS referral_reservations,
+        SUM(t.referral_guests)::int AS referral_guests,
+        SUM(t.attributed_entries)::int AS attributed_entries,
+        SUM(t.scans)::int AS scans
+      FROM (
+        SELECT
+          (r.meta->>'pr_membership_id') AS pr_membership_id,
+          ${bucket} AS bucket,
+          COUNT(*) AS referral_reservations,
+          COALESCE(SUM(r.guests), 0) AS referral_guests,
+          0 AS attributed_entries,
+          0 AS scans
+        FROM reservations r
+        JOIN events ev ON ev.id = r.event_id
+        WHERE r.status <> 'cancelled'
+          ${reservationMembers}
+          ${eventWhere}
+        GROUP BY 1, 2
+
+        UNION ALL
+
+        SELECT
+          e.pr_membership_id::text,
+          ${bucket},
+          0,
+          0,
+          COUNT(*),
+          0
+        FROM entries e
+        JOIN events ev ON ev.id = e.event_id
+        WHERE TRUE
+          ${entryMembers}
+          ${eventWhere}
+        GROUP BY 1, 2
+
+        UNION ALL
+
+        SELECT
+          s.pr_membership_id::text,
+          ${bucket},
+          0,
+          0,
+          0,
+          COUNT(*)
+        FROM venue_pr_qr_scans s
+        JOIN events ev ON ev.id = s.event_id
+        WHERE TRUE
+          ${scanMembers}
+          ${eventWhere}
+        GROUP BY 1, 2
+      ) t
+      GROUP BY t.pr_membership_id, t.bucket
+    `);
+  }
+
+  // `entries` stays as an alias of attributed_entries (and `scans` keeps its name) so
+  // frontends built on the previous shape keep working while they migrate.
+  withLegacyPrAliases(metrics: PrMetrics) {
+    return { ...metrics, entries: metrics.attributed_entries };
+  }
+
   async getPrDashboardStats(
     venueId: string,
     user?: RequestUser,
@@ -4568,158 +4943,56 @@ export class VenuesService {
     },
   ) {
     const eventId = filters?.event_id ?? undefined;
-    // `memberRows` and `scanRows` don't depend on `actorContext`/the event-ownership check at
-    // all (they're only filtered by `visibleIds` afterward) - all four run together instead of
-    // 3 sequential round trips.
-    const [actorContext, , memberRows, scanRows, referralReservationRows] =
-      await Promise.all([
-        this.getVenueAndPrActorContext(venueId, user, false),
-        eventId ? this.ensureEventBelongsToVenue(eventId, venueId) : undefined,
-        this.loadPrMemberRows(venueId),
-        this.prisma.$queryRaw<
-          Array<{
-            pr_membership_id: string;
-            scans_count: number;
-            entries_count: number;
-          }>
-        >(Prisma.sql`
-        SELECT
-          pr_membership_id,
-          COUNT(*)::int AS scans_count,
-          COUNT(entry_id)::int AS entries_count
-        FROM venue_pr_qr_scans
-        WHERE venue_id = ${venueId}::uuid
-          ${eventId ? Prisma.sql`AND event_id = ${eventId}::uuid` : Prisma.empty}
-        GROUP BY pr_membership_id
-      `),
-        // Conversions from the PR's shareable link/code (reservations.meta.pr_membership_id,
-        // set in ReservationsService.createReservation once a referral resolves) - previously
-        // this dashboard only ever read physical badge scans, so link-driven bookings never
-        // showed up here even after they started being attributed correctly.
-        this.prisma.$queryRaw<
-          Array<{
-            pr_membership_id: string;
-            referral_reservations_count: number;
-          }>
-        >(Prisma.sql`
-        SELECT
-          (r.meta->>'pr_membership_id')::uuid AS pr_membership_id,
-          COUNT(*)::int AS referral_reservations_count
-        FROM reservations r
-        INNER JOIN events e ON e.id = r.event_id
-        WHERE e.venue_id = ${venueId}::uuid
-          AND r.meta->>'pr_membership_id' IS NOT NULL
-          AND r.status <> 'cancelled'
-          ${eventId ? Prisma.sql`AND r.event_id = ${eventId}::uuid` : Prisma.empty}
-        GROUP BY 1
-      `),
-      ]);
+    // None of the loads depend on each other - the member rows and counters are only
+    // filtered by the actor's visibility afterward.
+    const [actorContext, , allRows, counterRows] = await Promise.all([
+      this.getVenueAndPrActorContext(venueId, user, false),
+      eventId ? this.ensureEventBelongsToVenue(eventId, venueId) : undefined,
+      this.loadPrMemberRowsForVenue(venueId),
+      this.queryPrCounters({
+        venueIds: [venueId],
+        eventIds: eventId ? [eventId] : undefined,
+        bucket: 'none',
+      }),
+    ]);
 
-    let visibleRows = memberRows;
+    // Exclusivity: the venue account never sees an organization's PRs (only their aggregate,
+    // via GET /venues/:id/organizations/:orgId/stats). Admin keeps full oversight.
+    let visibleRows =
+      this.normalizeAppRole(user?.role) === 'venue'
+        ? allRows.filter((row) => !row.organization_id)
+        : allRows;
     if (!actorContext.owner && actorContext.membership) {
       const allowed = this.collectPrSubtree(
         actorContext.membership.id,
-        memberRows,
+        visibleRows,
       );
-      visibleRows = memberRows.filter((row) => allowed.has(row.id));
+      visibleRows = visibleRows.filter((row) => allowed.has(row.id));
     }
 
+    const counters = foldPrCounterRows(counterRows);
+    const own = (id: string) => sumBuckets(counters.get(id));
+    // Rolled up over everything the actor can see, before narrowing to `membership_id`, so a
+    // responsabile's team_stats stay correct even when only that one row is requested.
+    const team = rollupTeamCounters(visibleRows, own);
+
+    let listedRows = visibleRows;
     if (filters?.membership_id) {
       const target = visibleRows.find(
         (row) => row.id === filters.membership_id,
       );
       if (!target) throw new ForbiddenException('Forbidden');
-      visibleRows = [target];
+      listedRows = [target];
     }
 
-    const visibleIds = new Set(visibleRows.map((row) => row.id));
-
-    const statsByMember = new Map<
-      string,
-      { scans: number; entries: number; referral_reservations: number }
-    >();
-    for (const row of scanRows) {
-      if (!visibleIds.has(row.pr_membership_id)) continue;
-      const existing = statsByMember.get(row.pr_membership_id);
-      statsByMember.set(row.pr_membership_id, {
-        scans: Number(row.scans_count ?? 0),
-        entries: Number(row.entries_count ?? 0),
-        referral_reservations: existing?.referral_reservations ?? 0,
-      });
-    }
-    for (const row of referralReservationRows) {
-      if (!row.pr_membership_id || !visibleIds.has(row.pr_membership_id)) {
-        continue;
-      }
-      const existing = statsByMember.get(row.pr_membership_id) ?? {
-        scans: 0,
-        entries: 0,
-        referral_reservations: 0,
-      };
-      existing.referral_reservations = Number(
-        row.referral_reservations_count ?? 0,
-      );
-      statsByMember.set(row.pr_membership_id, existing);
-    }
-
-    const childrenMap = new Map<string, string[]>();
-    for (const row of visibleRows) {
-      if (
-        !row.parent_membership_id ||
-        !visibleIds.has(row.parent_membership_id)
-      ) {
-        continue;
-      }
-      const siblings = childrenMap.get(row.parent_membership_id) ?? [];
-      siblings.push(row.id);
-      childrenMap.set(row.parent_membership_id, siblings);
-    }
-
-    const rollupCache = new Map<
-      string,
-      { scans: number; entries: number; referral_reservations: number }
-    >();
-    const rollup = (
-      membershipId: string,
-    ): { scans: number; entries: number; referral_reservations: number } => {
-      const cached = rollupCache.get(membershipId);
-      if (cached) return cached;
-
-      const own = statsByMember.get(membershipId) ?? {
-        scans: 0,
-        entries: 0,
-        referral_reservations: 0,
-      };
-      const children = childrenMap.get(membershipId) ?? [];
-
-      const totals = {
-        scans: own.scans,
-        entries: own.entries,
-        referral_reservations: own.referral_reservations,
-      };
-      for (const childId of children) {
-        const childTotals = rollup(childId);
-        totals.scans += childTotals.scans;
-        totals.entries += childTotals.entries;
-        totals.referral_reservations += childTotals.referral_reservations;
-      }
-
-      rollupCache.set(membershipId, totals);
-      return totals;
-    };
-
-    const members = visibleRows.map((row) => {
-      const own = statsByMember.get(row.id) ?? {
-        scans: 0,
-        entries: 0,
-        referral_reservations: 0,
-      };
-      const team = rollup(row.id);
+    const members = listedRows.map((row) => {
+      const ownCounters = own(row.id);
       return {
         id: row.id,
         user_id: row.user_id,
         role: this.toPrRoleApi(row.role),
         parent_membership_id: row.parent_membership_id,
+        organization_id: row.organization_id,
         ref_code: row.ref_code,
         is_active: Boolean(row.is_active),
         created_at: this.toIsoString(row.created_at),
@@ -4729,31 +5002,20 @@ export class VenuesService {
           id: row.user_id,
           name: row.user_name,
           username: row.user_username,
-          email: row.user_email,
+          avatar: row.user_avatar ?? null,
+          // Email only for the venue/admin view - PR-to-PR views never expose contact data.
+          email: actorContext.owner ? row.user_email : null,
           role: String(row.user_role || '').toLowerCase(),
         },
-        stats: {
-          scans: own.scans,
-          entries: own.entries,
-          referral_reservations: own.referral_reservations,
-        },
-        team_stats: {
-          scans: team.scans,
-          entries: team.entries,
-          referral_reservations: team.referral_reservations,
-        },
+        stats: this.withLegacyPrAliases(toPrMetrics(ownCounters)),
+        team_stats: this.withLegacyPrAliases(
+          toPrMetrics(team.get(row.id) ?? ownCounters),
+        ),
       };
     });
 
-    const totals = members.reduce(
-      (acc, member) => {
-        acc.scans += member.stats.scans;
-        acc.entries += member.stats.entries;
-        acc.referral_reservations += member.stats.referral_reservations;
-        return acc;
-      },
-      { scans: 0, entries: 0, referral_reservations: 0 },
-    );
+    const totals = emptyPrCounters();
+    for (const row of listedRows) addPrCounters(totals, own(row.id));
 
     return {
       venue_id: venueId,
@@ -4763,12 +5025,13 @@ export class VenuesService {
         : actorContext.membership
           ? this.toPrRoleApi(actorContext.membership.role)
           : 'PR',
+      actor_membership_id: actorContext.membership?.id ?? null,
       can_manage_team: actorContext.owner
         ? true
         : actorContext.membership
           ? this.canManagePrTeam(actorContext.membership.role)
           : false,
-      totals,
+      totals: this.withLegacyPrAliases(toPrMetrics(totals)),
       members,
       generated_at: new Date().toISOString(),
     };

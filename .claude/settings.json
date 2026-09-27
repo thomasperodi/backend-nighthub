@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx jest *)",
+      "Bash(git stash *)",
+      "Read(//c/Users/perod/Desktop/nightApp/pwa/nighthub/features/admin-dashboard/**)",
+      "Read(//c/Users/perod/Desktop/nightApp/pwa/nighthub/**)",
+      "Bash(curl -s -m 3 http://localhost:3001/api/docs-json -o /dev/null -w \"%{http_code}\\\\n\")",
+      "Bash(cd \"c:/Users/perod/Desktop/nightApp/pwa/nighthub\" && npm run generate:api-types 2>&1 | tail -30)",
+      "Bash(grep -c \"AssignVenuePlanDto\\\\|assignVenuePlan\\\\|VenuePlanCustomTermsDto\" \"c:/Users/perod/Desktop/nightApp/pwa/nighthub/lib/api-types.generated.ts\" || true)",
+      "Read(//c/Users/perod/Desktop/nightApp/pwa/nighthub/lib/**)",
+      "Bash(powershell -NoProfile -Command 'Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '\\\\''*nest start*'\\\\'' -or $_.CommandLine -like '\\\\''*start:dev*'\\\\'' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }')",
+      "Bash(curl -s -m 2 http://localhost:3001/api/docs-json -o /dev/null -w \"%{http_code}\\\\n\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\perod\\Desktop\\nightApp\\pwa\\nighthub\\features\\admin-dashboard"
+    ]
+  }
+}

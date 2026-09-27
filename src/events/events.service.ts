@@ -1143,6 +1143,8 @@ export class EventsService {
               description: true,
               image: true,
               is_featured: true,
+              // Lets clients label paid placements (manual) apart from trending (auto).
+              featured_source: true,
               date: true,
               start_time: true,
               end_time: true,
@@ -1195,6 +1197,8 @@ export class EventsService {
             description: true,
             image: true,
             is_featured: true,
+            // Lets clients label paid placements (manual) apart from trending (auto).
+            featured_source: true,
             date: true,
             start_time: true,
             end_time: true,
@@ -1310,6 +1314,8 @@ export class EventsService {
               description: true,
               image: true,
               is_featured: true,
+              // Lets clients label paid placements (manual) apart from trending (auto).
+              featured_source: true,
               date: true,
               start_time: true,
               end_time: true,
@@ -1376,6 +1382,8 @@ export class EventsService {
               description: true,
               image: true,
               is_featured: true,
+              // Lets clients label paid placements (manual) apart from trending (auto).
+              featured_source: true,
               date: true,
               start_time: true,
               end_time: true,

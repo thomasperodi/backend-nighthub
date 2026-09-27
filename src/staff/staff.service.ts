@@ -1112,7 +1112,7 @@ export class StaffService {
       >(Prisma.sql`
         SELECT id, entrati, prenotati
         FROM event_tables
-        WHERE id = ${id}
+        WHERE id = ${id}::uuid
         FOR UPDATE
       `);
       const table = locked[0];

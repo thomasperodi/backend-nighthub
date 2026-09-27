@@ -20,19 +20,9 @@ type BadgeSeed = {
 
 const badges: BadgeSeed[] = [
   // ---------------------------------------------------------------- 1. Nightlife
-  { code: 'prima_notte', category: 'NIGHTLIFE', rarity: 'COMMON', icon: '🌙', name: 'Prima Notte', description: 'Partecipa al tuo primo evento', criteria: { type: 'entries_count', threshold: 1 } },
-  { code: 'nighthubber', category: 'NIGHTLIFE', rarity: 'COMMON', icon: '🎟️', name: 'NightHubber', description: 'Partecipa a 3 eventi', criteria: { type: 'entries_count', threshold: 3 } },
-  { code: 'party_starter', category: 'NIGHTLIFE', rarity: 'RARE', icon: '🔥', name: 'Party Starter', description: 'Partecipa a 5 eventi', criteria: { type: 'entries_count', threshold: 5 } },
-  { code: 'night_lover', category: 'NIGHTLIFE', rarity: 'RARE', icon: '💜', name: 'Night Lover', description: 'Partecipa a 10 eventi', criteria: { type: 'entries_count', threshold: 10 } },
-  { code: 'night_addict', category: 'NIGHTLIFE', rarity: 'EPIC', icon: '🖤', name: 'Night Addict', description: 'Partecipa a 25 eventi', criteria: { type: 'entries_count', threshold: 25 } },
-  { code: 'night_legend', category: 'NIGHTLIFE', rarity: 'LEGENDARY', icon: '👑', name: 'Night Legend', description: 'Partecipa a 50 eventi', criteria: { type: 'entries_count', threshold: 50 } },
-  { code: 'afterlife', category: 'NIGHTLIFE', rarity: 'LEGENDARY', icon: '💀', name: 'Afterlife', description: 'Partecipa a 100 eventi', criteria: { type: 'entries_count', threshold: 100 } },
 
   // ---------------------------------------------------------------- 2. Esplorazione
-  { code: 'explorer', category: 'EXPLORATION', rarity: 'COMMON', icon: '🧭', name: 'Explorer', description: 'Partecipa a 3 eventi diversi', criteria: { type: 'entries_count', threshold: 3 } },
   { code: 'event_hunter', category: 'EXPLORATION', rarity: 'RARE', icon: '🗺️', name: 'Event Hunter', description: 'Partecipa a eventi in 5 locali diversi', criteria: { type: 'distinct_venues_count', threshold: 5 } },
-  { code: 'night_explorer', category: 'EXPLORATION', rarity: 'EPIC', icon: '🌍', name: 'Night Explorer', description: 'Partecipa a 10 eventi diversi', criteria: { type: 'entries_count', threshold: 10 } },
-  { code: 'event_collector', category: 'EXPLORATION', rarity: 'LEGENDARY', icon: '🏆', name: 'Event Collector', description: 'Partecipa a 25 eventi diversi', criteria: { type: 'entries_count', threshold: 25 } },
 
   // ---------------------------------------------------------------- 3. Social
   { code: 'hello_night', category: 'SOCIAL', rarity: 'COMMON', icon: '👋', name: 'Hello Night', description: 'Aggiungi il primo amico', criteria: { type: 'friends_count', threshold: 1 } },
@@ -103,6 +93,25 @@ const badges: BadgeSeed[] = [
   { code: 'mystery', category: 'SECRET', rarity: 'LEGENDARY', icon: '💀', name: '???', description: 'Condizione completamente nascosta', criteria: { type: 'manual' }, isSecret: true },
 ];
 
+/**
+ * Badges removed from the catalog. They're deactivated rather than deleted so users keep
+ * their unlock history (user_badges), but they no longer show up or get evaluated.
+ * - Plain `entries_count` badges (Prima Notte, Night Lover, Explorer...): they only counted
+ *   events attended, which is exactly what the night level (GET /badges/level) measures.
+ */
+const retiredCodes = [
+  'prima_notte',
+  'nighthubber',
+  'party_starter',
+  'night_lover',
+  'night_addict',
+  'night_legend',
+  'afterlife',
+  'explorer',
+  'night_explorer',
+  'event_collector',
+];
+
 async function main() {
   let sortOrder = 0;
   for (const badge of badges) {
@@ -117,6 +126,7 @@ async function main() {
         criteria: badge.criteria as unknown as Prisma.InputJsonValue,
         is_secret: badge.isSecret ?? false,
         is_public: badge.isPublic ?? true,
+        is_active: true,
         sort_order: badge.sortOrder ?? sortOrder,
       },
       create: {
@@ -135,7 +145,12 @@ async function main() {
     sortOrder += 1;
   }
 
-  console.log(`Seeded ${badges.length} badges.`);
+  const retired = await prisma.badges.updateMany({
+    where: { code: { in: retiredCodes }, is_active: true },
+    data: { is_active: false },
+  });
+
+  console.log(`Seeded ${badges.length} badges, retired ${retired.count}.`);
 }
 
 main()

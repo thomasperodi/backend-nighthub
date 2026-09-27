@@ -40,4 +40,9 @@ export class TtlCache {
       throw err;
     }
   }
+
+  /** Drops a cached entry, e.g. after a write that makes it stale. */
+  invalidate(key: string) {
+    this.entries.delete(key);
+  }
 }
