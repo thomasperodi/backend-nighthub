@@ -2,12 +2,13 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
   "framework": null,
+  "fluid": true,
   "outputDirectory": "public",
   "regions": ["fra1"],
   "functions": {
     "api/index.ts": {
       "memory": 1024,
-      "maxDuration": 10,
+      "maxDuration": 30,
       "includeFiles": "certs/**"
     }
   },

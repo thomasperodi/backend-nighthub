@@ -1,6 +1,7 @@
 import { ForbiddenException, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { TtlCache } from '../common/ttl-cache';
+import { mapWithConcurrency } from '../common/map-with-concurrency';
 import { BadgeCriteria } from './badge-criteria.types';
 
 type EntriesCacheRow = {
@@ -35,6 +36,7 @@ export class BadgesService {
   // evaluates fresh - only the next GET can read a cached result for up to the TTL below.
   private readonly selfBadgesCache = new TtlCache();
   private static readonly SELF_BADGES_CACHE_TTL_MS = 5 * 60_000;
+  private static readonly PROGRESS_CONCURRENCY = 3;
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -132,8 +134,13 @@ export class BadgesService {
     // once per call here instead of once per badge.
     const entriesCache = this.createEntriesCache(userId);
 
-    return Promise.all(
-      badges.map(async (badge) => {
+    // Bounded, not Promise.all over the whole catalog: each badge's progress can be several
+    // queries, and firing them all at once starved the instance's shared Prisma pool for
+    // every other in-flight request (pool timeouts -> FUNCTION_INVOCATION_TIMEOUT).
+    return mapWithConcurrency(
+      badges,
+      BadgesService.PROGRESS_CONCURRENCY,
+      async (badge) => {
         const unlockedEntry = unlockedByBadgeId.get(badge.id);
         const isUnlocked = !!unlockedEntry;
         const criteria = badge.criteria as unknown as BadgeCriteria;
@@ -150,7 +157,7 @@ export class BadgesService {
           unlockedAt: unlockedEntry?.unlocked_at ?? null,
           progress,
         });
-      }),
+      },
     );
   }
 

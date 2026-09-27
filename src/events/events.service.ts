@@ -20,6 +20,7 @@ import { SupabaseStorageService } from '../common/storage/supabase-storage.servi
 import { PushDispatchService } from '../common/push/push-dispatch.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { UpdateEventDto } from './dto/update-event.dto';
+import { mapWithConcurrency } from '../common/map-with-concurrency';
 
 export type EventStats = {
   event_id: string;
@@ -2125,8 +2126,10 @@ export class EventsService {
         }),
     );
 
-    const stats = await Promise.all(
-      venueEvents.map((e) => this.getEventStats(e.id)),
+    // Bounded: one recalculation per event (several queries each) for a venue's whole history
+    // would otherwise monopolize the instance's shared Prisma pool.
+    const stats = await mapWithConcurrency(venueEvents, 3, (e) =>
+      this.getEventStats(e.id),
     );
 
     const totals = stats.reduce(
