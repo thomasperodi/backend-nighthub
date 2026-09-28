@@ -1214,8 +1214,13 @@ export class AuthService {
   async setPushToken(userId: string, pushToken: string) {
     if (!pushToken) throw new BadRequestException('push_token required');
 
-    await this.prisma.users.update({
-      where: { id: userId },
+    // Scrive solo se il token è cambiato: le ri-registrazioni dello stesso token (a ogni avvio
+    // dell'app, o in raffica da un client difettoso) non prendono il lock della riga utente.
+    await this.prisma.users.updateMany({
+      where: {
+        id: userId,
+        OR: [{ push_token: null }, { push_token: { not: pushToken } }],
+      },
       data: {
         push_token: pushToken,
         push_token_updated_at: new Date(),

@@ -235,6 +235,9 @@ export class AuthController {
     return result;
   }
 
+  // Un client sano lo chiama una volta per avvio/rotazione del token: il limite frena un client
+  // in loop (è successo con l'app iOS che rilanciava la registrazione dal listener del token).
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @Post('push-token')
   async setPushToken(
     @Body() dto: PushTokenDto,
