@@ -1,6 +1,7 @@
 import { VenueStaysService } from './venue-stays.service';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { PushDispatchService } from '../common/push/push-dispatch.service';
+import type { BadgesService } from '../badges/badges.service';
 
 const time = (h: number, m = 0) => new Date(Date.UTC(1970, 0, 1, h, m));
 
@@ -18,11 +19,13 @@ function setup() {
     },
   };
   const push = { notifyUser: jest.fn().mockResolvedValue(undefined) };
+  const badges = { evaluateForUser: jest.fn().mockResolvedValue([]) };
   const service = new VenueStaysService(
     prisma as unknown as PrismaService,
     push as unknown as PushDispatchService,
+    badges as unknown as BadgesService,
   );
-  return { prisma, push, service };
+  return { prisma, push, badges, service };
 }
 
 describe('VenueStaysService', () => {
@@ -126,6 +129,63 @@ describe('VenueStaysService', () => {
           exit_source: 'geofence',
         },
       });
+    });
+
+    it('a measured exit re-evaluates the badges (exit-time badges)', async () => {
+      const { prisma, badges, service } = setup();
+      prisma.venue_stays.findFirst.mockResolvedValue({
+        id: 'stay-1',
+        entered_at: new Date(Date.now() - 3_600_000),
+        event_id: null,
+      });
+      await service.checkpoint({
+        user_id: 'user-1',
+        venue_id: 'venue-1',
+        event_type: 'exit',
+        exit_source: 'geofence',
+      });
+      expect(badges.evaluateForUser).toHaveBeenCalledWith('user-1');
+    });
+
+    it('an exit reported after the night was over counts as the end of the night, estimated', async () => {
+      const { prisma, badges, service } = setup();
+      prisma.venue_stays.findFirst.mockResolvedValue({
+        id: 'stay-1',
+        entered_at: new Date('2026-08-30T21:00:00Z'),
+        event_id: 'event-1',
+      });
+      prisma.events.findUnique.mockResolvedValue({
+        id: 'event-1',
+        venue_id: 'venue-1',
+      });
+      prisma.events.findMany.mockResolvedValue([
+        {
+          id: 'event-1',
+          date: new Date(Date.UTC(2026, 7, 30)),
+          start_time: time(22),
+          end_time: time(4), // 31 Aug 04:00 Rome = 02:00Z
+        },
+      ]);
+
+      await service.checkpoint({
+        user_id: 'user-1',
+        venue_id: 'venue-1',
+        event_id: 'event-1',
+        event_type: 'exit',
+        exit_source: 'geofence',
+        timestamp: '2026-08-31T09:00:00Z', // geofence fired the next morning
+      });
+
+      expect(prisma.venue_stays.update).toHaveBeenCalledWith({
+        where: { id: 'stay-1' },
+        data: {
+          exited_at: new Date('2026-08-31T02:00:00Z'),
+          duration_ms: 5 * 3_600_000,
+          exit_source: 'auto',
+        },
+      });
+      // Not a measured exit: no exit-time badge from it.
+      expect(badges.evaluateForUser).not.toHaveBeenCalled();
     });
   });
 

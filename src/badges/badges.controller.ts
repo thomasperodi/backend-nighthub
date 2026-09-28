@@ -79,10 +79,7 @@ export class BadgesController {
       throw new BadRequestException('user_id and badge_code are required');
     }
 
-    const result = await this.badgesService.awardManualBadge(
-      userId,
-      badgeCode,
-    );
+    const result = await this.badgesService.awardManualBadge(userId, badgeCode);
     if (!result) throw new BadRequestException('Unknown badge_code');
     return result;
   }

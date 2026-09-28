@@ -7,6 +7,7 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { PushDispatchService } from '../common/push/push-dispatch.service';
 import { eventEndMs } from '../common/event-time.util';
+import { BadgesService } from '../badges/badges.service';
 
 type EventTimes = {
   date: Date | null;
@@ -16,6 +17,16 @@ type EventTimes = {
 
 /** How an exit was detected, stored in venue_stays.exit_source (see schema). */
 export type StayExitSource = 'geofence' | 'app' | 'auto';
+
+/**
+ * Stays with a real exit time: only geofence exits. 'app' is only an upper bound (the user may
+ * have left hours before opening the app) and 'auto' is the end of the night, so both would
+ * inflate the average stay and fake exit-time badges. Use it for every "permanenza" metric.
+ */
+export const MEASURED_STAY_WHERE = {
+  duration_ms: { not: null },
+  exit_source: 'geofence',
+} as const;
 
 /** A stay without an event is closed after this long if the app never reports the exit. */
 const MAX_STAY_WITHOUT_EVENT_MS = 12 * 60 * 60 * 1000;
@@ -37,6 +48,7 @@ export class VenueStaysService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly pushDispatch: PushDispatchService,
+    private readonly badges: BadgesService,
   ) {}
 
   /**
@@ -182,18 +194,37 @@ export class VenueStaysService {
     }
 
     // Not before the entry (a delayed/old client timestamp).
-    const exitedAt = new Date(
+    let exitedAt = new Date(
       Math.max(when.getTime(), openStay.entered_at.getTime()),
     );
+    let source: StayExitSource = params.exit_source ?? 'app';
 
-    return this.prisma.venue_stays.update({
+    // Reported after the night was over (e.g. the geofence fired late, or the app was opened
+    // the next morning): the real exit is unknown, so it counts as the end of the night,
+    // estimated - never as a measured "stayed until 9am".
+    const event = openStay.event_id
+      ? (await this.eventTimes([openStay.event_id])).get(openStay.event_id)
+      : undefined;
+    const endMs = event ? eventEndMs(event) : null;
+    if (endMs !== null && exitedAt.getTime() > endMs) {
+      exitedAt = new Date(Math.max(endMs, openStay.entered_at.getTime()));
+      source = 'auto';
+    }
+
+    const updated = await this.prisma.venue_stays.update({
       where: { id: openStay.id },
       data: {
         exited_at: exitedAt,
         duration_ms: exitedAt.getTime() - openStay.entered_at.getTime(),
-        exit_source: params.exit_source ?? 'app',
+        exit_source: source,
       },
     });
+
+    // A measured exit can unlock exit-time badges (e.g. staying until the end of the night).
+    if (source === 'geofence') {
+      void this.badges.evaluateForUser(user_id).catch(() => undefined);
+    }
+    return updated;
   }
 
   /**

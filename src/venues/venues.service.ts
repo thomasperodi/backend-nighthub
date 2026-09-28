@@ -57,6 +57,7 @@ import { randomBytes, randomUUID } from 'crypto';
 import { readFileSync } from 'fs';
 import { isAbsolute, resolve as resolvePath } from 'path';
 import type { PKPass as PKPassClass } from 'passkit-generator';
+import { MEASURED_STAY_WHERE } from '../venue-stays/venue-stays.service';
 
 // Loaded on first use, not at boot: only the PR season pass (.pkpass) needs it, and it is
 // one of the heaviest modules to load on a cold start.
@@ -5705,8 +5706,8 @@ export class VenuesService {
       ? { event_id: eventId }
       : { event: { venue_id: venueId } };
     const stayFilter = eventId
-      ? { venue_id: venueId, event_id: eventId, duration_ms: { not: null } }
-      : { venue_id: venueId, duration_ms: { not: null } };
+      ? { venue_id: venueId, event_id: eventId, ...MEASURED_STAY_WHERE }
+      : { venue_id: venueId, ...MEASURED_STAY_WHERE };
 
     // The existence/ownership checks don't gate what the counts below need to run (a bad
     // venueId/eventId just yields zero-row counts, not an error) - they run in the same
@@ -5740,6 +5741,7 @@ export class VenuesService {
       this.prisma.venue_stays.aggregate({
         where: stayFilter,
         _avg: { duration_ms: true },
+        _count: { _all: true },
       }),
       this.getRevenueBreakdown(venueId, eventId),
     ]);
@@ -5759,6 +5761,8 @@ export class VenuesService {
           this.decimalToNumber(stayAgg._avg.duration_ms) / 60000,
           1,
         ),
+        // How many measured stays the average is based on (few = not yet reliable).
+        avgStayMeasuredCount: stayAgg._count._all,
         totalRevenue: revenue.totals.totalRevenue,
         entryRevenue: revenue.totals.entryRevenue,
         barRevenue: revenue.totals.barRevenue,
@@ -6127,8 +6131,9 @@ export class VenuesService {
         `,
       ),
       this.prisma.venue_stays.aggregate({
-        where: { venue_id: venueId, duration_ms: { not: null } },
+        where: { venue_id: venueId, ...MEASURED_STAY_WHERE },
         _avg: { duration_ms: true },
+        _count: { _all: true },
       }),
     ]);
 
@@ -6717,6 +6722,7 @@ export class VenuesService {
                 this.decimalToNumber(stayAggregate._avg.duration_ms) / 60000,
                 1,
               ),
+        avgStayMeasuredCount: stayAggregate._count._all,
       },
       audience: {
         uniqueCustomers,

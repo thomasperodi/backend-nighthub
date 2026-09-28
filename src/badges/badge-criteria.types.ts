@@ -11,6 +11,10 @@ export type BadgeCriteria =
   | { type: 'weekend_streak'; weeks: number }
   | { type: 'event_before_time'; before: string; threshold: number } // "HH:MM"
   | { type: 'event_after_time'; after: string; threshold: number } // "HH:MM"
+  // Nights where the user left in the last `withinMinutes` of the event, or later. Only
+  // geofence-measured exits count (see MEASURED_STAY_WHERE): an estimated exit at closing
+  // time must never unlock it.
+  | { type: 'stayed_until_end'; withinMinutes: number; threshold: number }
   | {
       type: 'seasonal_window';
       // Window is defined by month/day pairs, re-evaluated every year.

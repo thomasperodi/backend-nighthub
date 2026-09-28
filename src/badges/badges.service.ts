@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { TtlCache } from '../common/ttl-cache';
 import { mapWithConcurrency } from '../common/map-with-concurrency';
 import { BadgeCriteria } from './badge-criteria.types';
+import { eventEndMs } from '../common/event-time.util';
 
 type EntriesCacheRow = {
   event: { venue_id: string; start_time: Date | null; date: Date };
@@ -572,6 +573,14 @@ export class BadgesService {
         return { current, target: criteria.eventsThreshold };
       }
 
+      case 'stayed_until_end': {
+        const current = await this.countNightsStayedUntilEnd(
+          userId,
+          criteria.withinMinutes,
+        );
+        return { current, target: criteria.threshold };
+      }
+
       case 'manual':
         return { current: 0, target: 1 };
 
@@ -741,5 +750,36 @@ export class BadgesService {
       if (friendsPresent.size >= minFriendsPresent) qualifyingEvents += 1;
     }
     return qualifyingEvents;
+  }
+
+  /** Distinct nights left in the last `withinMinutes` of the event (measured exits only). */
+  private async countNightsStayedUntilEnd(
+    userId: string,
+    withinMinutes: number,
+  ) {
+    const stays = await this.prisma.venue_stays.findMany({
+      where: {
+        user_id: userId,
+        event_id: { not: null },
+        exited_at: { not: null },
+        duration_ms: { not: null },
+        exit_source: 'geofence',
+      },
+      select: { event_id: true, exited_at: true },
+    });
+    if (!stays.length) return 0;
+    const events = await this.prisma.events.findMany({
+      where: { id: { in: [...new Set(stays.map((s) => s.event_id!))] } },
+      select: { id: true, date: true, start_time: true, end_time: true },
+    });
+    const endById = new Map(events.map((e) => [e.id, eventEndMs(e)]));
+    const nights = new Set<string>();
+    for (const stay of stays) {
+      const end = endById.get(stay.event_id!);
+      if (end == null || !stay.exited_at) continue;
+      if (stay.exited_at.getTime() >= end - withinMinutes * 60_000)
+        nights.add(stay.event_id!);
+    }
+    return nights.size;
   }
 }

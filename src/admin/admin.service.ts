@@ -19,6 +19,7 @@ import { UpdatePlanDto } from './dto/update-plan.dto';
 import { TtlCache } from '../common/ttl-cache';
 import { geocodeAddress } from '../common/geocoding';
 import { AuditLogService } from '../common/audit/audit-log.service';
+import { MEASURED_STAY_WHERE } from '../venue-stays/venue-stays.service';
 
 type RevenuePoint = { label: string; value: number };
 
@@ -438,7 +439,7 @@ export class AdminService {
       this.prisma.venue_stays.aggregate({
         where: {
           entered_at: { gte: thirtyDaysAgo },
-          duration_ms: { not: null },
+          ...MEASURED_STAY_WHERE,
         },
         _avg: { duration_ms: true },
         _count: { _all: true },

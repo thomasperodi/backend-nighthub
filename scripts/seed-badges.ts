@@ -63,7 +63,7 @@ const badges: BadgeSeed[] = [
   { code: 'night_owl', category: 'NIGHT_CHALLENGES', rarity: 'EPIC', icon: '🦉', name: 'Night Owl', description: 'Partecipa a 5 eventi dopo mezzanotte', criteria: { type: 'event_after_time', after: '00:00', threshold: 5 } },
   // Require presence-duration tracking we don't have yet - kept manual.
   { code: 'sunrise_survivor', category: 'NIGHT_CHALLENGES', rarity: 'LEGENDARY', icon: '🌅', name: 'Sunrise Survivor', description: 'Rimani fino alle prime luci del mattino', criteria: { type: 'manual' } },
-  { code: 'last_one_standing', category: 'NIGHT_CHALLENGES', rarity: 'LEGENDARY', icon: '🌚', name: 'Last One Standing', description: 'Sei tra gli ultimi presenti a un evento', criteria: { type: 'manual' } },
+  { code: 'last_one_standing', category: 'NIGHT_CHALLENGES', rarity: 'LEGENDARY', icon: '🌚', name: 'Last One Standing', description: 'Resta fino all’ultima mezz’ora di una serata', criteria: { type: 'stayed_until_end', withinMinutes: 30, threshold: 1 } },
 
   // ---------------------------------------------------------------- 8. Eventi speciali (finestre stagionali ricorrenti ogni anno)
   { code: 'halloween_night', category: 'SPECIAL_EVENTS', rarity: 'EXCLUSIVE', icon: '🎃', name: 'Halloween Night', description: 'Partecipa a un evento di Halloween', criteria: { type: 'seasonal_window', monthFrom: 10, dayFrom: 25, monthTo: 10, dayTo: 31, threshold: 1 } },
