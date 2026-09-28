@@ -41,7 +41,7 @@ export class VenueStaysController {
 
   @Get()
   @Roles('client', 'venue', 'admin')
-  list(
+  async list(
     @CurrentUser() user: RequestUser,
     @Query('user_id') userId?: string,
     @Query('venue_id') venueId?: string,
@@ -58,11 +58,17 @@ export class VenueStaysController {
       const scopedVenueId = user.venue_id ?? undefined;
       if (!scopedVenueId)
         throw new BadRequestException('Missing venue_id for this user');
-      return this.venueStaysService.list({
+      // Anonymous for the venue: times and durations for its analytics, never who (see the
+      // privacy page). No filtering by user either, for the same reason.
+      void userId;
+      const rows = await this.venueStaysService.list({
         venue_id: scopedVenueId,
         event_id: eventId,
-        user_id: userId,
         limit: take,
+      });
+      return rows.map(({ user_id, ...rest }) => {
+        void user_id;
+        return rest;
       });
     }
 
