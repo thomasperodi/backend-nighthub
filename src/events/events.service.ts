@@ -1431,7 +1431,8 @@ export class EventsService {
     if (goingIds.length === 0) return [];
 
     return this.prisma.users.findMany({
-      where: { id: { in: goingIds } },
+      // Chi ha nascosto le proprie serate agli amici non compare (impostazione privacy).
+      where: { id: { in: goingIds }, nights_visible_to_friends: true },
       select: { id: true, username: true, name: true, avatar: true },
     });
   }

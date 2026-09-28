@@ -9,6 +9,9 @@ export type ErrorCode =
   // Registration
   | 'USERNAME_TAKEN'
   | 'EMAIL_TAKEN'
+  | 'BIRTH_DATE_REQUIRED'
+  | 'BIRTH_DATE_INVALID'
+  | 'UNDERAGE'
   // Booking
   | 'EVENT_CANCELLED'
   | 'EVENT_CLOSED'

@@ -24,6 +24,7 @@ type CurrentUserRecord = {
   avatar: string | null;
   venue_id: string | null;
   onboarding_completed_at: Date | null;
+  nights_visible_to_friends: boolean;
   created_at: Date;
   updated_at: Date;
 };
@@ -90,6 +91,7 @@ export class UsersService {
       pr_venue_id: prContext.pr_venue_id,
       is_verified_pr: Boolean(activeMembership),
       onboarding_completed: Boolean(user.onboarding_completed_at),
+      nights_visible_to_friends: user.nights_visible_to_friends,
       created_at: user.created_at,
       updated_at: user.updated_at,
     };
@@ -110,6 +112,7 @@ export class UsersService {
         avatar: true,
         venue_id: true,
         onboarding_completed_at: true,
+        nights_visible_to_friends: true,
         created_at: true,
         updated_at: true,
       },
@@ -189,6 +192,10 @@ export class UsersService {
       data.phone = phone || null;
     }
 
+    if (updates.nights_visible_to_friends !== undefined) {
+      data.nights_visible_to_friends = updates.nights_visible_to_friends;
+    }
+
     const normalizedAvatar = this.normalizeManagedImagePath(
       updates.avatar,
       'users',
@@ -211,6 +218,7 @@ export class UsersService {
           avatar: true,
           venue_id: true,
           onboarding_completed_at: true,
+          nights_visible_to_friends: true,
           created_at: true,
           updated_at: true,
         },

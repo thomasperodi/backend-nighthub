@@ -147,6 +147,7 @@ describe('AuthService', () => {
         username: 'newuser',
         password: 'password123',
         name: 'New User',
+        birth_date: '2000-01-01',
         role: 'admin',
       } as any);
 
@@ -205,6 +206,7 @@ describe('AuthService', () => {
           username: 'giulia',
           password: 'password123',
           name: 'Giulia',
+          birth_date: '2000-01-01',
         }),
       ).rejects.toThrow('User already exists (username)');
       expect(prisma.users.create).not.toHaveBeenCalled();

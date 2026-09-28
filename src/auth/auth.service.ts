@@ -482,6 +482,7 @@ export class AuthService {
     if (birthDate && Number.isNaN(birthDate.getTime())) {
       throw new BadRequestException('birth_date must be ISO8601');
     }
+    assertMinimumAge(birthDate);
 
     let user: users;
     try {
@@ -1303,5 +1304,46 @@ export class AuthService {
     });
 
     return { success: true };
+  }
+}
+
+/** Età minima per registrarsi (termini di servizio, consenso digitale in Italia). */
+export const MIN_AGE = 14;
+
+/**
+ * Rifiuta chi non ha ancora MIN_AGE anni oggi, o una data assurda (futura / oltre 110 anni).
+ * La data di nascita è un giorno di calendario: si confrontano anno/mese/giorno UTC, senza fusi.
+ */
+export function assertMinimumAge(
+  birthDate: Date | undefined,
+  now = new Date(),
+) {
+  if (!birthDate) {
+    throw new BadRequestException(
+      coded('BIRTH_DATE_REQUIRED', 'Inserisci la tua data di nascita.'),
+    );
+  }
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const d = now.getUTCDate();
+  let age = y - birthDate.getUTCFullYear();
+  if (
+    m < birthDate.getUTCMonth() ||
+    (m === birthDate.getUTCMonth() && d < birthDate.getUTCDate())
+  ) {
+    age -= 1;
+  }
+  if (age < 0 || age > 110) {
+    throw new BadRequestException(
+      coded('BIRTH_DATE_INVALID', 'La data di nascita non è valida.'),
+    );
+  }
+  if (age < MIN_AGE) {
+    throw new BadRequestException(
+      coded(
+        'UNDERAGE',
+        `Per usare NightHub devi avere almeno ${MIN_AGE} anni.`,
+      ),
+    );
   }
 }

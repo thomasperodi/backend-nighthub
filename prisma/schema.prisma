@@ -219,6 +219,9 @@ model users {
   last_location_accuracy_meters Int?
   last_location_updated_at      DateTime?
   last_active_at                DateTime?
+  /// Privacy: se false gli amici non vedono a quali serate è in lista (GET /friends/tonight,
+  /// GET /events/:id/friends-going). Di default visibile agli amici.
+  nights_visible_to_friends     Boolean   @default(true)
 
   sesso      Gender?
   birth_date DateTime?

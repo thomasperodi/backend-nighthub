@@ -1,4 +1,4 @@
-import { IsOptional, IsString } from 'class-validator';
+import { IsBoolean, IsOptional, IsString } from 'class-validator';
 
 export class UpdateMeDto {
   @IsOptional()
@@ -12,4 +12,9 @@ export class UpdateMeDto {
   @IsOptional()
   @IsString()
   avatar?: string | null;
+
+  /** Privacy: se false gli amici non vedono a quali serate sei in lista. */
+  @IsOptional()
+  @IsBoolean()
+  nights_visible_to_friends?: boolean;
 }

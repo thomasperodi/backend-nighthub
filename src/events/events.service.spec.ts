@@ -125,6 +125,27 @@ describe('EventsService', () => {
     });
   });
 
+  describe('getFriendsGoing', () => {
+    it('non mostra gli amici che hanno nascosto le proprie serate', async () => {
+      const findMany = jest.fn().mockResolvedValue([]);
+      Object.assign(prisma, {
+        friendships: {
+          findMany: jest.fn().mockResolvedValue([{ friend_id: 'f1' }]),
+        },
+        users: { findMany },
+      });
+      prisma.reservations.findMany.mockResolvedValue([{ user_id: 'f1' }]);
+
+      await service.getFriendsGoing('event-1', 'me');
+
+      expect(findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: { in: ['f1'] }, nights_visible_to_friends: true },
+        }),
+      );
+    });
+  });
+
   describe('list shape (serializeListEvent)', () => {
     const serialize = (e: unknown) =>
       (

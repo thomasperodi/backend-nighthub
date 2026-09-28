@@ -21,9 +21,9 @@ export function renderPrivacy(): string {
 
     <h2>Quali dati raccogliamo</h2>
     <ul>
-      <li><strong>Account:</strong> nome, email, username, password (salvata solo in forma cifrata) e, se li inserisci, telefono, data di nascita, sesso e foto profilo.</li>
+      <li><strong>Account:</strong> nome, email, username, password (salvata solo in forma cifrata), data di nascita e, se li inserisci, telefono, sesso e foto profilo.</li>
       <li><strong>Serate:</strong> le liste e i tavoli a cui ti iscrivi, gli ingressi registrati al locale (QR) e l'eventuale PR che ti ha invitato.</li>
-      <li><strong>Amici:</strong> richieste di amicizia, amici e gruppi. I tuoi amici possono vedere a quali serate sei in lista.</li>
+      <li><strong>Amici:</strong> richieste di amicizia, amici e gruppi. Di default i tuoi amici vedono a quali serate sei in lista: puoi nasconderlo in Profilo → Account e sicurezza → Privacy.</li>
       <li><strong>Posizione:</strong> solo se attivi tu la condivisione della posizione con gli amici; puoi disattivarla in qualsiasi momento.</li>
       <li><strong>Dispositivo:</strong> il token per le notifiche push e le sessioni di accesso attive.</li>
       <li><strong>Badge e livelli:</strong> calcolati dalle serate a cui partecipi e dalle attività nell'app.</li>
@@ -47,7 +47,7 @@ export function renderPrivacy(): string {
     </ul>
 
     <h2>Minori</h2>
-    <p>Per registrarti devi avere almeno 14 anni. L'ingresso ai singoli eventi può avere limiti di età più alti, decisi dal locale.</p>
+    <p>Per registrarti devi avere almeno 14 anni: per questo ti chiediamo la data di nascita. L'ingresso ai singoli eventi può avere limiti di età più alti, decisi dal locale.</p>
 
     <h2>Per quanto tempo</h2>
     <p>Conserviamo i dati finché il tuo account è attivo. Se elimini l'account (Profilo → Account e sicurezza → Elimina account) i tuoi dati personali vengono cancellati o resi anonimi; restano solo dati aggregati e non riconducibili a te (per esempio il numero di ingressi di una serata).</p>

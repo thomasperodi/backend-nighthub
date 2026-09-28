@@ -940,7 +940,11 @@ export class FriendsService {
     if (soonestByUser.size === 0) return [];
 
     const friends = await this.prisma.users.findMany({
-      where: { id: { in: Array.from(soonestByUser.keys()) } },
+      // Chi ha nascosto le proprie serate agli amici non compare (impostazione privacy).
+      where: {
+        id: { in: Array.from(soonestByUser.keys()) },
+        nights_visible_to_friends: true,
+      },
       select: { id: true, username: true, name: true, avatar: true },
     });
 

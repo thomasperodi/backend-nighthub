@@ -44,7 +44,8 @@ export class RegisterDto {
   @IsIn(Object.values(Gender))
   sesso?: Gender;
 
-  @IsOptional()
+  // Required: NightHub is for users aged 14+ (see MIN_AGE in auth.service.ts). The PWA
+  // register form already requires it; the app asks for it in the last signup step.
   @IsISO8601()
-  birth_date?: string;
+  birth_date: string;
 }
