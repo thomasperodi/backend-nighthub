@@ -17,6 +17,7 @@ import { createClient } from '@supabase/supabase-js';
 import { createHash, randomBytes, randomUUID } from 'crypto';
 import { REFRESH_TOKEN_TTL_MS } from './jwt.config';
 import type { AccessTokenPayload, RequestUser } from './types';
+import { coded } from '../common/http/error-codes';
 
 export type PublicUser = {
   id: string;
@@ -472,7 +473,9 @@ export class AuthService {
     // (admin tools, legacy rows) may be mixed-case: without this check "giulia" could be
     // registered next to an existing "Giulia". The P2002 catch below still covers races.
     if (!(await this.isUsernameAvailable(username)).available) {
-      throw new ConflictException('User already exists (username)');
+      throw new ConflictException(
+        coded('USERNAME_TAKEN', 'User already exists (username)'),
+      );
     }
 
     const birthDate = dto.birth_date ? new Date(dto.birth_date) : undefined;
@@ -503,7 +506,12 @@ export class AuthService {
         const target = Array.isArray(err.meta?.target)
           ? err.meta?.target.join(', ')
           : 'unique field';
-        throw new ConflictException(`User already exists (${target})`);
+        throw new ConflictException(
+          coded(
+            target.includes('username') ? 'USERNAME_TAKEN' : 'EMAIL_TAKEN',
+            `User already exists (${target})`,
+          ),
+        );
       }
       throw err;
     }

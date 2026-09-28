@@ -268,6 +268,16 @@ describe('ReservationsService', () => {
       expect(findFirst).not.toHaveBeenCalled();
     });
 
+    it('carries a stable code the app can switch on', async () => {
+      prisma.events.findUnique.mockResolvedValue(pastNight);
+      const err = (await service
+        .createReservation(entry)
+        .catch((e: unknown) => e)) as BadRequestException;
+      expect(err.getResponse()).toEqual(
+        expect.objectContaining({ code: 'EVENT_CLOSED' }),
+      );
+    });
+
     it('rejects any booking for a cancelled event, even a future one', async () => {
       prisma.events.findUnique.mockResolvedValue({
         ...futureNight,

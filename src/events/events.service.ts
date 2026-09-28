@@ -402,6 +402,21 @@ export class EventsService {
   }
   /* eslint-enable @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-argument */
 
+  // List/feed shape: the full event minus its price rules, plus the cheapest entry price so
+  // the card can say "da €10" / "Lista gratis" without the client fetching every detail.
+  // null = the venue has not published entry prices.
+  private serializeListEvent(e: any) {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const { entry_prices, ...rest } = this.serializeEvent(e);
+    const prices = Array.isArray(entry_prices)
+      ? (entry_prices as { price: number }[]).map((p) => p.price)
+      : [];
+    return {
+      ...rest,
+      min_entry_price: prices.length ? Math.min(...prices) : null,
+    };
+  }
+
   // Decimal -> number only for the fields the query actually selected: adding the missing
   // ones as null made every public event response carry e.g. `contract_monthly_fee: null`,
   // a billing field that is never selected for these endpoints.
@@ -1038,7 +1053,11 @@ export class EventsService {
             select: {
               id: true,
               venue_id: true,
-              venue: { select: { id: true, name: true, image: true } },
+              venue: {
+                select: { id: true, name: true, image: true, city: true },
+              },
+              // Only the prices, to expose `min_entry_price` on the card (see serializeListEvent).
+              entry_prices: { select: { price: true } },
               name: true,
               description: true,
               image: true,
@@ -1080,7 +1099,7 @@ export class EventsService {
       // vercel.json, runs every 15 min) instead of this endpoint - the highest-traffic,
       // unauthenticated public events list - paying for an UPDATE on every call.
       // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-      return ordered.map((e) => this.serializeEvent(e)) as any;
+      return ordered.map((e) => this.serializeListEvent(e)) as any;
     }
 
     const list = await this.runPrismaQueryWithRetry(
@@ -1092,7 +1111,11 @@ export class EventsService {
           select: {
             id: true,
             venue_id: true,
-            venue: { select: { id: true, name: true, image: true } },
+            venue: {
+              select: { id: true, name: true, image: true, city: true },
+            },
+            // Only the prices, to expose `min_entry_price` on the card (see serializeListEvent).
+            entry_prices: { select: { price: true } },
             name: true,
             description: true,
             image: true,
@@ -1138,7 +1161,7 @@ export class EventsService {
     await this.syncEventStatusesIfNeeded(list as EventStatusSyncCandidate[]);
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-    const serialized = list.map((e) => this.serializeEvent(e));
+    const serialized = list.map((e) => this.serializeListEvent(e));
 
     if (this.isDebugEventsEnabled()) {
       // Debug sample of computed statuses
@@ -1209,7 +1232,11 @@ export class EventsService {
             select: {
               id: true,
               venue_id: true,
-              venue: { select: { id: true, name: true, image: true } },
+              venue: {
+                select: { id: true, name: true, image: true, city: true },
+              },
+              // Only the prices, to expose `min_entry_price` on the card (see serializeListEvent).
+              entry_prices: { select: { price: true } },
               name: true,
               description: true,
               image: true,
@@ -1248,7 +1275,7 @@ export class EventsService {
         ordered as EventStatusSyncCandidate[],
       );
       // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-      const pageData = ordered.map((e) => this.serializeEvent(e));
+      const pageData = ordered.map((e) => this.serializeListEvent(e));
 
       return {
         data: pageData,
@@ -1277,7 +1304,11 @@ export class EventsService {
             select: {
               id: true,
               venue_id: true,
-              venue: { select: { id: true, name: true, image: true } },
+              venue: {
+                select: { id: true, name: true, image: true, city: true },
+              },
+              // Only the prices, to expose `min_entry_price` on the card (see serializeListEvent).
+              entry_prices: { select: { price: true } },
               name: true,
               description: true,
               image: true,
@@ -1314,7 +1345,7 @@ export class EventsService {
     await this.syncEventStatusesIfNeeded(data as EventStatusSyncCandidate[]);
 
     // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-    const serializedData = data.map((e) => this.serializeEvent(e));
+    const serializedData = data.map((e) => this.serializeListEvent(e));
 
     return {
       data: serializedData,

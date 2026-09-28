@@ -124,4 +124,38 @@ describe('EventsService', () => {
       expect(prisma.$transaction).toHaveBeenCalled();
     });
   });
+
+  describe('list shape (serializeListEvent)', () => {
+    const serialize = (e: unknown) =>
+      (
+        service as unknown as {
+          serializeListEvent: (e: unknown) => Record<string, unknown>;
+        }
+      ).serializeListEvent(e);
+    const base = {
+      id: 'event-1',
+      date: new Date(Date.UTC(2099, 0, 10)),
+      start_time: new Date(Date.UTC(1970, 0, 1, 23, 0)),
+      end_time: null,
+      status: EventStatus.DRAFT,
+      venue: { id: 'v1', name: 'Paradise', image: null, city: 'Piacenza' },
+      promos: [],
+    };
+
+    it('exposes the cheapest entry price and the city, not the price rules', () => {
+      const out = serialize({
+        ...base,
+        entry_prices: [{ price: '15.00' }, { price: '10.00' }],
+      });
+      expect(out.min_entry_price).toBe(10);
+      expect(out.entry_prices).toBeUndefined();
+      expect(out.venue).toEqual(expect.objectContaining({ city: 'Piacenza' }));
+    });
+
+    it('is null when the venue has not published prices', () => {
+      expect(
+        serialize({ ...base, entry_prices: [] }).min_entry_price,
+      ).toBeNull();
+    });
+  });
 });

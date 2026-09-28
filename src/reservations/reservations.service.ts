@@ -11,6 +11,7 @@ import { resolveEntryUnitPrice } from '../common/entry-pricing';
 import { BadgesService } from '../badges/badges.service';
 import { PushDispatchService } from '../common/push/push-dispatch.service';
 import { computeEventStatus, eventStartMs } from '../common/event-time.util';
+import { coded } from '../common/http/error-codes';
 
 type QrCheckInResult = {
   success: boolean;
@@ -1257,10 +1258,14 @@ export class ReservationsService {
       event as Parameters<typeof computeEventStatus>[0],
     );
     if (status === 'CANCELLED') {
-      throw new BadRequestException('Questo evento è stato annullato');
+      throw new BadRequestException(
+        coded('EVENT_CANCELLED', 'Questo evento è stato annullato'),
+      );
     }
     if (status === 'CLOSED' && bookerRole !== 'venue') {
-      throw new BadRequestException('Questa serata è già conclusa');
+      throw new BadRequestException(
+        coded('EVENT_CLOSED', 'Questa serata è già conclusa'),
+      );
     }
   }
 
@@ -1316,8 +1321,11 @@ export class ReservationsService {
       if (existingReservationForEvent) {
         throw new BadRequestException(
           type === 'table'
-            ? 'Hai già un tavolo prenotato per questa serata'
-            : 'Sei già in lista per questa serata',
+            ? coded(
+                'TABLE_ALREADY_BOOKED',
+                'Hai già un tavolo prenotato per questa serata',
+              )
+            : coded('ALREADY_IN_LIST', 'Sei già in lista per questa serata'),
         );
       }
     }
@@ -1859,19 +1867,27 @@ export class ReservationsService {
     }
 
     if (!reservation) {
-      throw new NotFoundException('Reservation not found for this QR');
+      throw new NotFoundException(
+        coded('QR_NOT_FOUND', 'Reservation not found for this QR'),
+      );
     }
 
     if (reservation.type !== 'entry') {
-      throw new BadRequestException('QR is not linked to an entry reservation');
+      throw new BadRequestException(
+        coded('QR_NOT_ENTRY', 'QR is not linked to an entry reservation'),
+      );
     }
 
     if (reservation.event_id !== eventId) {
-      throw new BadRequestException('QR does not belong to this event');
+      throw new BadRequestException(
+        coded('QR_WRONG_EVENT', 'QR does not belong to this event'),
+      );
     }
 
     if (reservation.status === 'cancelled') {
-      throw new BadRequestException('Reservation cancelled');
+      throw new BadRequestException(
+        coded('RESERVATION_CANCELLED', 'Reservation cancelled'),
+      );
     }
 
     if (reservation.checked_in_at) {
@@ -2059,32 +2075,42 @@ export class ReservationsService {
 
     const pass = passRows[0] ?? null;
     if (!pass) {
-      throw new NotFoundException('Season pass not found for this QR');
+      throw new NotFoundException(
+        coded('PASS_NOT_FOUND', 'Season pass not found for this QR'),
+      );
     }
 
     if (pass.venue_id !== event.venue_id) {
       throw new BadRequestException(
-        'Season pass does not belong to this venue',
+        coded('PASS_WRONG_VENUE', 'Season pass does not belong to this venue'),
       );
     }
 
     if (!pass.membership_is_active) {
-      throw new BadRequestException('Season pass membership is not active');
+      throw new BadRequestException(
+        coded('PASS_INACTIVE', 'Season pass membership is not active'),
+      );
     }
 
     if (pass.status === 'revoked' || pass.revoked_at) {
-      throw new BadRequestException('Season pass revoked');
+      throw new BadRequestException(
+        coded('PASS_REVOKED', 'Season pass revoked'),
+      );
     }
 
     const now = new Date();
     if (pass.valid_from.getTime() > now.getTime()) {
-      throw new BadRequestException('Season pass is not valid yet');
+      throw new BadRequestException(
+        coded('PASS_NOT_YET_VALID', 'Season pass is not valid yet'),
+      );
     }
     if (
       pass.status === 'expired' ||
       pass.valid_until.getTime() < now.getTime()
     ) {
-      throw new BadRequestException('Season pass expired');
+      throw new BadRequestException(
+        coded('PASS_EXPIRED', 'Season pass expired'),
+      );
     }
 
     const existingScanRows = await this.prisma.$queryRaw<
