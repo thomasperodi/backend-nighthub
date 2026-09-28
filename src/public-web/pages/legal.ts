@@ -24,7 +24,8 @@ export function renderPrivacy(): string {
       <li><strong>Account:</strong> nome, email, username, password (salvata solo in forma cifrata), data di nascita e, se li inserisci, telefono, sesso e foto profilo.</li>
       <li><strong>Serate:</strong> le liste e i tavoli a cui ti iscrivi, gli ingressi registrati al locale (QR) e l'eventuale PR che ti ha invitato.</li>
       <li><strong>Amici:</strong> richieste di amicizia, amici e gruppi. Di default i tuoi amici vedono a quali serate sei in lista: puoi nasconderlo in Profilo → Account e sicurezza → Privacy.</li>
-      <li><strong>Posizione:</strong> solo se attivi tu la condivisione della posizione con gli amici; puoi disattivarla in qualsiasi momento.</li>
+      <li><strong>Permanenza nel locale:</strong> quando lo staff registra il tuo ingresso, e solo se ci dai il permesso, usiamo la posizione per capire quando esci dal locale (con "Consenti sempre" anche con l'app chiusa). Conserviamo solo orario di ingresso, uscita e durata, non il percorso. Ci serve per i badge e per consigliarti serate adatte a te; non la vedono né amici né locali (i locali vedono solo medie anonime). Puoi revocare il permesso dalle impostazioni del telefono.</li>
+      <li><strong>Posizione condivisa con gli amici:</strong> solo se la attivi tu; puoi disattivarla in qualsiasi momento.</li>
       <li><strong>Dispositivo:</strong> il token per le notifiche push e le sessioni di accesso attive.</li>
       <li><strong>Badge e livelli:</strong> calcolati dalle serate a cui partecipi e dalle attività nell'app.</li>
     </ul>
