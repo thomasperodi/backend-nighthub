@@ -12,9 +12,10 @@ import { VenuesService } from '../venues/venues.service';
 import {
   resolvePlanTerms,
   computeOverage,
-  startOfMonth,
-  nextMonth,
+  billingMonth,
+  toNumber,
 } from '../common/billing/plan-usage.util';
+import { MEASURED_STAY_WHERE } from '../venue-stays/venue-stays.service';
 import {
   addPrCounters,
   emptyPrCounters,
@@ -535,6 +536,40 @@ export class OrganizationsService {
     const totals = emptyPrCounters();
     for (const m of memberships) addPrCounters(totals, metrics.own(m.id));
 
+    // Average stay at the organization's venues (measured exits only, see
+    // MEASURED_STAY_WHERE), with the same period/venue filters as the PR metrics.
+    const stayRows = venueLinks.length
+      ? await this.prisma.venue_stays.groupBy({
+          by: ['venue_id'],
+          where: {
+            venue_id: { in: venueLinks.map((l) => l.venue.id) },
+            ...(filters.from || filters.to
+              ? {
+                  entered_at: {
+                    ...(filters.from ? { gte: filters.from } : {}),
+                    ...(filters.to ? { lte: filters.to } : {}),
+                  },
+                }
+              : {}),
+            ...MEASURED_STAY_WHERE,
+          },
+          _avg: { duration_ms: true },
+          _count: { _all: true },
+        })
+      : [];
+    const stayByVenue = new Map(stayRows.map((r) => [r.venue_id, r]));
+    const minutes = (ms: number | null | undefined) =>
+      ms == null ? null : Math.round(ms / 6000) / 10;
+    const measured = stayRows.reduce((n, r) => n + r._count._all, 0);
+    const avgStayMinutes = measured
+      ? minutes(
+          stayRows.reduce(
+            (sum, r) => sum + (r._avg.duration_ms ?? 0) * r._count._all,
+            0,
+          ) / measured,
+        )
+      : null;
+
     const byVenue = venueLinks.map((link) => {
       const venueCounters = emptyPrCounters();
       for (const m of memberships) {
@@ -546,6 +581,11 @@ export class OrganizationsService {
       return {
         venue: link.venue,
         linked_at: link.created_at,
+        avg_stay_minutes: minutes(
+          stayByVenue.get(link.venue.id)?._avg.duration_ms,
+        ),
+        avg_stay_measured_count:
+          stayByVenue.get(link.venue.id)?._count._all ?? 0,
         ...toPrMetrics(venueCounters),
         // Legacy names, kept while clients migrate to the official ones above.
         total_scans: venueCounters.scans,
@@ -577,6 +617,9 @@ export class OrganizationsService {
       ...toPrMetrics(totals),
       total_scans: totals.scans,
       total_attributed_entries: totals.attributed_entries,
+      // null = no measured stay yet (only geofence exits count).
+      avg_stay_minutes: avgStayMinutes,
+      avg_stay_measured_count: measured,
       by_venue: byVenue,
       by_member: byMember,
     };
@@ -874,9 +917,12 @@ export class OrganizationsService {
   }
 
   /** This organization's consumption against its subscription plan for the current calendar
-   * month - every non-cancelled event dated this month (`organization_id`, any status:
-   * draft/live/closed), and "clienti analizzati": everyone this org put on a door list
-   * (`entry` reservations) for those same events, whether or not they actually showed up.
+   * month (Europe/Rome, see billingMonth) - every non-cancelled event dated this month, any
+   * status: draft/live/closed. The events counted are the organization's own ones plus the
+   * ones created by the venues billed to it (decision 2026-09-28: a linked venue consumes its
+   * organization's plan; a venue linked to several organizations is billed to the first one,
+   * see billedVenues). "Clienti analizzati": everyone on a door list (`entry` reservations)
+   * for those same events, whether or not they actually showed up (confirmed 2026-09-28).
    * Deliberately *not* real check-ins (`venue_stays`) - the plan meters what the attendance
    * forecast's personal-rate model (AttendanceForecastService) had to process to learn each
    * person's reliability, and a no-show is exactly as much analysis work as a show. Confirmed
@@ -912,38 +958,14 @@ export class OrganizationsService {
     });
     if (!organization) throw new NotFoundException('Organization not found');
 
-    const now = new Date();
-    const periodStart = startOfMonth(now);
-    const periodEnd = nextMonth(now);
-
-    const [eventsCount, peopleAnalyzed] = await Promise.all([
-      // Every event this organization has on the books this month regardless of where it is
-      // in its lifecycle (draft/live/closed) - a cancelled event doesn't count, since it never
-      // actually consumed anything. Deliberately not restricted to CLOSED-only (that would
-      // undercount: an event created for later this month wouldn't show up until it's over).
-      this.prisma.events.count({
-        where: {
-          organization_id: organizationId,
-          status: { not: 'CANCELLED' },
-          date: { gte: periodStart, lt: periodEnd },
-        },
-      }),
-      // Same event set as eventsCount above (this org's own events, same period) - sum of
-      // door-list guests, cancelled reservations excluded (never actually reached the list).
-      this.prisma.reservations.aggregate({
-        where: {
-          type: 'entry',
-          status: { in: ['confirmed', 'completed'] },
-          event: {
-            organization_id: organizationId,
-            status: { not: 'CANCELLED' },
-            date: { gte: periodStart, lt: periodEnd },
-          },
-        },
-        _sum: { guests: true },
-      }),
-    ]);
-    const peopleCount = peopleAnalyzed._sum.guests ?? 0;
+    const { start: periodStart, end: periodEnd } = billingMonth();
+    const venues = await this.billedVenues(organizationId);
+    const { eventsCount, peopleCount, byVenue } = await this.meterUsage(
+      organizationId,
+      venues.map((v) => v.id),
+      periodStart,
+      periodEnd,
+    );
 
     const terms = resolvePlanTerms(organization.plan, null);
     const overage = organization.plan
@@ -969,6 +991,14 @@ export class OrganizationsService {
       extra_events_cost: overage?.extraEventsCost ?? 0,
       extra_people_cost: overage?.extraPeopleCost ?? 0,
       overage_cost: overage?.overageCost ?? 0,
+      // What each venue billed to this organization consumed this month (the venue sees its
+      // own row in GET /venues/:id/billing).
+      by_venue: venues.map((v) => ({
+        venue_id: v.id,
+        venue_name: v.name,
+        events_count: byVenue.get(v.id)?.events ?? 0,
+        people_count: byVenue.get(v.id)?.people ?? 0,
+      })),
       // Unit prices, so the organization can see what the next extra event/person would
       // cost (estimates only: NightHub invoices at month end, nothing is paid in-app).
       terms: organization.plan
@@ -979,6 +1009,141 @@ export class OrganizationsService {
             is_custom: organization.plan.is_custom,
           }
         : null,
+    };
+  }
+
+  /**
+   * Venues whose events are billed to this organization: a linked venue consumes the plan of
+   * its organization, including the events the venue creates itself. A venue linked to
+   * several organizations is billed to the one it was linked to first, so an event is never
+   * billed twice.
+   */
+  private async billedVenues(organizationId: string) {
+    const links = await this.prisma.organization_venue_links.findMany({
+      where: { organization_id: organizationId },
+      select: { venue: { select: { id: true, name: true } } },
+    });
+    if (!links.length) return [];
+    const venueIds = links.map((l) => l.venue.id);
+    const firstLinks = await this.prisma.organization_venue_links.findMany({
+      where: { venue_id: { in: venueIds } },
+      orderBy: [{ created_at: 'asc' }, { id: 'asc' }],
+      select: { venue_id: true, organization_id: true },
+    });
+    const billedTo = new Map<string, string>();
+    for (const l of firstLinks) {
+      if (!billedTo.has(l.venue_id))
+        billedTo.set(l.venue_id, l.organization_id);
+    }
+    return links
+      .map((l) => l.venue)
+      .filter((v) => billedTo.get(v.id) === organizationId);
+  }
+
+  /** The organization billed for a venue's events, or null (the venue is on a flat contract). */
+  private async billingOrganizationForVenue(venueId: string) {
+    const first = await this.prisma.organization_venue_links.findFirst({
+      where: { venue_id: venueId },
+      orderBy: [{ created_at: 'asc' }, { id: 'asc' }],
+      select: { organization: { select: { id: true, name: true } } },
+    });
+    return first?.organization ?? null;
+  }
+
+  /**
+   * Plan meters for one month: the organization's own events (wherever they are) plus the
+   * events created by the venues billed to it. "Clienti analizzati" = guests on the list
+   * (confirmed/completed entry reservations), see the getUsage doc comment.
+   */
+  private async meterUsage(
+    organizationId: string,
+    billedVenueIds: string[],
+    periodStart: Date,
+    periodEnd: Date,
+  ) {
+    const events = await this.prisma.events.findMany({
+      where: {
+        status: { not: 'CANCELLED' },
+        date: { gte: periodStart, lt: periodEnd },
+        OR: [
+          { organization_id: organizationId },
+          ...(billedVenueIds.length
+            ? [{ organization_id: null, venue_id: { in: billedVenueIds } }]
+            : []),
+        ],
+      },
+      select: { id: true, venue_id: true },
+    });
+    const guests = events.length
+      ? await this.prisma.reservations.groupBy({
+          by: ['event_id'],
+          where: {
+            event_id: { in: events.map((e) => e.id) },
+            type: 'entry',
+            status: { in: ['confirmed', 'completed'] },
+          },
+          _sum: { guests: true },
+        })
+      : [];
+    const guestsByEvent = new Map(
+      guests.map((g) => [g.event_id, g._sum.guests ?? 0]),
+    );
+
+    const byVenue = new Map<string, { events: number; people: number }>();
+    let peopleCount = 0;
+    for (const e of events) {
+      const people = guestsByEvent.get(e.id) ?? 0;
+      peopleCount += people;
+      const row = byVenue.get(e.venue_id) ?? { events: 0, people: 0 };
+      row.events += 1;
+      row.people += people;
+      byVenue.set(e.venue_id, row);
+    }
+    return { eventsCount: events.length, peopleCount, byVenue };
+  }
+
+  /**
+   * What the venue sees about its billing in the gestionale:
+   * - linked to an organization: that organization's plan, the plan's consumption this month
+   *   (all its venues), the venue's own share and the estimated extras (billed to the
+   *   organization, not to the venue);
+   * - otherwise: its flat monthly contract.
+   */
+  async getVenueBilling(venueId: string) {
+    const organization = await this.billingOrganizationForVenue(venueId);
+    if (organization) {
+      const usage = await this.getUsage(organization.id);
+      const own = usage.by_venue.find((v) => v.venue_id === venueId);
+      return {
+        mode: 'organization' as const,
+        organization,
+        plan: usage.plan,
+        period: usage.period,
+        venue_events_count: own?.events_count ?? 0,
+        venue_people_count: own?.people_count ?? 0,
+        events_count: usage.events_count,
+        people_count: usage.people_count,
+        included_events: usage.included_events,
+        included_people: usage.included_people,
+        extra_events_count: usage.extra_events_count,
+        extra_people_count: usage.extra_people_count,
+        overage_cost: usage.overage_cost,
+        terms: usage.terms,
+      };
+    }
+    const venue = await this.prisma.venues.findUnique({
+      where: { id: venueId },
+      select: { contract_monthly_fee: true, contract_status: true },
+    });
+    if (!venue) throw new NotFoundException('Venue not found');
+    return {
+      mode: 'contract' as const,
+      period: billingMonth(),
+      monthly_fee:
+        venue.contract_monthly_fee == null
+          ? null
+          : toNumber(venue.contract_monthly_fee),
+      contract_status: venue.contract_status,
     };
   }
 

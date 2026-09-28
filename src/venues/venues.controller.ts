@@ -147,6 +147,18 @@ export class VenuesController {
     return this.venuesService.uploadVenueImage(file);
   }
 
+  /**
+   * Billing the venue sees in the gestionale: the plan of the organization it belongs to
+   * (consumption, its own share, estimated extras billed to the organization) or its flat
+   * monthly contract when it has no organization. See OrganizationsService.getVenueBilling.
+   */
+  @Get(':id/billing')
+  @Roles('venue', 'admin')
+  @RequireVenueOwnership()
+  getBilling(@Param('id') id: string) {
+    return this.organizationsService.getVenueBilling(id);
+  }
+
   // Fase 7 "tessere custom": per-venue PR season pass branding. Uses RequireVenueOwnership
   // (the new reusable guard) rather than the inline if/throw the endpoints above still use -
   // new code should prefer it over copying that pattern further.

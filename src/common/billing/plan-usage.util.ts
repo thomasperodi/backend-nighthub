@@ -26,6 +26,29 @@ export function nextMonth(date: Date): Date {
   return new Date(date.getFullYear(), date.getMonth() + 1, 1);
 }
 
+/**
+ * The billing month containing `now`, on the venue calendar (Europe/Rome, not the server's
+ * clock: at 00:30 on the 1st in Italy it is still the previous month in UTC, and a server in
+ * another timezone would shift the bounds). Bounds are UTC midnights, directly comparable
+ * with events.date (@db.Date).
+ */
+export function billingMonth(
+  now: Date = new Date(),
+  timeZone = process.env.EVENTS_TIMEZONE || 'Europe/Rome',
+) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+  }).formatToParts(now);
+  const year = Number(parts.find((p) => p.type === 'year')?.value);
+  const month = Number(parts.find((p) => p.type === 'month')?.value) - 1;
+  return {
+    start: new Date(Date.UTC(year, month, 1)),
+    end: new Date(Date.UTC(year, month + 1, 1)),
+  };
+}
+
 export type PlanCustomTerms = {
   monthly_price?: number;
   included_events?: number | null;
@@ -59,9 +82,7 @@ export function resolvePlanTerms(
     (plan?.extra_event_price == null ? 0 : toNumber(plan.extra_event_price));
   const extraPersonPrice =
     customTerms?.extra_person_price ??
-    (plan?.extra_person_price == null
-      ? 0
-      : toNumber(plan.extra_person_price));
+    (plan?.extra_person_price == null ? 0 : toNumber(plan.extra_person_price));
 
   return {
     monthlyPrice,

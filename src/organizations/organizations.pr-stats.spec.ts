@@ -68,6 +68,7 @@ function makePrisma() {
       findUnique: jest.fn(),
       findMany: jest.fn().mockResolvedValue([]),
     },
+    venue_stays: { groupBy: jest.fn().mockResolvedValue([]) },
     venue_pr_event_assignments: {
       findMany: jest.fn().mockResolvedValue([]),
       upsert: jest.fn().mockReturnValue('upsert-op'),
