@@ -822,6 +822,10 @@ model venue_stays {
   entered_at  DateTime
   exited_at   DateTime?
   duration_ms Int?
+  /// Come è stata rilevata l'uscita: 'geofence' (posizione in background, preciso), 'app'
+  /// (posizione all'apertura dell'app, approssimato per eccesso), 'auto' (chiusa a fine serata:
+  /// durata stimata). null = ancora aperta. Serve a chi usa duration_ms per pesarne l'affidabilità.
+  exit_source String?
   created_at  DateTime  @default(now())
   updated_at  DateTime  @updatedAt
 

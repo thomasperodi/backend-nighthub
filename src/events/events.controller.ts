@@ -26,6 +26,7 @@ import { Public } from '../auth/public.decorator';
 import { Roles } from '../auth/roles.decorator';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { RequestUser } from '../auth/types';
+import { VenueStaysService } from '../venue-stays/venue-stays.service';
 
 type UploadedPosterFile = {
   originalname?: string;
@@ -39,6 +40,7 @@ export class EventsController {
     private readonly eventsService: EventsService,
     private readonly authService: AuthService,
     private readonly attendanceForecastService: AttendanceForecastService,
+    private readonly venueStays: VenueStaysService,
   ) {}
 
   // Reuses AuthService.verifyAccessToken (the same verification JwtAuthGuard uses for every
@@ -124,18 +126,21 @@ export class EventsController {
     @Headers('authorization') authorization?: string,
   ) {
     this.assertCronAuth({ token, headerSecret, authorization });
-    const [statusResult, autoFeaturedResult] = await Promise.all([
+    const [statusResult, autoFeaturedResult, staysResult] = await Promise.all([
       this.eventsService.syncEventStatusesNow({
         daysBack: 2,
         daysForward: 2,
       }),
       this.eventsService.evaluateAutoFeaturedEvents(),
+      // Stays the app never reported an exit for, once their night is over.
+      this.venueStays.closeExpiredStays(),
     ]);
 
     return {
       success: statusResult.success && autoFeaturedResult.success,
       statusUpdated: statusResult.updated,
       autoFeaturedUpdated: autoFeaturedResult.updated,
+      staysClosed: staysResult.closed,
     };
   }
 

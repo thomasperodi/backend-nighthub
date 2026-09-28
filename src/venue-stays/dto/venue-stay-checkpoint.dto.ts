@@ -14,4 +14,9 @@ export class VenueStayCheckpointDto {
   @IsOptional()
   @IsISO8601()
   timestamp?: string;
+
+  /** How the app detected the exit (see venue_stays.exit_source). Default 'app'. */
+  @IsOptional()
+  @IsIn(['geofence', 'app'])
+  exit_source?: 'geofence' | 'app';
 }

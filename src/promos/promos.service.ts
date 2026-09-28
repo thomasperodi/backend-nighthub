@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Injectable,
   NotFoundException,
   ForbiddenException,
@@ -7,6 +8,23 @@ import {
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma, PromoStatus } from '@prisma/client';
 import { PushDispatchService } from '../common/push/push-dispatch.service';
+import type { PromoAudience, UpdatePromoDto } from './dto/promo.dto';
+
+type TargetRule = {
+  segment?: 'specific' | 'new' | 'loyal' | 'churn';
+  weeks?: number;
+  customers?: string[];
+};
+
+/** Explicit audience chosen in the app → the same segments the [target_rule] line used. */
+const AUDIENCE_RULE: Record<
+  Exclude<PromoAudience, 'none'>,
+  TargetRule | null
+> = {
+  recent: { segment: 'loyal', weeks: 4 },
+  lapsed: { segment: 'churn', weeks: 4 },
+  all: null,
+};
 
 @Injectable()
 export class PromosService {
@@ -16,13 +34,17 @@ export class PromosService {
   ) {}
   private readonly logger = new Logger(PromosService.name);
 
-  private async sendPromoCreatedPush(promo: {
-    id: string;
-    venue_id: string;
-    event_id: string | null;
-    title: string;
-    description: string | null;
-  }) {
+  private async sendPromoCreatedPush(
+    promo: {
+      id: string;
+      venue_id: string;
+      event_id: string | null;
+      title: string;
+      description: string | null;
+    },
+    audience?: PromoAudience,
+  ) {
+    if (audience === 'none') return;
     const users = await this.prisma.users.findMany({
       where: {
         role: 'client',
@@ -38,7 +60,11 @@ export class PromosService {
     });
     if (!users.length) return;
 
-    const rule = this.parseTargetRule(promo.description);
+    // Explicit audience (app) first; otherwise the legacy "[target_rule]" line in the
+    // description (older promos). Neither = every client.
+    const rule = audience
+      ? AUDIENCE_RULE[audience]
+      : this.parseTargetRule(promo.description);
     const normalizedCustomers = new Set(
       (rule?.customers ?? []).map((item) => this.normalizeIdentity(item)),
     );
@@ -123,11 +149,7 @@ export class PromosService {
     );
   }
 
-  private parseTargetRule(description?: string | null): {
-    segment?: 'specific' | 'new' | 'loyal' | 'churn';
-    weeks?: number;
-    customers?: string[];
-  } | null {
+  private parseTargetRule(description?: string | null): TargetRule | null {
     if (!description) return null;
     const line = description
       .split('\n')
@@ -355,18 +377,43 @@ export class PromosService {
     });
   }
 
-  async createPromo(input: Partial<Prisma.promosCreateInput>) {
-    const p = await this.prisma.promos.create({ data: input as any });
+  async createPromo(
+    input: {
+      venue_id: string;
+      event_id?: string | null;
+      title: string;
+      description?: string | null;
+      discount_type: 'percentage' | 'fixed' | 'free';
+      discount_value?: number | null;
+    },
+    audience?: PromoAudience,
+  ) {
+    const p = await this.prisma.promos.create({
+      data: {
+        venue_id: input.venue_id,
+        event_id: input.event_id ?? null,
+        title: input.title.trim(),
+        description: input.description?.trim() || null,
+        discount_type: input.discount_type,
+        discount_value: this.checkedDiscountValue(
+          input.discount_type,
+          input.discount_value,
+        ),
+      },
+    });
 
     // Fire-and-forget: the push fan-out to all clients shouldn't block the response to
     // whoever created the promo.
-    void this.sendPromoCreatedPush({
-      id: p.id,
-      venue_id: p.venue_id,
-      event_id: p.event_id,
-      title: p.title,
-      description: p.description,
-    }).catch((error) => {
+    void this.sendPromoCreatedPush(
+      {
+        id: p.id,
+        venue_id: p.venue_id,
+        event_id: p.event_id,
+        title: p.title,
+        description: p.description,
+      },
+      audience,
+    ).catch((error) => {
       this.logger.warn(
         `sendPromoCreatedPush failed for promo ${p.id}: ${String(error)}`,
       );
@@ -375,9 +422,78 @@ export class PromosService {
     return p;
   }
 
-  async updatePromo(id: string, updates: Partial<Prisma.promosUpdateInput>) {
-    await this.getPromo(id);
-    return this.prisma.promos.update({ where: { id }, data: updates as any });
+  async updatePromo(id: string, updates: UpdatePromoDto) {
+    const existing = await this.getPromo(id);
+    const type = updates.discount_type ?? existing.discount_type;
+    const valueChanged =
+      updates.discount_type !== undefined ||
+      updates.discount_value !== undefined;
+    return this.prisma.promos.update({
+      where: { id },
+      data: {
+        ...(updates.title !== undefined ? { title: updates.title.trim() } : {}),
+        ...(updates.description !== undefined
+          ? { description: updates.description?.trim() || null }
+          : {}),
+        ...(updates.discount_type !== undefined
+          ? { discount_type: updates.discount_type }
+          : {}),
+        ...(valueChanged
+          ? {
+              discount_value: this.checkedDiscountValue(
+                type,
+                updates.discount_value !== undefined
+                  ? updates.discount_value
+                  : existing.discount_value === null
+                    ? null
+                    : Number(existing.discount_value),
+              ),
+            }
+          : {}),
+        ...(updates.status !== undefined ? { status: updates.status } : {}),
+      },
+    });
+  }
+
+  /** percentage 1-100, fixed > 0 (euro), free: no value. */
+  private checkedDiscountValue(
+    type: 'percentage' | 'fixed' | 'free',
+    value: number | null | undefined,
+  ): number | null {
+    if (type === 'free') return null;
+    if (value === null || value === undefined || !(value > 0)) {
+      throw new BadRequestException(
+        type === 'percentage'
+          ? 'Indica la percentuale di sconto.'
+          : 'Indica l’importo dello sconto.',
+      );
+    }
+    if (type === 'percentage' && value > 100) {
+      throw new BadRequestException('Lo sconto non può superare il 100%.');
+    }
+    return value;
+  }
+
+  /**
+   * An organization manages only the nights it created (same rule as editing the event, see
+   * EventsService.assertEventBelongsToOrganization). Returns the event's venue.
+   */
+  async assertEventBelongsToOrganization(eventId: string, orgId: string) {
+    const e = await this.prisma.events.findUnique({
+      where: { id: eventId },
+      select: { venue_id: true, organization_id: true },
+    });
+    if (!e) throw new NotFoundException('Event not found');
+    if (e.organization_id !== orgId) throw new ForbiddenException('Forbidden');
+    return e.venue_id;
+  }
+
+  /** Promos on the nights created by this organization. */
+  async listByOrganization(orgId: string) {
+    return this.prisma.promos.findMany({
+      where: { event: { organization_id: orgId } },
+      orderBy: { created_at: 'desc' },
+    });
   }
 
   async deletePromo(id: string) {

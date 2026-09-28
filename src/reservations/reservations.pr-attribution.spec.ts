@@ -4,6 +4,7 @@ import { ReservationsService } from './reservations.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { BadgesService } from '../badges/badges.service';
 import { PushDispatchService } from '../common/push/push-dispatch.service';
+import { VenueStaysService } from '../venue-stays/venue-stays.service';
 
 // Organization & PR rework: "ingressi portati" must follow the guest from the PR's link to
 // the door, and the season pass is per venue.
@@ -91,6 +92,12 @@ describe('ReservationsService PR attribution', () => {
         {
           provide: PushDispatchService,
           useValue: { notifyUser: jest.fn().mockResolvedValue(undefined) },
+        },
+        {
+          provide: VenueStaysService,
+          useValue: {
+            startStayOnCheckIn: jest.fn().mockResolvedValue(undefined),
+          },
         },
       ],
     }).compile();

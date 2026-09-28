@@ -10,6 +10,7 @@ import { randomUUID } from 'crypto';
 import { resolveEntryUnitPrice } from '../common/entry-pricing';
 import { BadgesService } from '../badges/badges.service';
 import { PushDispatchService } from '../common/push/push-dispatch.service';
+import { VenueStaysService } from '../venue-stays/venue-stays.service';
 import { computeEventStatus, eventStartMs } from '../common/event-time.util';
 import { coded } from '../common/http/error-codes';
 
@@ -141,6 +142,7 @@ export class ReservationsService {
     private readonly prisma: PrismaService,
     private readonly badgesService: BadgesService,
     private readonly pushDispatch: PushDispatchService,
+    private readonly venueStays: VenueStaysService,
   ) {}
 
   private evaluateBadges(userId: string | null | undefined) {
@@ -2017,6 +2019,8 @@ export class ReservationsService {
     }
 
     this.evaluateBadges(reservation.user_id);
+    // Opens the user's stay at the venue and tells the app where the venue is (exit tracking).
+    await this.venueStays.startStayOnCheckIn(reservation.user_id, eventId);
 
     return {
       success: true,

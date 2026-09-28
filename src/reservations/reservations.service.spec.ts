@@ -4,6 +4,7 @@ import { ReservationsService } from './reservations.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { BadgesService } from '../badges/badges.service';
 import { PushDispatchService } from '../common/push/push-dispatch.service';
+import { VenueStaysService } from '../venue-stays/venue-stays.service';
 
 function makePrismaMock() {
   return {
@@ -77,6 +78,12 @@ describe('ReservationsService', () => {
         {
           provide: PushDispatchService,
           useValue: { notifyUser: jest.fn().mockResolvedValue(undefined) },
+        },
+        {
+          provide: VenueStaysService,
+          useValue: {
+            startStayOnCheckIn: jest.fn().mockResolvedValue(undefined),
+          },
         },
       ],
     }).compile();

@@ -89,34 +89,45 @@ export function computeEventStatus<S extends EventStatusValue>(
   const stored = (e.status ?? 'DRAFT') as S;
   if (stored === 'CANCELLED' || !e.date) return stored;
 
+  const endMs = eventEndMs(e)!;
+  const startMs = eventStartMs(e);
+  if (startMs === null) return (nowMs >= endMs ? 'CLOSED' : 'DRAFT') as S;
+  if (nowMs < startMs) return 'DRAFT' as S;
+  if (nowMs < endMs) return 'LIVE' as S;
+  return 'CLOSED' as S;
+}
+
+/**
+ * The instant (epoch ms) the night is over: end_time (the next day if it is not after
+ * start_time, nights cross midnight) or, without end_time, NIGHT_ROLLOVER_HOUR the morning
+ * after `date`. null without a date. Used for the event status and to close venue stays.
+ */
+export function eventEndMs(e: {
+  date?: Date | null;
+  start_time?: Date | null;
+  end_time?: Date | null;
+}): number | null {
+  if (!e?.date) return null;
   const timeZone = getEventsTimeZone();
   // Date is @db.Date and times are @db.Time: UTC parts are the raw stored values.
-  const year = e.date.getUTCFullYear();
-  const month = e.date.getUTCMonth() + 1;
-  const day = e.date.getUTCDate();
   const at = (hour: number, minute: number, plusDays = 0) =>
     zonedDateTimeToUtcMs({
       timeZone,
-      year,
-      month,
-      day: day + plusDays,
+      year: e.date!.getUTCFullYear(),
+      month: e.date!.getUTCMonth() + 1,
+      day: e.date!.getUTCDate() + plusDays,
       hour,
       minute,
     });
 
   const rolloverMs = at(NIGHT_ROLLOVER_HOUR, 0, 1);
-  if (!e.start_time) return (nowMs >= rolloverMs ? 'CLOSED' : 'DRAFT') as S;
+  const startMs = eventStartMs(e);
+  if (!e.end_time || startMs === null) return rolloverMs;
 
-  const startMs = at(e.start_time.getUTCHours(), e.start_time.getUTCMinutes());
-  let endMs = e.end_time
-    ? at(e.end_time.getUTCHours(), e.end_time.getUTCMinutes())
-    : rolloverMs;
+  let endMs = at(e.end_time.getUTCHours(), e.end_time.getUTCMinutes());
   // Nights cross midnight (Saturday 23:00 -> Sunday 05:00).
   if (endMs <= startMs) endMs += 24 * 60 * 60 * 1000;
-
-  if (nowMs < startMs) return 'DRAFT' as S;
-  if (nowMs < endMs) return 'LIVE' as S;
-  return 'CLOSED' as S;
+  return endMs;
 }
 
 /** The absolute instant (epoch ms) an event actually starts, or null if it doesn't have

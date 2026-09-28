@@ -24,7 +24,7 @@ import { UpdateTableHostessDto } from './dto/update-table-hostess.dto';
 import { EventsService } from '../events/events.service';
 import { resolveEntryUnitPrice } from '../common/entry-pricing';
 import { CreateTableBottleOrderDto } from './dto/create-table-bottle-order.dto';
-import { PushDispatchService } from '../common/push/push-dispatch.service';
+import { VenueStaysService } from '../venue-stays/venue-stays.service';
 
 @Injectable()
 export class StaffService {
@@ -34,7 +34,7 @@ export class StaffService {
     private readonly prisma: PrismaService,
     private readonly eventsService: EventsService,
     private readonly badgesService: BadgesService,
-    private readonly pushDispatch: PushDispatchService,
+    private readonly venueStays: VenueStaysService,
   ) {}
 
   private evaluateBadges(userId: string | null | undefined) {
@@ -505,45 +505,8 @@ export class StaffService {
       });
     }
 
-    if (dto.user_id) {
-      const event = await this.prisma.events.findUnique({
-        where: { id: eventId },
-        select: {
-          venue: {
-            select: {
-              id: true,
-              name: true,
-              latitude: true,
-              longitude: true,
-              radius_geofence: true,
-            },
-          },
-        },
-      });
-
-      const venue = event?.venue ?? null;
-      const latitude = venue?.latitude ? Number(venue.latitude) : null;
-      const longitude = venue?.longitude ? Number(venue.longitude) : null;
-      const radius = venue?.radius_geofence ?? 100;
-
-      if (
-        Number.isFinite(latitude) &&
-        Number.isFinite(longitude) &&
-        venue?.id
-      ) {
-        await this.pushDispatch.notifyUser(dto.user_id, {
-          title: 'Ingresso al locale',
-          body: `Monitoraggio posizione attivato per ${venue.name ?? 'il locale'}.`,
-          data: {
-            type: 'venue_stay',
-            venue_id: venue.id,
-            latitude,
-            longitude,
-            radius,
-          },
-        });
-      }
-    }
+    // Opens the user's stay at the venue and tells the app where the venue is (exit tracking).
+    await this.venueStays.startStayOnCheckIn(dto.user_id, eventId);
 
     return { success: true, created: quantity, stats };
   }

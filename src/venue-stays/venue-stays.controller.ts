@@ -28,7 +28,15 @@ export class VenueStaysController {
       event_id: body.event_id,
       event_type: body.event_type,
       timestamp: body.timestamp,
+      exit_source: body.exit_source,
     });
+  }
+
+  /** The caller's stay still open (with the venue position), or null. */
+  @Get('current')
+  @Roles('client')
+  current(@CurrentUser() user: RequestUser) {
+    return this.venueStaysService.currentStay(user.id);
   }
 
   @Get()
