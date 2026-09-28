@@ -247,6 +247,15 @@ export class AuthController {
     return { success: true };
   }
 
+  @Delete('push-token')
+  async clearPushToken(
+    @Body() dto: PushTokenDto,
+    @CurrentUser() user: RequestUser,
+  ) {
+    await this.authService.clearPushToken(user.id, dto.push_token);
+    return { success: true };
+  }
+
   @Post('onboarding/complete')
   async completeOnboarding(@CurrentUser() user: RequestUser) {
     return this.authService.completeOnboarding(user.id);

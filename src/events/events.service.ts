@@ -21,6 +21,7 @@ import { PushDispatchService } from '../common/push/push-dispatch.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { UpdateEventDto } from './dto/update-event.dto';
 import { mapWithConcurrency } from '../common/map-with-concurrency';
+import { computeEventStatus } from '../common/event-time.util';
 
 export type EventStats = {
   event_id: string;
@@ -119,66 +120,6 @@ export class EventsService {
         );
       }
     }
-  }
-
-  private getEventsTimeZone(): string {
-    // Events times (date + @db.Time) are intended as local venue time.
-    // Defaulting to Europe/Rome keeps behavior aligned with production expectations.
-    return process.env.EVENTS_TIMEZONE || 'Europe/Rome';
-  }
-
-  private getTimeZoneOffsetMs(timeZone: string, instant: Date): number {
-    // Returns offset where: localTime = utcTime + offset
-    // Uses Intl to derive the local wall-clock components for the given instant.
-    const dtf = new Intl.DateTimeFormat('en-US', {
-      timeZone,
-      hour12: false,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    });
-
-    const parts = dtf.formatToParts(instant);
-    const map = new Map(parts.map((p) => [p.type, p.value]));
-    const year = Number(map.get('year'));
-    const month = Number(map.get('month'));
-    const day = Number(map.get('day'));
-    const hour = Number(map.get('hour'));
-    const minute = Number(map.get('minute'));
-    const second = Number(map.get('second'));
-
-    const localAsUtcMs = Date.UTC(year, month - 1, day, hour, minute, second);
-    return localAsUtcMs - instant.getTime();
-  }
-
-  private zonedDateTimeToUtcMs(params: {
-    timeZone: string;
-    year: number;
-    month: number; // 1-12
-    day: number; // 1-31
-    hour: number;
-    minute: number;
-    second?: number;
-  }): number {
-    const baseUtc = Date.UTC(
-      params.year,
-      params.month - 1,
-      params.day,
-      params.hour,
-      params.minute,
-      params.second ?? 0,
-      0,
-    );
-
-    // Two-pass conversion to handle DST boundaries correctly.
-    const guess = new Date(baseUtc);
-    const offset1 = this.getTimeZoneOffsetMs(params.timeZone, guess);
-    const utc1 = baseUtc - offset1;
-    const offset2 = this.getTimeZoneOffsetMs(params.timeZone, new Date(utc1));
-    return baseUtc - offset2;
   }
 
   private isDataUrlImage(value?: string | null): boolean {
@@ -303,49 +244,9 @@ export class EventsService {
     end_time?: Date | null;
     status?: EventStatus | null;
   }): EventStatus {
-    const fallback = e.status ?? EventStatus.DRAFT;
-    if (!e?.date || !e?.start_time || !e?.end_time) return fallback;
-
-    const timeZone = this.getEventsTimeZone();
-
-    // Date is @db.Date: use UTC date parts to avoid timezone drift for the calendar day.
-    // start/end are @db.Time: use UTC time parts to extract the raw time value.
-    const year = e.date.getUTCFullYear();
-    const month = e.date.getUTCMonth() + 1;
-    const day = e.date.getUTCDate();
-
-    const sh = e.start_time.getUTCHours();
-    const sm = e.start_time.getUTCMinutes();
-    const eh = e.end_time.getUTCHours();
-    const em = e.end_time.getUTCMinutes();
-
-    const startMs = this.zonedDateTimeToUtcMs({
-      timeZone,
-      year,
-      month,
-      day,
-      hour: sh,
-      minute: sm,
-    });
-
-    let endMs = this.zonedDateTimeToUtcMs({
-      timeZone,
-      year,
-      month,
-      day,
-      hour: eh,
-      minute: em,
-    });
-
-    // Events can end after midnight (e.g. Saturday 23:00 -> Sunday 05:00)
-    if (endMs <= startMs) endMs += 24 * 60 * 60 * 1000;
-
-    const nowMs = Date.now();
-    if (nowMs < startMs) return EventStatus.DRAFT;
-    if (nowMs >= startMs && nowMs < endMs) {
-      return EventStatus.LIVE;
-    }
-    return EventStatus.CLOSED;
+    // Shared with ReservationsService (see computeEventStatus for the rules, including the
+    // missing end_time fallback and CANCELLED never being recomputed).
+    return computeEventStatus(e);
   }
 
   private async syncEventStatusIfNeeded(e: {
@@ -355,8 +256,7 @@ export class EventsService {
     end_time?: Date | null;
     status?: EventStatus | null;
   }): Promise<void> {
-    if (!e?.id) return;
-    if (!e?.date || !e?.start_time || !e?.end_time) return;
+    if (!e?.id || !e?.date) return;
 
     const effective = this.computeEffectiveStatus(e);
     const current = e.status ?? EventStatus.DRAFT;
@@ -382,7 +282,7 @@ export class EventsService {
     const idsByStatus = new Map<EventStatus, string[]>();
 
     for (const e of list) {
-      if (!e?.id || !e?.date || !e?.start_time || !e?.end_time) continue;
+      if (!e?.id || !e?.date) continue;
       const effective = this.computeEffectiveStatus(e);
       const current = e.status ?? EventStatus.DRAFT;
       if (effective === current) continue;
@@ -493,29 +393,7 @@ export class EventsService {
             discount_value: this.decimalToNumber(p.discount_value),
           }))
         : e.promos,
-      venue: e.venue
-        ? {
-            ...e.venue,
-            latitude:
-              e.venue.latitude === null || e.venue.latitude === undefined
-                ? null
-                : this.decimalToNumber(e.venue.latitude),
-            longitude:
-              e.venue.longitude === null || e.venue.longitude === undefined
-                ? null
-                : this.decimalToNumber(e.venue.longitude),
-            cloakroom_unit_price:
-              e.venue.cloakroom_unit_price === null ||
-              e.venue.cloakroom_unit_price === undefined
-                ? null
-                : this.decimalToNumber(e.venue.cloakroom_unit_price),
-            contract_monthly_fee:
-              e.venue.contract_monthly_fee === null ||
-              e.venue.contract_monthly_fee === undefined
-                ? null
-                : this.decimalToNumber(e.venue.contract_monthly_fee),
-          }
-        : e.venue,
+      venue: e.venue ? this.serializeEventVenue(e.venue) : e.venue,
       presale_price:
         e.presale_price === null || e.presale_price === undefined
           ? null
@@ -523,6 +401,27 @@ export class EventsService {
     };
   }
   /* eslint-enable @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-argument */
+
+  // Decimal -> number only for the fields the query actually selected: adding the missing
+  // ones as null made every public event response carry e.g. `contract_monthly_fee: null`,
+  // a billing field that is never selected for these endpoints.
+  private serializeEventVenue(venue: Record<string, unknown>) {
+    const out: Record<string, unknown> = { ...venue };
+    for (const key of [
+      'latitude',
+      'longitude',
+      'cloakroom_unit_price',
+      'contract_monthly_fee',
+    ]) {
+      if (!(key in venue)) continue;
+      const value = venue[key];
+      out[key] =
+        value === null || value === undefined
+          ? null
+          : this.decimalToNumber(value as Prisma.Decimal);
+    }
+    return out;
+  }
 
   private hasTablePricingOverride(row: {
     per_testa_override?: Prisma.Decimal | null;
@@ -1972,9 +1871,7 @@ export class EventsService {
     const updated = await this.prisma.$executeRaw`
       UPDATE "events" e
       SET "status" = public.compute_event_status(e."date", e."start_time", e."end_time", e."status")
-      WHERE e."start_time" IS NOT NULL
-        AND e."end_time" IS NOT NULL
-        AND e."date" >= (CURRENT_DATE - (${daysBack}::int * interval '1 day'))::date
+      WHERE e."date" >=(CURRENT_DATE - (${daysBack}::int * interval '1 day'))::date
         AND e."date" <= (CURRENT_DATE + (${daysForward}::int * interval '1 day'))::date
         AND e."status" <> public.compute_event_status(e."date", e."start_time", e."end_time", e."status");
     `;

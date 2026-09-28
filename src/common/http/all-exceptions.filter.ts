@@ -51,6 +51,18 @@ export class AllExceptionsFilter implements ExceptionFilter {
       exception instanceof Error ? exception : new Error(String(exception));
     // Prisma errors carry a code (P2024 = pool timeout, P1001 = DB unreachable, ...).
     const code = (exception as { code?: unknown })?.code;
+
+    // P2023 = malformed column value, in practice a path/query id that is not a UUID
+    // (e.g. GET /events/abc). That is the caller's mistake, not a server fault.
+    if (code === 'P2023') {
+      response.status(HttpStatus.BAD_REQUEST).json({
+        statusCode: HttpStatus.BAD_REQUEST,
+        message: 'Identificativo non valido',
+        error: 'Bad Request',
+        requestId,
+      });
+      return;
+    }
     this.logger.error(
       { msg: error.message, name: error.name, code, ...where },
       error.stack,

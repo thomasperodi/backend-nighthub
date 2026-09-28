@@ -230,4 +230,73 @@ describe('ReservationsService', () => {
       expect(result).toEqual({ success: true, expired: 3 });
     });
   });
+
+  describe('createReservation: event must still be bookable', () => {
+    const pastNight = {
+      id: 'event-1',
+      venue_id: 'venue-1',
+      name: 'Sabato sera',
+      // Well in the past and without end_time: this used to stay DRAFT forever.
+      date: new Date('2020-01-11'),
+      start_time: new Date(Date.UTC(1970, 0, 1, 22, 0)),
+      end_time: null,
+      status: 'DRAFT',
+    };
+    const futureNight = { ...pastNight, date: new Date('2099-01-10') };
+    const entry = {
+      user_id: 'user-1',
+      event_id: 'event-1',
+      type: 'entry',
+      guests: 1,
+    };
+
+    let users: { findUnique: jest.Mock };
+    let findFirst: jest.Mock;
+
+    beforeEach(() => {
+      users = { findUnique: jest.fn().mockResolvedValue({ role: 'client' }) };
+      findFirst = jest.fn().mockResolvedValue({ id: 'existing' });
+      Object.assign(prisma.users, users);
+      Object.assign(prisma.reservations, { findFirst });
+    });
+
+    it('rejects a client booking for a night that is already over', async () => {
+      prisma.events.findUnique.mockResolvedValue(pastNight);
+      await expect(service.createReservation(entry)).rejects.toThrow(
+        'Questa serata è già conclusa',
+      );
+      expect(findFirst).not.toHaveBeenCalled();
+    });
+
+    it('rejects any booking for a cancelled event, even a future one', async () => {
+      prisma.events.findUnique.mockResolvedValue({
+        ...futureNight,
+        status: 'CANCELLED',
+      });
+      await expect(service.createReservation(entry)).rejects.toThrow(
+        'Questo evento è stato annullato',
+      );
+    });
+
+    it('lets a venue account record a booking on a closed night', async () => {
+      users.findUnique.mockResolvedValue({ role: 'venue' });
+      prisma.events.findUnique.mockResolvedValue(pastNight);
+      // Gets past the status check; whatever the (partially mocked) rest of the flow does
+      // afterwards is out of scope here.
+      const outcome: unknown = await service
+        .createReservation(entry)
+        .catch((e: unknown) => e);
+      expect((outcome as Error | undefined)?.message).not.toBe(
+        'Questa serata è già conclusa',
+      );
+    });
+
+    it('lets a client book an upcoming night (reaches the duplicate check)', async () => {
+      prisma.events.findUnique.mockResolvedValue(futureNight);
+      await expect(service.createReservation(entry)).rejects.toThrow(
+        'Sei già in lista per questa serata',
+      );
+      expect(findFirst).toHaveBeenCalled();
+    });
+  });
 });

@@ -1228,6 +1228,19 @@ export class AuthService {
     });
   }
 
+  /** DELETE /auth/push-token - called by the app right before logout, so a shared/borrowed
+   * phone stops receiving this account's notifications. Clears the column only if it still
+   * holds this device's token: logging out of an old phone must not unregister the phone
+   * the user registered afterwards (push_token is single-device, last one wins). */
+  async clearPushToken(userId: string, pushToken: string) {
+    if (!pushToken) throw new BadRequestException('push_token required');
+
+    await this.prisma.users.updateMany({
+      where: { id: userId, push_token: pushToken },
+      data: { push_token: null, push_token_updated_at: new Date() },
+    });
+  }
+
   /** POST /auth/push-subscription - registers/refreshes a Web Push subscription for this
    * device/browser. Unlike push_token (single column, Expo/mobile), a user can have any
    * number of these; `endpoint` is globally unique per browser+device, so re-subscribing

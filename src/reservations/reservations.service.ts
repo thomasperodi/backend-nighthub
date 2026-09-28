@@ -10,7 +10,7 @@ import { randomUUID } from 'crypto';
 import { resolveEntryUnitPrice } from '../common/entry-pricing';
 import { BadgesService } from '../badges/badges.service';
 import { PushDispatchService } from '../common/push/push-dispatch.service';
-import { eventStartMs } from '../common/event-time.util';
+import { computeEventStatus, eventStartMs } from '../common/event-time.util';
 
 type QrCheckInResult = {
   success: boolean;
@@ -1238,6 +1238,32 @@ export class ReservationsService {
     return r;
   }
 
+  /**
+   * A client cannot book (list, table or guest join) an event that is cancelled or already
+   * over. Uses the live computed status, not the stored column, which the cron may not have
+   * updated yet. Venue accounts booking on someone's behalf are not blocked on CLOSED, so a
+   * late entry can still be recorded after the fact.
+   */
+  private assertEventBookable(
+    event: {
+      date: Date | null;
+      start_time: Date | null;
+      end_time: Date | null;
+      status: string | null;
+    },
+    bookerRole?: string | null,
+  ) {
+    const status = computeEventStatus(
+      event as Parameters<typeof computeEventStatus>[0],
+    );
+    if (status === 'CANCELLED') {
+      throw new BadRequestException('Questo evento è stato annullato');
+    }
+    if (status === 'CLOSED' && bookerRole !== 'venue') {
+      throw new BadRequestException('Questa serata è già conclusa');
+    }
+  }
+
   async createReservation(dto: Record<string, unknown> | null | undefined) {
     const normalized = this.normalizeCreateReservationDto(dto);
 
@@ -1256,7 +1282,15 @@ export class ReservationsService {
     const [event, userRecord] = await Promise.all([
       this.prisma.events.findUnique({
         where: { id: eventId },
-        select: { id: true, venue_id: true, name: true },
+        select: {
+          id: true,
+          venue_id: true,
+          name: true,
+          date: true,
+          start_time: true,
+          end_time: true,
+          status: true,
+        },
       }),
       // ❗ Saltiamo il controllo duplicati se è un account venue
       this.prisma.users.findUnique({
@@ -1265,6 +1299,7 @@ export class ReservationsService {
       }),
     ]);
     if (!event) throw new NotFoundException('Event not found');
+    this.assertEventBookable(event, userRecord?.role);
 
     if (userRecord?.role !== 'venue') {
       const existingReservationForEvent =
@@ -1612,12 +1647,18 @@ export class ReservationsService {
 
     const event = await this.prisma.events.findUnique({
       where: { id: eventId },
-      select: { id: true, venue_id: true, name: true, status: true },
+      select: {
+        id: true,
+        venue_id: true,
+        name: true,
+        date: true,
+        start_time: true,
+        end_time: true,
+        status: true,
+      },
     });
     if (!event) throw new NotFoundException('Event not found');
-    if (event.status === 'CANCELLED') {
-      throw new BadRequestException('Questo evento è stato annullato');
-    }
+    this.assertEventBookable(event);
 
     const matchedUser = await this.findUserForGuestJoin(
       normalizedEmail,

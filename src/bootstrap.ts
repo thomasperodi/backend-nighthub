@@ -2,7 +2,7 @@ import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, INestApplication } from '@nestjs/common';
 import type { AbstractHttpAdapter } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
-import { json, urlencoded } from 'express';
+import { json, urlencoded, type Request, type Response } from 'express';
 import cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
 import { responseTimingMiddleware } from './common/http/response-timing.middleware';
@@ -11,6 +11,7 @@ import { requestLogMiddleware } from './common/http/request-log.middleware';
 import { StructuredLogger } from './common/http/structured-logger';
 import { AllExceptionsFilter } from './common/http/all-exceptions.filter';
 import { resolveCorsOrigins } from './common/cors-origins';
+import { PUBLIC_WEB_ROUTES } from './public-web/public-web.config';
 
 // Single source of truth for app setup, shared by the local/traditional-server entrypoint
 // (src/main.ts) and the Vercel serverless entrypoint (api/index.ts). These two used to each
@@ -55,7 +56,13 @@ export async function createApp(
   app.use(json({ limit: '5mb' }));
   app.use(urlencoded({ extended: true, limit: '5mb' }));
 
-  app.setGlobalPrefix('api');
+  // The old shared-link URL lived under the prefix: keep it working by forwarding to the
+  // root-level page (see PublicWebController), preserving ?pr=.
+  app.use('/api/r/event/', (req: Request, res: Response) => {
+    res.redirect(301, `/r/event${req.url}`);
+  });
+
+  app.setGlobalPrefix('api', { exclude: PUBLIC_WEB_ROUTES });
 
   // OpenAPI document, used as the single source of truth to generate the frontend's typed
   // API client (see pwa/nighthub `npm run generate:api-types`). Kept available in every
@@ -65,7 +72,9 @@ export async function createApp(
     app,
     new DocumentBuilder()
       .setTitle('NightHub API')
-      .setDescription('Auto-generated from DTOs/controllers via the @nestjs/swagger CLI plugin.')
+      .setDescription(
+        'Auto-generated from DTOs/controllers via the @nestjs/swagger CLI plugin.',
+      )
       .setVersion('1.0')
       .addBearerAuth()
       .build(),

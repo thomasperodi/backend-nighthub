@@ -150,7 +150,15 @@ type PrMember = {
 |---|---|---|---|
 | GET | `/` 🌐 | — | stringa |
 | GET | `/health` 🌐 | — | `{ status: 'ok' }` |
-| GET | `/r/event/:eventId?pr=&wallet=apple\|google` 🌐 | — | **HTML** (pagina che apre `nighthub://event/:id`, fallback store). Non JSON. |
+| GET | `/api/r/event/:eventId` 🌐 | — | 301 verso `/r/event/:eventId` (sotto, fuori da `/api`), query preservata. |
+
+**Fuori dal prefisso `/api`** (`src/public-web`, alla radice del dominio):
+
+| Metodo | Path | Ritorna |
+|---|---|---|
+| GET | `/.well-known/apple-app-site-association` 🌐 | JSON per gli universal link iOS (`/r/event/*` apre l'app `4S4XRSW6AC.com.thomas88.nighthub`; override con env `IOS_APP_IDS`). |
+| GET | `/r/event/:eventId?pr=` 🌐 | **HTML**: link condivisibile di una serata. App installata → iOS apre l'app direttamente. Altrimenti anteprima (Open Graph per WhatsApp/Instagram) + bottone App Store; Android "in arrivo" finché non c'è `EXPO_PUBLIC_PLAY_STORE_URL`. 404 se l'evento non esiste. |
+| GET | `/legal/privacy`, `/legal/termini` 🌐 | **HTML**: informativa privacy e termini (bozze da far rivedere a un legale). |
 
 ## 3. Auth (`/auth`)
 

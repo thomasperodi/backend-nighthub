@@ -19,6 +19,7 @@ import { BadgesModule } from './badges/badges.module';
 import { ModerationModule } from './moderation/moderation.module';
 import { OrganizationsModule } from './organizations/organizations.module';
 import { MediaModule } from './media/media.module';
+import { PublicWebModule } from './public-web/public-web.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { RolesGuard } from './auth/roles.guard';
 
@@ -48,6 +49,7 @@ import { RolesGuard } from './auth/roles.guard';
     ModerationModule,
     OrganizationsModule,
     MediaModule,
+    PublicWebModule,
   ],
   controllers: [AppController],
   providers: [
