@@ -224,10 +224,12 @@ describe('AuthService', () => {
 
       const result = service.verifyAccessToken(token);
 
+      // organization_id is always present on RequestUser (null for non-organization roles).
       expect(result).toEqual({
         id: 'user-1',
         role: 'venue',
         venue_id: 'venue-1',
+        organization_id: null,
       });
     });
 

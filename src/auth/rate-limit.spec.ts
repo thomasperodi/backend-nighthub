@@ -1,11 +1,12 @@
 import { Test } from '@nestjs/testing';
-import { INestApplication } from '@nestjs/common';
+import { INestApplication, UnauthorizedException } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import request from 'supertest';
 import cookieParser from 'cookie-parser';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
+import { PushDispatchService } from '../common/push/push-dispatch.service';
 
 // Exercises the actual @Throttle() override on POST /auth/login end-to-end (real HTTP layer,
 // real ThrottlerGuard) rather than asserting decorator metadata, so this fails if the
@@ -22,8 +23,16 @@ describe('Rate limiting on sensitive auth endpoints', () => {
       providers: [
         {
           provide: AuthService,
-          useValue: { login: jest.fn().mockResolvedValue(null) },
+          // Wrong credentials, like the real service: 401 (not rate-limited).
+          useValue: {
+            login: jest
+              .fn()
+              .mockRejectedValue(
+                new UnauthorizedException('Credenziali non valide'),
+              ),
+          },
         },
+        { provide: PushDispatchService, useValue: { notifyUser: jest.fn() } },
         { provide: APP_GUARD, useClass: ThrottlerGuard },
       ],
     }).compile();
@@ -48,8 +57,8 @@ describe('Rate limiting on sensitive auth endpoints', () => {
       statuses.push(res.status);
     }
 
-    // First 10 requests are within the limit (200/201 - login itself returns null body but
-    // 2xx status since credentials are wrong, not rate-limited); the 11th must be throttled.
+    // First 10 requests are within the limit (401: wrong credentials, not rate-limited);
+    // the 11th must be throttled.
     expect(statuses.slice(0, 10).every((s) => s < 429)).toBe(true);
     expect(statuses[10]).toBe(429);
   });

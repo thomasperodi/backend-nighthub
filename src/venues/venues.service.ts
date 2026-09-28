@@ -56,7 +56,16 @@ import {
 import { randomBytes, randomUUID } from 'crypto';
 import { readFileSync } from 'fs';
 import { isAbsolute, resolve as resolvePath } from 'path';
-import { PKPass } from 'passkit-generator';
+import type { PKPass as PKPassClass } from 'passkit-generator';
+
+// Loaded on first use, not at boot: only the PR season pass (.pkpass) needs it, and it is
+// one of the heaviest modules to load on a cold start.
+let passkit: { PKPass: typeof PKPassClass } | undefined;
+function loadPassKit() {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  passkit ??= require('passkit-generator') as { PKPass: typeof PKPassClass };
+  return passkit;
+}
 
 type AnalyticsDistributionItem = {
   label: string;
@@ -491,6 +500,7 @@ export class VenuesService {
       },
     };
 
+    const { PKPass } = loadPassKit();
     const pass = new PKPass(
       {
         // icon.* stays the minimal placeholder regardless of branding: Apple requires it at

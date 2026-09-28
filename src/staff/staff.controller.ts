@@ -282,7 +282,9 @@ export class StaffController {
   ) {
     res?.setHeader(
       'Cache-Control',
-      'public, max-age=0, s-maxage=5, stale-while-revalidate=30',
+      // Authenticated, per-venue data: never in a shared/CDN cache (a cookie-auth client would
+      // otherwise get another venue's cached numbers). Browser-only reuse is fine.
+      'private, max-age=5',
     );
     if (user.role !== 'admin') {
       if (!user.venue_id) throw new ForbiddenException('Missing venue_id');

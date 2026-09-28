@@ -490,7 +490,9 @@ export class VenuesController {
   ) {
     res?.setHeader(
       'Cache-Control',
-      'public, max-age=0, s-maxage=10, stale-while-revalidate=60',
+      // Authenticated, per-venue data: never in a shared/CDN cache (a cookie-auth client would
+      // otherwise get another venue's cached numbers). Browser-only reuse is fine.
+      'private, max-age=10',
     );
 
     if (String(user?.role || '').toLowerCase() === 'venue') {
@@ -509,7 +511,9 @@ export class VenuesController {
   ) {
     res?.setHeader(
       'Cache-Control',
-      'public, max-age=0, s-maxage=10, stale-while-revalidate=60',
+      // Authenticated, per-venue data: never in a shared/CDN cache (a cookie-auth client would
+      // otherwise get another venue's cached numbers). Browser-only reuse is fine.
+      'private, max-age=10',
     );
 
     if (String(user?.role || '').toLowerCase() === 'venue') {

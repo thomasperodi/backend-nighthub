@@ -3,6 +3,7 @@ import { UnauthorizedException } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { AuthController } from './auth.controller';
 import { AuthService, REFRESH_COOKIE_NAME } from './auth.service';
+import { PushDispatchService } from '../common/push/push-dispatch.service';
 
 function makeRes() {
   const cookie = jest.fn();
@@ -46,7 +47,11 @@ describe('AuthController', () => {
 
     const module: TestingModule = await Test.createTestingModule({
       controllers: [AuthController],
-      providers: [{ provide: AuthService, useValue: authService }],
+      providers: [
+        { provide: AuthService, useValue: authService },
+        // Used only by POST /auth/push-test, not exercised here.
+        { provide: PushDispatchService, useValue: { notifyUser: jest.fn() } },
+      ],
     }).compile();
 
     controller = module.get<AuthController>(AuthController);
@@ -113,11 +118,17 @@ describe('AuthController', () => {
   });
 
   it('login: propagates the 401 and sets no cookie on invalid credentials', async () => {
-    authService.login.mockRejectedValue(new UnauthorizedException('Credenziali non valide'));
+    authService.login.mockRejectedValue(
+      new UnauthorizedException('Credenziali non valide'),
+    );
     const { res, cookie } = makeRes();
 
     await expect(
-      controller.login({ identifier: 'a', password: 'wrong' } as any, makeReq(), res),
+      controller.login(
+        { identifier: 'a', password: 'wrong' } as any,
+        makeReq(),
+        res,
+      ),
     ).rejects.toThrow(UnauthorizedException);
     expect(cookie).not.toHaveBeenCalled();
   });

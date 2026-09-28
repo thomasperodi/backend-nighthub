@@ -1,10 +1,24 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
-import sharp from 'sharp';
+import type Sharp from 'sharp';
+
+// Loaded on first use, not at boot: only image requests need it, and every cold start on
+// Vercel would otherwise pay for the native module even for plain JSON calls.
+let sharpModule: typeof Sharp | undefined;
+function sharp(...args: Parameters<typeof Sharp>) {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  sharpModule ??= require('sharp') as typeof Sharp;
+  return sharpModule(...args);
+}
 
 // Only the public image prefixes SupabaseStorageService writes to. The object name is always
 // `<uuid>.<ext>` (see SupabaseStorageService.buildObjectPath), so anything else is rejected
 // before any network call - the upstream URL is built from a fixed base, never from input.
-const ALLOWED_PREFIXES = new Set(['events', 'venues', 'users', 'venue-wallet-logos']);
+const ALLOWED_PREFIXES = new Set([
+  'events',
+  'venues',
+  'users',
+  'venue-wallet-logos',
+]);
 const FILE_RE = /^[0-9a-f-]{36}\.(jpg|jpeg|png|webp)$/i;
 
 // Widths are snapped to a small fixed set so the CDN cache holds a bounded number of
@@ -29,18 +43,25 @@ export class MediaService {
   private readonly inFlight = new Map<string, Promise<RenderedImage>>();
 
   private get publicBase(): string {
-    const url = String(process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || '')
+    const url = String(
+      process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || '',
+    )
       .trim()
       .replace(/\/+$/, '');
     const bucket =
-      process.env.SUPABASE_BUCKET_PUBLIC || process.env.SUPABASE_BUCKET_EVENTS || 'event-posters';
+      process.env.SUPABASE_BUCKET_PUBLIC ||
+      process.env.SUPABASE_BUCKET_EVENTS ||
+      'event-posters';
     return `${url}/storage/v1/object/public/${bucket}`;
   }
 
   snapWidth(raw: unknown): number {
     const w = Number(raw);
     if (!Number.isFinite(w) || w <= 0) return DEFAULT_WIDTH;
-    return MEDIA_WIDTHS.find((allowed) => allowed >= w) ?? MEDIA_WIDTHS[MEDIA_WIDTHS.length - 1];
+    return (
+      MEDIA_WIDTHS.find((allowed) => allowed >= w) ??
+      MEDIA_WIDTHS[MEDIA_WIDTHS.length - 1]
+    );
   }
 
   assertValidPath(prefix: string, file: string) {
@@ -49,7 +70,11 @@ export class MediaService {
     }
   }
 
-  async render(prefix: string, file: string, width: number): Promise<RenderedImage> {
+  async render(
+    prefix: string,
+    file: string,
+    width: number,
+  ): Promise<RenderedImage> {
     this.assertValidPath(prefix, file);
     const key = `${prefix}/${file}@${width}`;
 
@@ -63,7 +88,9 @@ export class MediaService {
 
     let pending = this.inFlight.get(key);
     if (!pending) {
-      pending = this.renderUncached(prefix, file, width).finally(() => this.inFlight.delete(key));
+      pending = this.renderUncached(prefix, file, width).finally(() =>
+        this.inFlight.delete(key),
+      );
       this.inFlight.set(key, pending);
     }
     const rendered = await pending;
@@ -71,10 +98,16 @@ export class MediaService {
     return rendered;
   }
 
-  private async renderUncached(prefix: string, file: string, width: number): Promise<RenderedImage> {
+  private async renderUncached(
+    prefix: string,
+    file: string,
+    width: number,
+  ): Promise<RenderedImage> {
     const res = await fetch(`${this.publicBase}/${prefix}/${file}`);
-    if (res.status === 400 || res.status === 404) throw new NotFoundException('Image not found');
-    if (!res.ok) throw new Error(`Storage responded ${res.status} for ${prefix}/${file}`);
+    if (res.status === 400 || res.status === 404)
+      throw new NotFoundException('Image not found');
+    if (!res.ok)
+      throw new Error(`Storage responded ${res.status} for ${prefix}/${file}`);
 
     const input = Buffer.from(await res.arrayBuffer());
     try {
@@ -86,13 +119,20 @@ export class MediaService {
       return { body, contentType: 'image/webp' };
     } catch (error) {
       // Not decodable by sharp: serve the original bytes rather than a broken image.
-      this.logger.warn(`Could not optimize ${prefix}/${file}: ${String(error)}`);
-      return { body: input, contentType: res.headers.get('content-type') || 'application/octet-stream' };
+      this.logger.warn(
+        `Could not optimize ${prefix}/${file}: ${String(error)}`,
+      );
+      return {
+        body: input,
+        contentType:
+          res.headers.get('content-type') || 'application/octet-stream',
+      };
     }
   }
 
   private remember(key: string, value: RenderedImage) {
-    if (this.cache.has(key) || value.body.length > MEMORY_CACHE_MAX_BYTES / 4) return;
+    if (this.cache.has(key) || value.body.length > MEMORY_CACHE_MAX_BYTES / 4)
+      return;
     this.cache.set(key, value);
     this.cacheBytes += value.body.length;
     while (this.cacheBytes > MEMORY_CACHE_MAX_BYTES) {
