@@ -4,7 +4,7 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 
 /**
  * On Vercel every warm function instance holds its own Prisma pool, and with Fluid compute
@@ -53,9 +53,30 @@ export function serverlessDatabaseUrl(
   }
 }
 
+/** Host/port/pool params of the effective DB url, never the credentials - logged at startup so
+ * the Vercel logs show which pooler and pool size an instance actually ended up with. */
+function describeDatabaseUrl(url: string | undefined) {
+  if (!url) return { configured: false };
+  try {
+    const parsed = new URL(url);
+    return {
+      configured: true,
+      host: parsed.hostname,
+      port: parsed.port,
+      pgbouncer: parsed.searchParams.get('pgbouncer'),
+      connection_limit: parsed.searchParams.get('connection_limit'),
+      pool_timeout: parsed.searchParams.get('pool_timeout'),
+    };
+  } catch {
+    return { configured: true, parseable: false };
+  }
+}
+
+type PrismaLogEvents = 'query' | 'warn' | 'error';
+
 @Injectable()
 export class PrismaService
-  extends PrismaClient
+  extends PrismaClient<Prisma.PrismaClientOptions, PrismaLogEvents>
   implements OnModuleInit, OnModuleDestroy
 {
   private readonly logger = new Logger(PrismaService.name);
@@ -63,8 +84,35 @@ export class PrismaService
   constructor() {
     const url = serverlessDatabaseUrl(process.env.DATABASE_URL);
     super({
-      log: ['error'],
+      log: [
+        { emit: 'event', level: 'query' },
+        { emit: 'event', level: 'warn' },
+        { emit: 'event', level: 'error' },
+      ],
       ...(url ? { datasources: { db: { url } } } : {}),
+    });
+
+    this.logger.log({
+      msg: 'Prisma datasource',
+      vercel: Boolean(process.env.VERCEL),
+      ...describeDatabaseUrl(url ?? process.env.DATABASE_URL),
+    });
+
+    const slowQueryMs = Number(process.env.LOG_SLOW_QUERY_MS) || 500;
+    this.$on('query', (e) => {
+      if (e.duration < slowQueryMs) return;
+      this.logger.warn({
+        msg: 'Slow query',
+        durationMs: e.duration,
+        query: e.query.slice(0, 1000),
+        target: e.target,
+      });
+    });
+    this.$on('warn', (e) => {
+      this.logger.warn({ msg: 'Prisma warn', message: e.message, target: e.target });
+    });
+    this.$on('error', (e) => {
+      this.logger.error({ msg: 'Prisma error', message: e.message, target: e.target });
     });
   }
 
@@ -79,20 +127,25 @@ export class PrismaService
   private async connectWithRetry() {
     const maxAttempts = 5;
 
+    const start = Date.now();
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         await this.$connect();
-        if (attempt > 1) {
-          this.logger.log(`Prisma connected on attempt ${attempt}.`);
-        }
+        this.logger.log({
+          msg: 'Prisma connected',
+          attempt,
+          durationMs: Date.now() - start,
+        });
         return;
       } catch (error) {
         const isLastAttempt = attempt === maxAttempts;
         const delayMs = attempt * 1000;
 
-        this.logger.warn(
-          `Prisma connection attempt ${attempt}/${maxAttempts} failed.`,
-        );
+        this.logger.warn({
+          msg: `Prisma connection attempt ${attempt}/${maxAttempts} failed.`,
+          error: error instanceof Error ? error.message : String(error),
+        });
 
         if (isLastAttempt) {
           this.logger.error(

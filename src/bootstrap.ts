@@ -7,6 +7,7 @@ import cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
 import { responseTimingMiddleware } from './common/http/response-timing.middleware';
 import { requestContextMiddleware } from './common/http/request-context.middleware';
+import { requestLogMiddleware } from './common/http/request-log.middleware';
 import { StructuredLogger } from './common/http/structured-logger';
 import { AllExceptionsFilter } from './common/http/all-exceptions.filter';
 import { resolveCorsOrigins } from './common/cors-origins';
@@ -31,6 +32,7 @@ export async function createApp(
   // Must run before any route/guard so every log line for this request - across every
   // service, however deep the call chain - can be tied back to one request id.
   app.use(requestContextMiddleware());
+  app.use(requestLogMiddleware());
   app.use(responseTimingMiddleware());
   app.use(cookieParser());
 

@@ -6,7 +6,7 @@ import {
   HttpStatus,
   Logger,
 } from '@nestjs/common';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 import { getRequestId } from './request-context';
 
 // Centralizes what was previously implicit in Nest's default behavior (each service
@@ -22,10 +22,21 @@ export class AllExceptionsFilter implements ExceptionFilter {
   catch(exception: unknown, host: ArgumentsHost) {
     const ctx = host.switchToHttp();
     const response = ctx.getResponse<Response>();
+    const request = ctx.getRequest<Request>();
     const requestId = getRequestId();
+    const where = {
+      method: request?.method,
+      path: request?.originalUrl?.split('?')[0],
+    };
 
     if (exception instanceof HttpException) {
       const status = exception.getStatus();
+      if (status >= 500) {
+        this.logger.error(
+          { msg: exception.message, status, ...where },
+          exception.stack,
+        );
+      }
       const body = exception.getResponse();
       const payload =
         typeof body === 'string'
@@ -36,8 +47,13 @@ export class AllExceptionsFilter implements ExceptionFilter {
       return;
     }
 
+    const error =
+      exception instanceof Error ? exception : new Error(String(exception));
+    // Prisma errors carry a code (P2024 = pool timeout, P1001 = DB unreachable, ...).
+    const code = (exception as { code?: unknown })?.code;
     this.logger.error(
-      exception instanceof Error ? exception : new Error(String(exception)),
+      { msg: error.message, name: error.name, code, ...where },
+      error.stack,
     );
 
     response.status(HttpStatus.INTERNAL_SERVER_ERROR).json({
