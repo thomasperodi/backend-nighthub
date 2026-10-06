@@ -34,16 +34,16 @@ export class AdminController {
   }
 
   @Get('users')
-  users() {
-    return this.adminService.getUsers();
+  users(@Query('role') role?: string) {
+    return this.adminService.getUsers(role);
   }
 
   // Trust & safety: search across all users (getUsers above is a 50-most-recent dashboard
   // widget, not a search) and suspend/reactivate one. :id accepts id/email/username, same
   // as PATCH users/:id/assignment.
   @Get('users/search')
-  searchUsers(@Query('search') search?: string) {
-    return this.adminService.searchUsers(search);
+  searchUsers(@Query('search') search?: string, @Query('role') role?: string) {
+    return this.adminService.searchUsers(search, role);
   }
 
   @Post('users/:id/suspend')

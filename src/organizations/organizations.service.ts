@@ -24,7 +24,7 @@ import {
   sumBuckets,
   toPrMetrics,
 } from '../common/pr/pr-metrics.util';
-import { Prisma } from '@prisma/client';
+import { Prisma, UserRole } from '@prisma/client';
 import type { RequestUser } from '../auth/types';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
@@ -167,6 +167,46 @@ export class OrganizationsService {
     }
 
     return organization;
+  }
+
+  /** Admin-only hard delete. Venue links cascade (FK). In the same transaction:
+   * - the organization's own PR network (rows with organization_id = this org and no venue_id,
+   *   i.e. exclusive to it) is deleted, cascading its event assignments/QR scans/passes;
+   *   entries keep their history (pr_membership_id SetNull). Venue PRs merely tagged with the
+   *   org keep working for their venue (organization_id SetNull).
+   * - owner accounts (`role: organization`) are demoted to `client`, so they don't end up as
+   *   an organization login with no organization.
+   * - events it created stay with their venue (events.organization_id SetNull). */
+  async remove(organizationId: string, actor: RequestUser | undefined) {
+    this.assertAdmin(actor);
+    const existing = await this.prisma.organizations.findUnique({
+      where: { id: organizationId },
+      select: { id: true, name: true },
+    });
+    if (!existing) throw new NotFoundException('Organization not found');
+
+    await this.prisma.$transaction([
+      this.prisma.venue_pr_memberships.deleteMany({
+        where: { organization_id: organizationId, venue_id: null },
+      }),
+      this.prisma.users.updateMany({
+        where: { organization_id: organizationId, role: UserRole.organization },
+        data: { role: UserRole.client, organization_id: null },
+      }),
+      this.prisma.organizations.delete({ where: { id: organizationId } }),
+    ]);
+
+    if (actor?.id) {
+      this.auditLog.record({
+        adminId: actor.id,
+        action: 'organization.delete',
+        targetType: 'organization',
+        targetId: organizationId,
+        metadata: { name: existing.name },
+      });
+    }
+
+    return { success: true };
   }
 
   // Billing lives on organizations (confirmed business decision) - one flat plan per

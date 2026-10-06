@@ -65,6 +65,12 @@ export class OrganizationsController {
     return this.organizationsService.update(id, dto, user);
   }
 
+  @Delete(':id')
+  @Roles('admin')
+  remove(@Param('id') id: string, @CurrentUser() user: RequestUser) {
+    return this.organizationsService.remove(id, user);
+  }
+
   @Patch(':id/plan')
   @Roles('admin')
   assignPlan(

@@ -21,6 +21,9 @@ import { geocodeAddress } from '../common/geocoding';
 import { AuditLogService } from '../common/audit/audit-log.service';
 import { MEASURED_STAY_WHERE } from '../venue-stays/venue-stays.service';
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 type RevenuePoint = { label: string; value: number };
 
 type DashboardMetrics = {
@@ -198,7 +201,6 @@ export class AdminService {
     name: string;
     city: string | null;
     created_at: Date;
-    stripe_onboarding_completed_at: Date | null;
     contract_start_at: Date | null;
     contract_end_at: Date | null;
     contract_status: string | null;
@@ -206,10 +208,7 @@ export class AdminService {
     contract_auto_renew: boolean;
     contract_notes: string | null;
   }): ContractSnapshot {
-    const sourceDate =
-      venue.contract_start_at ??
-      venue.stripe_onboarding_completed_at ??
-      venue.created_at;
+    const sourceDate = venue.contract_start_at ?? venue.created_at;
     const explicitEnd = venue.contract_end_at;
     const estimated = explicitEnd == null;
     const expiresAt = explicitEnd ?? this.addDays(sourceDate, 365);
@@ -308,7 +307,6 @@ export class AdminService {
       ticketOrdersMonthPaidCount,
       pendingReservations,
       failedOrdersMonth,
-      venuesNeedingStripe,
       paidOrdersWeek,
       tableReservationsWeek,
       paidOrdersMonth,
@@ -332,7 +330,6 @@ export class AdminService {
           name: true,
           city: true,
           created_at: true,
-          stripe_onboarding_completed_at: true,
           contract_start_at: true,
           contract_end_at: true,
           contract_status: true,
@@ -381,14 +378,6 @@ export class AdminService {
             in: [TicketOrderStatus.cancelled, TicketOrderStatus.failed],
           },
           created_at: { gte: monthStart, lt: nextMonthStart },
-        },
-      }),
-      this.prisma.venues.count({
-        where: {
-          OR: [
-            { stripe_charges_enabled: false },
-            { stripe_payouts_enabled: false },
-          ],
         },
       }),
       this.prisma.ticket_orders.findMany({
@@ -639,15 +628,6 @@ export class AdminService {
       });
     }
 
-    if (venuesNeedingStripe > 0) {
-      alerts.push({
-        id: 3,
-        title: 'Onboarding pagamenti incompleto',
-        detail: `${venuesNeedingStripe} locali senza Stripe pienamente attivo`,
-        severity: 'warning',
-      });
-    }
-
     if (failedOrdersMonth > 0) {
       alerts.push({
         id: 4,
@@ -703,9 +683,6 @@ export class AdminService {
           city: true,
           address: true,
           created_at: true,
-          stripe_onboarding_completed_at: true,
-          stripe_charges_enabled: true,
-          stripe_payouts_enabled: true,
           contract_start_at: true,
           contract_end_at: true,
           contract_status: true,
@@ -829,9 +806,6 @@ export class AdminService {
       city: string | null;
       address: string | null;
       created_at: Date;
-      stripe_onboarding_completed_at: Date | null;
-      stripe_charges_enabled: boolean;
-      stripe_payouts_enabled: boolean;
       contract_start_at: Date | null;
       contract_end_at: Date | null;
       contract_status: string | null;
@@ -864,7 +838,6 @@ export class AdminService {
         name: venue.name,
         city: venue.city,
         created_at: venue.created_at,
-        stripe_onboarding_completed_at: venue.stripe_onboarding_completed_at,
         contract_start_at: venue.contract_start_at,
         contract_end_at: venue.contract_end_at,
         contract_status: venue.contract_status,
@@ -903,75 +876,85 @@ export class AdminService {
     });
   }
 
-  async getUsers() {
+  /** Up to 50 most recent users, optionally only one role (so "Staff"/"Gestori" show every
+   * staff/venue account, not just those among the 50 newest). Activity aggregates are scoped
+   * to the returned ids: previously they grouped the whole reservations/entries/stays tables
+   * on every call. */
+  async getUsers(role?: string) {
     const now = new Date();
     const activeSince = this.addDays(this.startOfDay(now), -29);
+    const roleFilter = this.parseUserRole(role);
+
+    const users = await this.prisma.users.findMany({
+      where: roleFilter ? { role: roleFilter } : undefined,
+      orderBy: { created_at: 'desc' },
+      take: 50,
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        is_active: true,
+        venue_id: true,
+        organization_id: true,
+        created_at: true,
+        venue: { select: { id: true, name: true } },
+        organization: { select: { id: true, name: true } },
+      },
+    });
+    const forUsers = { in: users.map((u) => u.id) };
 
     const activeUsersSet = new Set<string>();
     const userActivityData = await Promise.all([
-      // Independent of every activity aggregate below - only merged at the end via
-      // `activeUsersSet`/`lastActivityMap`/`stayStatsMap` lookups - so it runs in the same
-      // batch instead of after it (previously a 10th sequential round trip).
-      this.prisma.users.findMany({
-        orderBy: { created_at: 'desc' },
-        take: 50,
-        select: {
-          id: true,
-          name: true,
-          email: true,
-          role: true,
-          venue_id: true,
-          created_at: true,
-          venue: { select: { id: true, name: true } },
-        },
-      }),
       this.prisma.reservations.findMany({
-        where: { created_at: { gte: activeSince } },
+        where: { created_at: { gte: activeSince }, user_id: forUsers },
         distinct: ['user_id'],
         select: { user_id: true },
       }),
       this.prisma.ticket_orders.findMany({
-        where: { created_at: { gte: activeSince } },
+        where: { created_at: { gte: activeSince }, user_id: forUsers },
         distinct: ['user_id'],
         select: { user_id: true },
       }),
       this.prisma.entries.findMany({
-        where: { created_at: { gte: activeSince }, user_id: { not: null } },
+        where: { created_at: { gte: activeSince }, user_id: forUsers },
         distinct: ['user_id'],
         select: { user_id: true },
       }),
       this.prisma.venue_stays.findMany({
-        where: { entered_at: { gte: activeSince } },
+        where: { entered_at: { gte: activeSince }, user_id: forUsers },
         distinct: ['user_id'],
         select: { user_id: true },
       }),
       this.prisma.reservations.groupBy({
         by: ['user_id'],
+        where: { user_id: forUsers },
         _max: { created_at: true },
       }),
       this.prisma.ticket_orders.groupBy({
         by: ['user_id'],
+        where: { user_id: forUsers },
         _max: { created_at: true },
       }),
       this.prisma.entries.groupBy({
         by: ['user_id'],
-        where: { user_id: { not: null } },
+        where: { user_id: forUsers },
         _max: { created_at: true },
       }),
       this.prisma.venue_stays.groupBy({
         by: ['user_id'],
+        where: { user_id: forUsers },
         _max: { entered_at: true },
       }),
       this.prisma.venue_stays.groupBy({
         by: ['user_id'],
-        where: { entered_at: { gte: activeSince } },
+        where: { entered_at: { gte: activeSince }, user_id: forUsers },
         _count: { _all: true },
         _avg: { duration_ms: true },
       }),
     ]);
 
     const [
-      users,
       reservationUsers,
       ticketUsers,
       entryUsers,
@@ -1044,7 +1027,10 @@ export class AdminService {
             ? 'Venue'
             : role === 'staff'
               ? 'Staff'
-              : 'Cliente';
+              : role === 'organization'
+                ? 'Organizzazione'
+                : 'Cliente';
+      const linkName = user.venue?.name ?? user.organization?.name ?? null;
 
       const stayStats = stayStatsMap.get(user.id);
 
@@ -1053,11 +1039,12 @@ export class AdminService {
         name: displayName,
         email: user.email,
         roleKey: role,
+        isActive: user.is_active,
         venueId: user.venue_id,
         venueName: user.venue?.name ?? null,
-        role: user.venue?.name
-          ? `${roleLabel} • ${user.venue.name}`
-          : roleLabel,
+        organizationId: user.organization_id,
+        organizationName: user.organization?.name ?? null,
+        role: linkName ? `${roleLabel} • ${linkName}` : roleLabel,
         status: activeUsersSet.has(user.id) ? 'Attivo' : 'Inattivo',
         joinedAt: user.created_at,
         lastActivityAt: lastActivityMap.get(user.id) ?? null,
@@ -1069,18 +1056,23 @@ export class AdminService {
 
   // Trust & safety: search across every user (not just the 50-most-recent list `getUsers`
   // returns for the dashboard widget) so an admin can actually find one account to act on.
-  async searchUsers(search?: string) {
+  async searchUsers(search?: string, role?: string) {
     const term = String(search || '').trim();
+    const roleFilter = this.parseUserRole(role);
+    const where: Prisma.usersWhereInput = {};
+    if (term) {
+      where.OR = [
+        { name: { contains: term, mode: 'insensitive' } },
+        { email: { contains: term, mode: 'insensitive' } },
+        { username: { contains: term, mode: 'insensitive' } },
+        // Exact id too: the app's user detail page looks a user up by id.
+        ...(UUID_RE.test(term) ? [{ id: term }] : []),
+      ];
+    }
+    if (roleFilter) where.role = roleFilter;
+
     const users = await this.prisma.users.findMany({
-      where: term
-        ? {
-            OR: [
-              { name: { contains: term, mode: 'insensitive' } },
-              { email: { contains: term, mode: 'insensitive' } },
-              { username: { contains: term, mode: 'insensitive' } },
-            ],
-          }
-        : undefined,
+      where,
       orderBy: { created_at: 'desc' },
       take: 50,
       select: {
@@ -1091,10 +1083,28 @@ export class AdminService {
         role: true,
         is_active: true,
         venue_id: true,
+        organization_id: true,
         created_at: true,
+        venue: { select: { name: true } },
+        organization: { select: { name: true } },
       },
     });
-    return users;
+    // Current assignment included, so the admin sees who is already linked where before
+    // reassigning (an assignment replaces the previous venue/organization).
+    return users.map(({ venue, organization, ...user }) => ({
+      ...user,
+      venue_name: venue?.name ?? null,
+      organization_name: organization?.name ?? null,
+    }));
+  }
+
+  private parseUserRole(role?: string): UserRole | undefined {
+    const value = String(role || '')
+      .trim()
+      .toLowerCase();
+    return (Object.values(UserRole) as string[]).includes(value)
+      ? (value as UserRole)
+      : undefined;
   }
 
   async setUserActive(

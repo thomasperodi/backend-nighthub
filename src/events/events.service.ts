@@ -1602,7 +1602,39 @@ export class EventsService {
       });
     }
 
+    if (dto.organization_id) {
+      await this.assignOrganizationPrs(
+        event.id,
+        dto.venue_id,
+        dto.organization_id,
+      );
+    }
+
     return this.getEvent(event.id);
+  }
+
+  /** An event created by an organization starts with every active PR of its network assigned
+   * (it used to be a manual "Assegna tutti" step afterwards). The organization can still
+   * remove single PRs via PUT /organizations/:id/events/:eventId/pr-assignments. */
+  private async assignOrganizationPrs(
+    eventId: string,
+    venueId: string,
+    organizationId: string,
+  ) {
+    const memberships = await this.prisma.venue_pr_memberships.findMany({
+      where: { organization_id: organizationId, is_active: true },
+      select: { id: true },
+    });
+    if (!memberships.length) return;
+    await this.prisma.venue_pr_event_assignments.createMany({
+      data: memberships.map((m) => ({
+        venue_id: venueId,
+        event_id: eventId,
+        pr_membership_id: m.id,
+        is_active: true,
+      })),
+      skipDuplicates: true,
+    });
   }
 
   async updateEvent(id: string, dto: UpdateEventDto) {
