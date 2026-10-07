@@ -196,6 +196,17 @@ export class FriendsService {
     );
   }
 
+  /** Ids the user blocked or was blocked by: hidden both ways from search and requests. */
+  private async blockedUserIds(userId: string): Promise<string[]> {
+    const rows = await this.prisma.user_blocks.findMany({
+      where: { OR: [{ blocker_id: userId }, { blocked_id: userId }] },
+      select: { blocker_id: true, blocked_id: true },
+    });
+    return rows.map((row) =>
+      row.blocker_id === userId ? row.blocked_id : row.blocker_id,
+    );
+  }
+
   async searchUsers(query: string, currentUserId: string) {
     const q = String(query || '')
       .trim()
@@ -205,6 +216,7 @@ export class FriendsService {
       throw new BadRequestException('query must be at least 2 characters');
     }
 
+    const blockedIds = await this.blockedUserIds(currentUserId);
     const [currentUserFriendLinks, candidates] = await this.prisma.$transaction(
       [
         this.prisma.friendships.findMany({
@@ -213,7 +225,7 @@ export class FriendsService {
         }),
         this.prisma.users.findMany({
           where: {
-            id: { not: currentUserId },
+            id: { notIn: [currentUserId, ...blockedIds] },
             // Social search must never surface staff/venue/admin accounts (impersonation
             // risk) or suspended/deactivated users - both are enforced here, not just in
             // the frontend, since the frontend filter is trivially bypassed by calling
@@ -1009,6 +1021,10 @@ export class FriendsService {
     if (!target) throw new NotFoundException('User not found');
     if (target.id === from_user_id)
       throw new BadRequestException('Cannot add yourself');
+    // Same answer as a missing user: the sender must not learn that they were blocked.
+    if ((await this.blockedUserIds(from_user_id)).includes(target.id)) {
+      throw new NotFoundException('User not found');
+    }
 
     const [existingFriend, existingRequest] = await Promise.all([
       this.prisma.friendships.findFirst({

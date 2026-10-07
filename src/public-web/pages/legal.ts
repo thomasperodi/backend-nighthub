@@ -28,6 +28,7 @@ export function renderPrivacy(): string {
       <li><strong>Posizione condivisa con gli amici:</strong> solo se la attivi tu; puoi disattivarla in qualsiasi momento.</li>
       <li><strong>Dispositivo:</strong> il token per le notifiche push e le sessioni di accesso attive.</li>
       <li><strong>Badge e livelli:</strong> calcolati dalle serate a cui partecipi e dalle attività nell'app.</li>
+      <li><strong>Segnalazioni e blocchi:</strong> se segnali o blocchi un utente conserviamo chi ha segnalato o bloccato chi, il motivo e la data. Chi viene segnalato o bloccato non lo sa e non sa chi è stato.</li>
     </ul>
 
     <h2>Perché li usiamo</h2>
@@ -44,6 +45,7 @@ export function renderPrivacy(): string {
     <ul>
       <li><strong>Il locale</strong> della serata a cui ti iscrivi vede nome, lista e ingresso; lo staff alla porta vede il tuo nome quando scansiona il QR.</li>
       <li><strong>Il PR</strong> che ti ha invitato vede nome e foto profilo, mai email o telefono.</li>
+      <li><strong>Il team di NightHub</strong> vede le segnalazioni (chi segnala, chi è segnalato, motivo, foto profilo e username) per decidere se rimuovere un contenuto o sospendere un account. Dei blocchi vede solo quante persone hanno bloccato un utente, mai chi.</li>
       <li><strong>Fornitori tecnici</strong> che ospitano il servizio per nostro conto: Vercel (server), Supabase (database e immagini), Expo (notifiche push).</li>
     </ul>
 
@@ -89,7 +91,7 @@ export function renderTerms(): string {
     <p>Le informazioni sugli eventi (orari, prezzi, programma) sono inserite dai locali, che ne sono responsabili. Un evento può essere modificato o annullato dal locale: in quel caso ti avvisiamo con una notifica quando possibile.</p>
 
     <h2>Comportamento</h2>
-    <p>Non usare NightHub per molestare altri utenti, pubblicare contenuti illeciti o aggirare i controlli d'ingresso. Puoi segnalare contenuti o utenti a ${email}.</p>
+    <p>Non usare NightHub per molestare altri utenti, pubblicare contenuti illeciti o aggirare i controlli d'ingresso. Puoi segnalare o bloccare un utente dal suo profilo nell'app (oppure scrivere a ${email}): esaminiamo ogni segnalazione e possiamo rimuovere i contenuti inappropriati, come la foto profilo, o sospendere l'account. Chi blocchi viene rimosso dai tuoi amici e non può più trovarti né inviarti richieste; puoi sbloccarlo da Profilo → Account e sicurezza → Utenti bloccati.</p>
 
     <h2>Responsabilità</h2>
     <p>Facciamo il possibile perché il servizio funzioni sempre, ma non possiamo garantirlo senza interruzioni. Non siamo responsabili di quanto accade all'interno dei locali.</p>
