@@ -198,4 +198,25 @@ describe('Reports', () => {
       }),
     );
   });
+
+  it('every report outcome lands in the audit log with its reason', async () => {
+    const { moderation, audit } = setup();
+    await moderation.resolveReport({
+      reportId: 'r1',
+      adminId: 'admin',
+      status: 'dismissed',
+      resolutionNote: ' niente di grave ',
+    });
+    expect(audit.record).toHaveBeenCalledWith({
+      adminId: 'admin',
+      action: 'report.dismissed',
+      targetType: 'user',
+      targetId: 'bob',
+      metadata: expect.objectContaining({
+        report_id: 'r1',
+        suspended: false,
+        avatar_removed: false,
+      }) as unknown,
+    });
+  });
 });

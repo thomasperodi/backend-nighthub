@@ -171,7 +171,7 @@ export class ModerationService {
       await this.removeAvatar(report.reported_user_id, params.adminId);
     }
 
-    return this.prisma.content_reports.update({
+    const updated = await this.prisma.content_reports.update({
       where: { id: params.reportId },
       data: {
         status: params.status,
@@ -180,6 +180,23 @@ export class ModerationService {
         resolved_at: new Date(),
       },
     });
+
+    // The outcome of every report shows up in the admin audit log, with the reason, so the
+    // moderation history is readable there and not only in the reports list.
+    this.auditLog.record({
+      adminId: params.adminId,
+      action: `report.${params.status}`,
+      targetType: 'user',
+      targetId: report.reported_user_id,
+      metadata: {
+        report_id: report.id,
+        reason: report.reason,
+        note: updated.resolution_note,
+        suspended: Boolean(params.suspendReportedUser),
+        avatar_removed: Boolean(params.removeAvatar),
+      },
+    });
+    return updated;
   }
 
   /** Removes an inappropriate profile photo without suspending the account. */
