@@ -2,7 +2,13 @@ import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, INestApplication } from '@nestjs/common';
 import type { AbstractHttpAdapter } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
-import { json, urlencoded, type Request, type Response } from 'express';
+import {
+  json,
+  urlencoded,
+  type NextFunction,
+  type Request,
+  type Response,
+} from 'express';
 import cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
 import { responseTimingMiddleware } from './common/http/response-timing.middleware';
@@ -45,7 +51,17 @@ export async function createApp(
   app.useGlobalPipes(new ValidationPipe({ transform: true }));
   app.useGlobalFilters(new AllExceptionsFilter());
 
-  app.use((req, res, next) => {
+  // No ETags and no caching by default: iOS revalidated cached GETs with If-None-Match, got
+  // a body-less 304 back and the app treated it as an error ("Qualcosa è andato storto" on
+  // Moderation and other admin screens). Routes that want caching (public pages, events,
+  // promos, media) still set their own Cache-Control, which replaces this default.
+  const express = app.getHttpAdapter().getInstance() as {
+    set(key: string, value: unknown): void;
+  };
+  express.set('etag', false);
+
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    res.setHeader('Cache-Control', 'no-store');
     // Quick check to ensure the deployed instance is running the expected body limit.
     // If you still see 413 with limit=102400 in logs, Vercel is serving an older build.
     res.setHeader('X-Json-Limit', '5mb');
