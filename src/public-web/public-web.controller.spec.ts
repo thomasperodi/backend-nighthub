@@ -146,6 +146,8 @@ describe('PublicWebController', () => {
     expect(controller.privacy()).toContain('Thomas Perodi');
     expect(controller.privacy()).toContain('perodithomas88@gmail.com');
     expect(controller.terms()).toContain('Termini di servizio');
+    expect(controller.support()).toContain('perodithomas88@gmail.com');
+    expect(controller.support()).toContain('Elimina account');
   });
 
   it('formats the calendar day without timezone drift', () => {

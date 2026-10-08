@@ -99,7 +99,7 @@ export function renderTerms(): string {
     <h2>Modifiche</h2>
     <p>Possiamo aggiornare questi termini; se le modifiche sono importanti te lo diremo nell'app. Si applica la legge italiana.</p>
 
-    <p class="muted"><a href="/legal/privacy">Informativa sulla privacy</a></p>
+    <p class="muted"><a href="/legal/privacy">Informativa sulla privacy</a> · <a href="/supporto">Supporto</a></p>
     `,
   });
 }

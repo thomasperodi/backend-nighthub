@@ -51,6 +51,8 @@ describe('PublicWeb routing', () => {
       .expect('Content-Type', /html/);
     await request(server).get('/legal/privacy').expect(200);
     await request(server).get('/legal/termini').expect(200);
+    await request(server).get('/supporto').expect(200);
+    await request(server).get('/support').expect(200);
   });
 
   it('does not serve them under /api', async () => {

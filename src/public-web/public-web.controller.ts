@@ -21,6 +21,7 @@ import {
 } from './public-web.config';
 import { renderEventLanding, type LandingEvent } from './pages/event-landing';
 import { renderPrivacy, renderTerms } from './pages/legal';
+import { renderSupport } from './pages/support';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EVENT_IMAGE = /^events\/[0-9a-f-]{36}\.(jpg|jpeg|png|webp)$/i;
@@ -30,7 +31,7 @@ const hhmm = (t: Date | null) =>
 
 /**
  * Root-level pages (outside `/api`, see PUBLIC_WEB_ROUTES): the iOS universal-link
- * association file, the shareable event page and the legal pages.
+ * association file, the shareable event page, the legal pages and the support page.
  */
 @Controller()
 @Public()
@@ -118,6 +119,14 @@ export class PublicWebController {
   @Header('Cache-Control', 'public, max-age=3600')
   terms() {
     return renderTerms();
+  }
+
+  /** Support URL for App Store Connect (`/support` is an alias). */
+  @Get(['supporto', 'support'])
+  @Header('Content-Type', 'text/html; charset=utf-8')
+  @Header('Cache-Control', 'public, max-age=3600')
+  support() {
+    return renderSupport();
   }
 
   private async loadEvent(

@@ -11,6 +11,8 @@ export const PUBLIC_WEB_ROUTES: RouteInfo[] = [
   { path: 'r/event/:eventId', method: RequestMethod.GET },
   { path: 'legal/privacy', method: RequestMethod.GET },
   { path: 'legal/termini', method: RequestMethod.GET },
+  { path: 'supporto', method: RequestMethod.GET },
+  { path: 'support', method: RequestMethod.GET },
 ];
 
 /** `<Team ID>.<bundle id>` of the iOS app allowed to open NightHub links. */
